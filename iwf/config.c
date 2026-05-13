@@ -18,6 +18,23 @@ static void defaults(iwf_config_t *c)
     c->sgwc_port = 2123;
     strncpy(c->log_level, "info", sizeof(c->log_level) - 1);
     strncpy(c->log_file, "-", sizeof(c->log_file) - 1);
+    c->synthetic_uli_no_rai = 0;
+    /* Open5GS SMF only accepts EUTRAN (6) and WLAN (3); UTRAN (1) is rejected
+     * with "Unknown RAT Type" -> SGW-C surfaces it as GTP cause 70.
+     * Default to EUTRAN so the IWF works against vanilla Open5GS out of the box. */
+    c->rat_type = 6;
+}
+
+static uint8_t parse_rat_type(const char *val)
+{
+    if (!val || !*val) return 6;
+    if (!strcasecmp(val, "utran"))  return 1;
+    if (!strcasecmp(val, "geran"))  return 2;
+    if (!strcasecmp(val, "wlan"))   return 3;
+    if (!strcasecmp(val, "eutran")) return 6;
+    long n = strtol(val, NULL, 0);
+    if (n >= 1 && n <= 255) return (uint8_t)n;
+    return 6;
 }
 
 static char *trim(char *s)
@@ -93,6 +110,10 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             if      (!strcmp(key, "listen_ip"))   copy_str(out->listen_ip, sizeof(out->listen_ip), val);
             else if (!strcmp(key, "listen_port")) out->listen_port = (uint16_t)atoi(val);
             else if (!strcmp(key, "local_ip"))    copy_str(out->local_ip, sizeof(out->local_ip), val);
+            else if (!strcmp(key, "synthetic_uli_no_rai"))
+                out->synthetic_uli_no_rai = (atoi(val) != 0);
+            else if (!strcmp(key, "rat_type"))
+                out->rat_type = parse_rat_type(val);
             else LOGW("config", "unknown key [iwf].%s", key);
         } else if (!strcmp(section, "sgsn")) {
             if (!strcmp(key, "ip")) copy_str(out->sgsn_ip, sizeof(out->sgsn_ip), val);
@@ -101,6 +122,10 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             if      (!strcmp(key, "ip"))   copy_str(out->sgwc_ip, sizeof(out->sgwc_ip), val);
             else if (!strcmp(key, "port")) out->sgwc_port = (uint16_t)atoi(val);
             else LOGW("config", "unknown key [sgwc].%s", key);
+        } else if (!strcmp(section, "smf")) {
+            if      (!strcmp(key, "ip"))   copy_str(out->smf_ip, sizeof(out->smf_ip), val);
+            else if (!strcmp(key, "teid")) out->smf_teid = (uint32_t)strtoul(val, NULL, 0);
+            else LOGW("config", "unknown key [smf].%s", key);
         } else if (!strcmp(section, "logging")) {
             if      (!strcmp(key, "level")) copy_str(out->log_level, sizeof(out->log_level), val);
             else if (!strcmp(key, "file"))  copy_str(out->log_file, sizeof(out->log_file), val);
@@ -120,9 +145,12 @@ int iwf_config_load(const char *path, iwf_config_t *out)
 
 void iwf_config_dump(const iwf_config_t *c)
 {
-    LOGI("config", "listen=%s:%u local_ip=%s sgsn=%s sgwc=%s:%u log=%s/%s",
+    LOGI("config", "file=%s listen=%s:%u local_ip=%s rat_type=%u synthetic_uli_no_rai=%d sgsn=%s sgwc=%s:%u smf=%s teid=%u log=%s/%s",
+         c->cfg_path[0] ? c->cfg_path : "-",
          c->listen_ip, c->listen_port,
          c->local_ip[0] ? c->local_ip : "(unset)",
+         (unsigned)c->rat_type, c->synthetic_uli_no_rai,
          c->sgsn_ip, c->sgwc_ip, c->sgwc_port,
+         c->smf_ip[0] ? c->smf_ip : "(unset)", (unsigned)c->smf_teid,
          c->log_level, c->log_file);
 }

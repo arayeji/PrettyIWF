@@ -132,6 +132,21 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         if (ie) gtpv1_decode_nsapi(ie, &nsapi);
     }
 
+    /* GTPv1 retransmissions reuse the same sequence number. A retransmit may
+     * omit the NSAPI IE (we then default nsapi to 5), so do not key only on
+     * sess_find(imsi, nsapi) — correlate by IMSI + GTPv1 seq. */
+    {
+        sess_t *pending =
+            sess_find_pending_create_by_imsi_gnseq(imsi, (uint16_t)v1->seq);
+        if (pending) {
+            LOGI("translate",
+                 "duplicate Create-PDP-Req (retransmit) imsi=%s gn_seq=%u nsapi=%u state=%s — ignoring",
+                 imsi, (unsigned)(uint16_t)v1->seq, (unsigned)pending->key.nsapi,
+                 sess_state_str(pending->state));
+            return 0;
+        }
+    }
+
     sess_t *s = sess_create(imsi, nsapi);
     if (!s) {
         LOGE("translate", "out of memory creating session imsi=%s", imsi);
@@ -186,20 +201,42 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     gtpv2_enc_imsi_bcd(&e, imsi);
     if (s->msisdn[0]) gtpv2_enc_msisdn_bcd(&e, s->msisdn);
 
-    /* IE: ULI - could be derived from RAI in v1; omitted minimally here.
-     * Many SGW-C deployments accept CSReq without ULI. */
-
-    /* IE: Serving Network - take MCC/MNC from the IMSI's first 5 digits
-     * (heuristic: 3-digit MCC + 2-digit MNC). */
+    uint16_t mcc_sn = 0, mnc_sn = 0;
+    int      have_sn = 0;
     if (strlen(imsi) >= 5) {
         char mc[4] = { imsi[0], imsi[1], imsi[2], 0 };
         char mn[4] = { imsi[3], imsi[4], 0, 0 };
-        uint16_t mcc = (uint16_t)atoi(mc);
-        uint16_t mnc = (uint16_t)atoi(mn);
-        gtpv2_enc_serving_network(&e, mcc, mnc);
+        mcc_sn = (uint16_t)atoi(mc);
+        mnc_sn = (uint16_t)atoi(mn);
+        have_sn = 1;
     }
 
-    gtpv2_enc_rat_type(&e, GTPV2_RAT_UTRAN);
+    /* ULI (RAI) — Open5GS SGW-C often requires this for UTRAN (GTPv2 cause 103
+     * "Conditional IE missing" if absent). Map from GTPv1 RAI TV IE. */
+    if ((ie = gtpv1_find_ie(v1, GTPV1_IE_RAI)) && ie->length >= 6) {
+        if (gtpv2_enc_uli_from_v1_rai(&e, ie->value) != 0)
+            LOGW("translate", "encoding ULI from RAI failed");
+    } else if (rt->cfg.synthetic_uli_no_rai && have_sn) {
+        if (gtpv2_enc_uli_synthetic_plmn(&e, mcc_sn, mnc_sn) != 0)
+            LOGW("translate", "encoding synthetic ULI failed");
+        else
+            LOGI("translate",
+                 "encoded synthetic ULI (Gn had no RAI; synthetic_uli_no_rai=1) mcc=%u mnc=%u",
+                 (unsigned)mcc_sn, (unsigned)mnc_sn);
+    } else {
+        LOGW("translate",
+             "Create PDP has no RAI IE — Create Session may be rejected (e.g. gtpv2 cause 103); "
+             "enable [iwf] synthetic_uli_no_rai=1 for lab emulators that omit RAI");
+    }
+
+    /* IE: Serving Network - take MCC/MNC from the IMSI's first 5 digits
+     * (heuristic: 3-digit MCC + 2-digit MNC). */
+    if (have_sn)
+        gtpv2_enc_serving_network(&e, mcc_sn, mnc_sn);
+
+    /* RAT Type is configurable: real UTRAN (1) but Open5GS SMF only accepts
+     * EUTRAN (6) / WLAN (3). Default of 6 is set in config defaults. */
+    gtpv2_enc_rat_type(&e, rt->cfg.rat_type);
 
     /* Indication flags: hi=DAF | DTF | HI | ... (TS 29.274 §8.12). Set DTF
      * (bit 5 of octet 2) to advertise Direct Tunnel support. */
@@ -208,6 +245,27 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     /* Sender F-TEID for Control Plane = S4-SGSN GTP-C, our own. */
     gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S4_SGSN_GTPC,
                          s->iwf_s4_c_teid, ntohl(rt->local_ipv4_be));
+
+    /* PGW/SMF S5/S8-C F-TEID (instance 1) — Open5GS SGWC requires this IE or
+     * rejects with cause 103 ("No PGW IP" in sgwc logs). */
+    if (rt->cfg.smf_ip[0]) {
+        struct in_addr smf;
+        if (inet_pton(AF_INET, rt->cfg.smf_ip, &smf) != 1) {
+            LOGE("translate", "invalid [smf] ip=%s", rt->cfg.smf_ip);
+            sess_remove(s);
+            return -1;
+        }
+        gtpv2_enc_fteid_ipv4(&e, 1, FTEID_IFACE_S5S8_PGW_GTPC,
+                             rt->cfg.smf_teid, ntohl(smf.s_addr));
+    } else {
+        static int warned_no_smf_fteid;
+        if (!warned_no_smf_fteid) {
+            warned_no_smf_fteid = 1;
+            LOGW("translate",
+                 "Create Session: [smf] ip not set (config file: %s) — Open5GS SGWC rejects CSReq (cause 103). Add: [smf] ip=<SMF GTP-C IPv4> teid=<S5/S8 F-TEID>",
+                 rt->cfg.cfg_path[0] ? rt->cfg.cfg_path : "iwf.conf");
+        }
+    }
 
     /* APN. */
     if (s->apn[0]) gtpv2_enc_apn(&e, s->apn);
@@ -319,7 +377,7 @@ static int translate_update_pdp_context(iwf_runtime_t *rt,
     gtpv2_enc_begin(&e, GTPV2_MODIFY_BEARER_REQUEST,
                     s->sgwc_ctrl_teid, s->gtpv2_seq);
 
-    gtpv2_enc_rat_type(&e, GTPV2_RAT_UTRAN);
+    gtpv2_enc_rat_type(&e, rt->cfg.rat_type);
     gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00); /* DTF */
 
     /* Bearer Contexts To Be Modified (grouped IE 93, instance 0). */
@@ -440,6 +498,12 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
              v2->teid, (unsigned)(v2->seq & 0xffffffu));
         return -1;
     }
+    if (s->state != SESS_WAIT_CS_RESP) {
+        LOGI("translate",
+             "CSResp duplicate or late imsi=%s seq=%u state=%s — ignoring",
+             s->key.imsi, (unsigned)(v2->seq & 0xffffffu), sess_state_str(s->state));
+        return 0;
+    }
     if (v2->teid != s->iwf_s4_c_teid)
         LOGI("translate", "CSResp imsi=%s matched via seq=%u (hdr teid=0x%08x, iwf_s4_c=0x%08x)",
              s->key.imsi, (unsigned)(v2->seq & 0xffffffu), v2->teid, s->iwf_s4_c_teid);
@@ -450,8 +514,14 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
              s->key.imsi, v2->n_ies);
         gtpv2_cause = GTPV2_CAUSE_SYSTEM_FAILURE;
     } else if (gtpv2_cause != GTPV2_CAUSE_REQUEST_ACCEPTED) {
-        LOGW("translate", "CSResp imsi=%s gtpv2_cause=%u (not Request Accepted)",
-             s->key.imsi, (unsigned)gtpv2_cause);
+        if (gtpv2_cause == 103) {
+            LOGW("translate",
+                 "CSResp imsi=%s gtpv2_cause=103 (Conditional IE missing) — GTP CSReq: missing ULI or missing [smf] PGW F-TEID (sgwc: No IMSI / No PGW IP). If CSReq already has SMF F-TEID (len grew), Open5GS maps PFCP Sx failure (SGWC⇄SGW-U) to 103 — check sgwc/sgwu logs and udp/8805",
+                 s->key.imsi);
+        } else {
+            LOGW("translate", "CSResp imsi=%s gtpv2_cause=%u (not Request Accepted)",
+                 s->key.imsi, (unsigned)gtpv2_cause);
+        }
     }
 
     const iwf_ie_t *ie;

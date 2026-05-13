@@ -13,6 +13,7 @@
 #              listen_port = 2123
 #              local_ip = YOUR Gn/S4-facing IP (required if listen is 0.0.0.0)
 #       [sgwc] ip / port = Open5GS SGW-C
+#       [smf]  ip / teid = SMF (PGW-C) S5/S8 GTP-C F-TEID for Create Session (Open5GS SGWC requires it)
 #       [logging] level, file path
 #  5. Run: sudo ./iwf -c /path/to/iwf.conf
 #     Or use this script with --install to install binary + systemd service.
@@ -41,6 +42,11 @@ IWF_LOCAL_IP="${IWF_LOCAL_IP:-}"           # if empty, set equal to listen_ip wh
 IWF_SGSN_IP="${IWF_SGSN_IP:-127.0.0.1}"    # informational in config
 IWF_SGWC_IP="${IWF_SGWC_IP:-127.0.0.1}"
 IWF_SGWC_PORT="${IWF_SGWC_PORT:-2123}"
+IWF_SMF_IP="${IWF_SMF_IP:-}"
+# 0 = initial Create Session (SMF allocates its own TEID in the response).
+# Non-zero only if your SMF deployment uses a fixed S5/S8-C TEID — wrong
+# values cause SMF "No Session" -> SGW-C "No GTP TEID" -> GTP cause 103.
+IWF_SMF_TEID="${IWF_SMF_TEID:-0}"
 IWF_LOG_LEVEL="${IWF_LOG_LEVEL:-info}"
 IWF_LOG_FILE="${IWF_LOG_FILE:-/var/log/iwf/iwf.log}"
 PREFIX="${PREFIX:-/usr/local}"
@@ -67,6 +73,8 @@ Environment (for --install; required when listen is 0.0.0.0):
   IWF_LOCAL_IP    IP advertised in GTP IEs (required if listen is 0.0.0.0)
   IWF_SGWC_IP     Open5GS SGW-C address
   IWF_SGWC_PORT   SGW-C port (default 2123)
+  IWF_SMF_IP      SMF/PGW-C GTP-C IPv4 for [smf] in iwf.conf (Open5GS CSReq)
+  IWF_SMF_TEID    SMF S5/S8-C F-TEID value (decimal or 0x...; default 0)
   IWF_SGSN_IP     Informational osmo-sgsn IP for config file
   IWF_LOG_LEVEL   error|warn|info|debug|trace
   IWF_LOG_FILE    Log file path
@@ -111,6 +119,8 @@ if [[ "$INSTALL" -eq 1 && "${EUID:-$(id -u)}" -ne 0 ]]; then
     IWF_SGSN_IP="$IWF_SGSN_IP" \
     IWF_SGWC_IP="$IWF_SGWC_IP" \
     IWF_SGWC_PORT="$IWF_SGWC_PORT" \
+    IWF_SMF_IP="$IWF_SMF_IP" \
+    IWF_SMF_TEID="$IWF_SMF_TEID" \
     IWF_LOG_LEVEL="$IWF_LOG_LEVEL" \
     IWF_LOG_FILE="$IWF_LOG_FILE" \
     PREFIX="$PREFIX" \
@@ -201,6 +211,10 @@ ip          = ${IWF_SGSN_IP}
 [sgwc]
 ip          = ${IWF_SGWC_IP}
 port        = ${IWF_SGWC_PORT}
+
+[smf]
+ip          = ${IWF_SMF_IP}
+teid        = ${IWF_SMF_TEID}
 
 [logging]
 level       = ${IWF_LOG_LEVEL}

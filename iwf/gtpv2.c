@@ -368,6 +368,32 @@ int gtpv2_enc_serving_network(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc)
     return gtpv2_enc_tlv(e, GTPV2_IE_SERVING_NETWORK, 0, v, sizeof(v));
 }
 
+int gtpv2_enc_uli_from_v1_rai(gtpv2_enc_t *e, const uint8_t rai6[6])
+{
+    /*
+     * TS 29.274 §8.21 ULI: octet 5 flags — bit 1 CGI, 2 SAI, 3 RAI (LSB = bit 1).
+     * RAI-only → 0x04. §8.21.3 RAI field = PLMN(3) + LAC(2) + RAC(2 octets).
+     * GTPv1 / TS 24.008 RAI is 6 octets (1-byte RAC); pad second RAC octet 0.
+     */
+    uint8_t v[8];
+    v[0] = 0x04;
+    memcpy(v + 1, rai6, 6);
+    v[7] = 0x00;
+    return gtpv2_enc_tlv(e, GTPV2_IE_ULI, 0, v, sizeof(v));
+}
+
+int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc)
+{
+    uint8_t plmn[3];
+    mccmnc_encode(mcc, mnc, plmn);
+    uint8_t rai6[6];
+    memcpy(rai6, plmn, 3);
+    rai6[3] = 0;
+    rai6[4] = 0;
+    rai6[5] = 0;
+    return gtpv2_enc_uli_from_v1_rai(e, rai6);
+}
+
 int gtpv2_enc_cause(gtpv2_enc_t *e, uint8_t cause)
 {
     uint8_t v[2] = { cause, 0 };
