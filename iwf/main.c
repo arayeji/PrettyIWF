@@ -66,6 +66,11 @@ static int open_udp(const char *bind_ip, uint16_t port, int *out_fd)
     }
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
         LOGE("net", "bind %s:%u failed: %s", bind_ip, port, strerror(errno));
+        if (errno == EADDRINUSE) {
+            LOGE("net", "UDP %u is already in use (often Open5GS SGW-C/MME on the same host). "
+                        "Run on another machine, or set [iwf] listen_ip to a different local IPv4 than the other GTP stack, or stop the conflicting service. "
+                        "Check: ss -ulnp | grep %u", port, port);
+        }
         close(fd);
         return -1;
     }

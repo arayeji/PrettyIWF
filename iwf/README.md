@@ -55,7 +55,11 @@ If you see `/usr/bin/env: 'bash\r': No such file or directory`, the script has W
 3. **Typical causes**
 
    - **`local_ip must be set`** — `[iwf] listen_ip = 0.0.0.0` but `local_ip` is missing or invalid. Set `local_ip` to the host’s real Gn/S4 IPv4, or bind `listen_ip` to that address instead of `0.0.0.0`.
-   - **`bind … failed: Address already in use`** — UDP 2123 is already taken (another `iwf`, **Open5GS** SGW-C/MME on the same host, etc.). Run `sudo ss -ulnp | grep 2123` and stop the conflicting service or change `listen_port` everywhere consistently.
+   - **`bind … failed: Address already in use`** — Something else already owns **UDP on that IP:port** (very often **Open5GS SGW-C** on the same VM, also bound to `*:2123` or `0.0.0.0:2123`). Only **one** process can bind a given `(local_ip, port)` pair.
+     - **Preferred:** run the IWF on a **different host** (or container with its own IP) from SGW-C.
+     - **Same host, two IPs:** give the machine two addresses; bind IWF with `listen_ip = <Gn-facing-IP>` and ensure SGW-C listens only on **another** local IP (see Open5GS `gtpc` `address` vs your IWF `listen_ip`). Example: IWF `listen_ip = 10.0.0.5`, SGW-C listens on `10.0.0.30` — then both can use port 2123 on **different** addresses.
+     - **Not workable:** two stacks both on `0.0.0.0:2123` on one host (kernel will reject the second bind).
+     - Inspect: `sudo ss -ulnp | grep 2123`
    - **`bad sgwc ip`** — typo or empty `[sgwc] ip` in `/etc/iwf/iwf.conf`.
    - **`failed to load config`** — wrong path in `ExecStart` or unreadable `/etc/iwf/iwf.conf`.
 
