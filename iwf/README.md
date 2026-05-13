@@ -86,9 +86,12 @@ level       = info              ; error|warn|info|debug|trace
 file        = /var/log/iwf.log  ; "-" or empty = stderr
 ```
 
-> The IWF binds **one** UDP socket on `listen_ip:listen_port`. GTPv1-C and
-> GTPv2-C are multiplexed on UDP/2123 by GTP version, exactly as 3GPP
-> intends.
+> The IWF binds **one** UDP socket on `listen_port`. If `listen_ip` is a
+> concrete address, the socket is bound there. If `listen_ip` is `0.0.0.0`
+> and **`local_ip`** is set, the implementation binds **only** `local_ip`
+> (same port) so another GTP-C process can use a different local address on
+> the same host. Set environment **`IWF_LISTEN_ON_ANY=1`** to bind `0.0.0.0`
+> instead. GTPv1-C and GTPv2-C are multiplexed on that socket by GTP version.
 
 ## Run
 
