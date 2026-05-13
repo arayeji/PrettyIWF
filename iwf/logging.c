@@ -84,16 +84,21 @@ void iwf_log(iwf_log_level_t level, const char *component, const char *fmt, ...)
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm_buf);
 
-    fprintf(g_fp, "%s.%03ld [%s] [%-7s] ",
-            ts, (long)(tv.tv_usec / 1000),
-            level_str(level), component ? component : "iwf");
-
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(g_fp, fmt, ap);
+    char msgbuf[2048];
+    vsnprintf(msgbuf, sizeof(msgbuf), fmt, ap);
     va_end(ap);
 
-    fputc('\n', g_fp);
+    fprintf(g_fp, "%s.%03ld [%s] [%-7s] %s\n",
+            ts, (long)(tv.tv_usec / 1000),
+            level_str(level), component ? component : "iwf",
+            msgbuf);
+    fflush(g_fp);
+
+    /* systemd/journald only follows stderr; mirror fatal lines when logging to a file. */
+    if (level <= IWF_LOG_ERROR && g_fp != stderr)
+        fprintf(stderr, "iwf: [%s] %s\n", component ? component : "iwf", msgbuf);
 }
 
 void iwf_log_hex(const char *component, const char *tag,
