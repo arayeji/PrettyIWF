@@ -227,6 +227,8 @@ Type=simple
 ExecStart=$PREFIX/sbin/iwf -c $CONFIG_PATH
 Restart=on-failure
 RestartSec=3
+StandardOutput=journal
+StandardError=journal
 
 # Hardening (optional; comment out if something breaks in your environment)
 NoNewPrivileges=yes
