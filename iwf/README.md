@@ -42,6 +42,23 @@ See `setup-ubuntu.sh --help` and the comment block at the top of that script for
 
 If you see `/usr/bin/env: 'bash\r': No such file or directory`, the script has Windows (CRLF) line endings. From the `iwf` directory run `sed -i 's/\r$//' setup-ubuntu.sh` (or `dos2unix setup-ubuntu.sh`), then `chmod +x setup-ubuntu.sh` again. The repo’s `.gitattributes` keeps `*.sh` as LF on fresh clones.
 
+### `iwf.service` exits with status 1 (restart loop)
+
+1. **See the error in the journal** (recent builds also mirror ERROR lines to stderr):
+
+   `sudo journalctl -u iwf -n 40 --no-pager`
+
+2. **Check the log file** if `[logging] file` is not `-`:
+
+   `sudo tail -50 /var/log/iwf/iwf.log`
+
+3. **Typical causes**
+
+   - **`local_ip must be set`** — `[iwf] listen_ip = 0.0.0.0` but `local_ip` is missing or invalid. Set `local_ip` to the host’s real Gn/S4 IPv4, or bind `listen_ip` to that address instead of `0.0.0.0`.
+   - **`bind … failed: Address already in use`** — UDP 2123 is already taken (another `iwf`, **Open5GS** SGW-C/MME on the same host, etc.). Run `sudo ss -ulnp | grep 2123` and stop the conflicting service or change `listen_port` everywhere consistently.
+   - **`bad sgwc ip`** — typo or empty `[sgwc] ip` in `/etc/iwf/iwf.conf`.
+   - **`failed to load config`** — wrong path in `ExecStart` or unreadable `/etc/iwf/iwf.conf`.
+
 ## Configuration
 
 Edit `iwf.conf` (the install target also drops a sample at
