@@ -29,9 +29,9 @@ typedef enum {
     SESS_WAIT_DS_RESP,
 } sess_state_t;
 
-#define IWF_IMSI_MAX 16
+#define IWF_IMSI_MAX 20       /* 15-digit IMSI + NUL; 8 BCD octets can hold up to 16 digits */
 #define IWF_APN_MAX  64
-#define IWF_MSISDN_MAX 16
+#define IWF_MSISDN_MAX 24     /* E.164 BCD in IE can be long; + NUL */
 
 typedef struct {
     char     imsi[IWF_IMSI_MAX];      /* 5-15 digits, NUL-terminated */
