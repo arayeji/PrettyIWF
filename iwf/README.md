@@ -14,6 +14,10 @@ osmo-sgsn ─────────► iwf ─────────► ─�
                        └─────────► Open5GS SGW-C ── PFCP ── UPG-VPP
 ```
 
+**Lab (sgsnemu, no RNC):** GTP-U still comes from the SGSN host. The IWF sets **S4-SGSN-U** in Create Session Request to the **user-plane GSN** from Create PDP Request (last IE 133 when two are present, per TS 29.060 order) or, if absent, the **UDP source IP** of the request — **not** the IWF `local_ip` — so the UPF accepts GTP-U from `sgsnemu`.
+
+**Bearer activation toward Open5GS / UPG-VPP:** sgsnemu does not send `Update PDP Context`, so the IWF would never issue a `Modify Bearer Request`. Open5GS sgwcd installs the SGW-U **DL FAR in BUFFER** until a Modify Bearer Request supplies the access-side F-TEID (visible as `FAR#1[0]: BUFFER notify_cp=1 bar_id=1` in `vppctl show upf session`). To unblock downlink, the IWF emits a Modify Bearer Request **right after** Create Session Response, reusing the SGSN GTP-U F-TEID it already learned from Create PDP Context Request. The matching MBResp does not generate a GTPv1 Update PDP Response.
+
 ## Build
 
 The project has no external dependencies — `uthash.h` is vendored.
@@ -238,7 +242,8 @@ SGW-C    → IWF        GTPv2 Create Session Response   seq=1 cause=16
 IWF      → osmo-sgsn  GTPv1 Create PDP Context Response seq=42 cause=128
                        Reordering=0xfe ChargingId TEID-D=0xa1
                        TEID-C(IWF)=0x10000001 EUA=10.45.0.2
-                       GSN(U)=10.234.241.40 GSN(C)=10.234.241.10
+                       GSN(C)=10.234.241.10 GSN(U)=10.234.241.40
+                       (TS 29.060: two IE 133 in this order — user plane is SGW-U)
 osmo-sgsn → RNC       RAB Assignment (uses TEID-D=0xa1 @ 10.234.241.40)
 RNC      → UPG-VPP    GTPv1-U packets directly to 10.234.241.40 / 0xa1
 ```

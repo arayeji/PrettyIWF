@@ -182,6 +182,7 @@ const char *sess_state_str(sess_state_t st)
     case SESS_ACTIVE:        return "ACTIVE";
     case SESS_MODIFYING:     return "MODIFYING";
     case SESS_WAIT_MB_RESP:  return "WAIT_MB_RESP";
+    case SESS_WAIT_MB_RESP_INIT: return "WAIT_MB_RESP_INIT";
     case SESS_DELETING:      return "DELETING";
     case SESS_WAIT_DS_RESP:  return "WAIT_DS_RESP";
     }

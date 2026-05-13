@@ -220,6 +220,22 @@ int gtpv1_decode_gsn_addr(const iwf_ie_t *ie, uint32_t *ipv4)
     return 0;
 }
 
+int gtpv1_last_gsn_addr_ipv4(const iwf_msg_t *msg, uint32_t *ipv4)
+{
+    if (!msg || !ipv4) return -1;
+    uint32_t last = 0;
+    for (size_t i = 0; i < msg->n_ies; i++) {
+        if (msg->ies[i].type != GTPV1_IE_GSN_ADDRESS)
+            continue;
+        uint32_t a = 0;
+        if (gtpv1_decode_gsn_addr(&msg->ies[i], &a) == 0 && a)
+            last = a;
+    }
+    if (!last) return -1;
+    *ipv4 = last;
+    return 0;
+}
+
 /* ------------------------------------------------------------------- */
 /* Encoder                                                             */
 /* ------------------------------------------------------------------- */
