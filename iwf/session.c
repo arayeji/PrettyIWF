@@ -3,6 +3,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <time.h>
 
 static sess_t *g_by_key = NULL;       /* keyed on sess_key_t */
 static sess_t *g_by_iwf_c = NULL;     /* keyed on iwf_ctrl_teid */
@@ -30,7 +32,11 @@ void sess_init(void)
     g_by_key = NULL;
     g_iwf_c_idx = NULL;
     g_iwf_s4_idx = NULL;
-    g_teid_counter = (uint32_t)(time(NULL) & 0x00ffffff) | 0x10000000;
+    /* Mix PID into the seed so two iwf processes started in the same second
+     * cannot hand out the same TEIDs. Makes duplicate-process bugs obvious. */
+    uint32_t t_part   = (uint32_t)(time(NULL) & 0x00ffff);
+    uint32_t pid_part = (uint32_t)(getpid() & 0xff);
+    g_teid_counter = 0x10000000u | (pid_part << 16) | t_part;
 }
 
 void sess_shutdown(void)
@@ -87,6 +93,20 @@ sess_t *sess_find_by_pending_v2_seq(uint32_t seq24, sess_state_t expect_state)
     sess_t *s, *tmp;
     HASH_ITER(hh, g_by_key, s, tmp) {
         if (s->state == expect_state && (s->gtpv2_seq & 0xffffffu) == want)
+            return s;
+    }
+    return NULL;
+}
+
+sess_t *sess_find_pending_create_by_imsi_gnseq(const char *imsi, uint16_t gn_seq)
+{
+    sess_t *s, *tmp;
+    HASH_ITER(hh, g_by_key, s, tmp) {
+        if (strcmp(s->key.imsi, imsi) != 0)
+            continue;
+        if (s->state != SESS_WAIT_CS_RESP && s->state != SESS_CREATING)
+            continue;
+        if (s->sgsn_seq == gn_seq)
             return s;
     }
     return NULL;

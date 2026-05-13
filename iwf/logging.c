@@ -90,10 +90,10 @@ void iwf_log(iwf_log_level_t level, const char *component, const char *fmt, ...)
     vsnprintf(msgbuf, sizeof(msgbuf), fmt, ap);
     va_end(ap);
 
-    fprintf(g_fp, "%s.%03ld [%s] [%-7s] %s\n",
+    fprintf(g_fp, "%s.%03ld [%s] [%-7s] pid=%d %s\n",
             ts, (long)(tv.tv_usec / 1000),
             level_str(level), component ? component : "iwf",
-            msgbuf);
+            (int)getpid(), msgbuf);
     fflush(g_fp);
 
     /* systemd/journald only follows stderr; mirror fatal lines when logging to a file. */

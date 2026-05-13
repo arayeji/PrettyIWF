@@ -70,6 +70,10 @@ int gtpv2_enc_apn_restriction(gtpv2_enc_t *e, uint8_t restr);
 int gtpv2_enc_serving_network(gtpv2_enc_t *e,
                               uint16_t mcc, uint16_t mnc);
 int gtpv2_enc_cause(gtpv2_enc_t *e, uint8_t cause);
+/* ULI with RAI only, from 6-octet GTPv1 / TS 24.008 RAI (PLMN+LAC+RAC). */
+int gtpv2_enc_uli_from_v1_rai(gtpv2_enc_t *e, const uint8_t rai6[6]);
+/* Same wire shape, PLMN from MCC/MNC and LAC=RAC=0 (lab fallback when Gn has no RAI). */
+int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc);
 int gtpv2_enc_fteid_ipv4(gtpv2_enc_t *e, uint8_t instance,
                          uint8_t iface, uint32_t teid, uint32_t ipv4);
 

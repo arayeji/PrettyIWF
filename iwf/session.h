@@ -89,6 +89,8 @@ sess_t *sess_find_by_iwf_ctrl_teid(uint32_t teid);
 sess_t *sess_find_by_iwf_s4_c_teid(uint32_t teid);
 /* When SGW sends header TEID 0 (T=0) or wrong TEID, correlate by our last seq. */
 sess_t *sess_find_by_pending_v2_seq(uint32_t seq24, sess_state_t expect_state);
+/* Retransmitted Create PDP may omit NSAPI IE — match only IMSI + GTPv1 seq. */
+sess_t *sess_find_pending_create_by_imsi_gnseq(const char *imsi, uint16_t gn_seq);
 sess_t *sess_create(const char *imsi, uint8_t nsapi);
 void    sess_remove(sess_t *s);
 
