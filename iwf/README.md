@@ -40,6 +40,8 @@ sudo systemctl status iwf
 
 See `setup-ubuntu.sh --help` and the comment block at the top of that script for manual step-by-step instructions and all environment variables.
 
+If you see `/usr/bin/env: 'bash\r': No such file or directory`, the script has Windows (CRLF) line endings. From the `iwf` directory run `sed -i 's/\r$//' setup-ubuntu.sh` (or `dos2unix setup-ubuntu.sh`), then `chmod +x setup-ubuntu.sh` again. The repo’s `.gitattributes` keeps `*.sh` as LF on fresh clones.
+
 ## Configuration
 
 Edit `iwf.conf` (the install target also drops a sample at
