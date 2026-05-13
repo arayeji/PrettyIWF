@@ -444,9 +444,17 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
         LOGI("translate", "CSResp imsi=%s matched via seq=%u (hdr teid=0x%08x, iwf_s4_c=0x%08x)",
              s->key.imsi, (unsigned)(v2->seq & 0xffffffu), v2->teid, s->iwf_s4_c_teid);
 
-    uint8_t cause = 0;
-    const iwf_ie_t *ie = gtpv2_find_ie(v2, GTPV2_IE_CAUSE, 0);
-    if (ie) gtpv2_decode_cause(ie, &cause);
+    uint8_t gtpv2_cause;
+    if (gtpv2_find_cause_value(v2, &gtpv2_cause) < 0) {
+        LOGW("translate", "CSResp imsi=%s no decodable Cause IE (ies=%zu) — treating as reject",
+             s->key.imsi, v2->n_ies);
+        gtpv2_cause = GTPV2_CAUSE_SYSTEM_FAILURE;
+    } else if (gtpv2_cause != GTPV2_CAUSE_REQUEST_ACCEPTED) {
+        LOGW("translate", "CSResp imsi=%s gtpv2_cause=%u (not Request Accepted)",
+             s->key.imsi, (unsigned)gtpv2_cause);
+    }
+
+    const iwf_ie_t *ie;
 
     /* Pick up SGW-C control F-TEID (instance 0) and SGW-U user F-TEID
      * (carried inside the Bearer Context grouped IE). */
@@ -475,8 +483,9 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
 
     /* Bearer Context - SGW-U F-TEID (Direct Tunnel target). */
     if ((ie = gtpv2_find_ie(v2, GTPV2_IE_BEARER_CONTEXT, 0))) {
-        iwf_ie_t inner[8]; size_t n_inner = 0;
-        if (gtpv2_parse_grouped(ie, inner, 8, &n_inner) == 0) {
+        iwf_ie_t inner[IWF_MAX_IES];
+        size_t n_inner = 0;
+        if (gtpv2_parse_grouped(ie, inner, IWF_MAX_IES, &n_inner) == 0) {
             for (size_t i = 0; i < n_inner; i++) {
                 if (inner[i].type == GTPV2_IE_FTEID) {
                     uint8_t iface; uint32_t teid, ipv4;
@@ -501,9 +510,19 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
     gtpv1_enc_begin(&e, GTPV1_CREATE_PDP_CONTEXT_RESPONSE,
                     s->sgsn_ctrl_teid, s->sgsn_seq);
 
-    uint8_t v1_cause = (cause == GTPV2_CAUSE_REQUEST_ACCEPTED)
+    uint8_t v1_cause = (gtpv2_cause == GTPV2_CAUSE_REQUEST_ACCEPTED)
                        ? GTPV1_CAUSE_REQUEST_ACCEPTED
                        : GTPV1_CAUSE_NO_RESOURCES;
+
+    iwf_endpoint_t resp_ep    = s->sgsn_ep;
+    uint16_t       resp_seq   = s->sgsn_seq;
+    char           log_imsi[IWF_IMSI_MAX];
+    strncpy(log_imsi, s->key.imsi, sizeof(log_imsi));
+    log_imsi[sizeof(log_imsi) - 1] = '\0';
+    uint32_t log_sgwu_ip   = s->sgwu_addr_ipv4;
+    uint32_t log_sgwu_teid = s->sgwu_teid;
+    uint32_t log_ue_ip     = s->ue_ipv4;
+
     gtpv1_enc_cause(&e, v1_cause);
 
     if (v1_cause == GTPV1_CAUSE_REQUEST_ACCEPTED) {
@@ -543,15 +562,15 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
 
     LOGI("translate",
          "TX-Gn Create-PDP-Resp imsi=%s seq=%u cause=%u sgwu=%u.%u.%u.%u teid=0x%08x ue_ip=%u.%u.%u.%u",
-         s->key.imsi, s->sgsn_seq, v1_cause,
-         (s->sgwu_addr_ipv4 >> 24) & 0xff, (s->sgwu_addr_ipv4 >> 16) & 0xff,
-         (s->sgwu_addr_ipv4 >> 8) & 0xff, s->sgwu_addr_ipv4 & 0xff,
-         s->sgwu_teid,
-         (s->ue_ipv4 >> 24) & 0xff, (s->ue_ipv4 >> 16) & 0xff,
-         (s->ue_ipv4 >> 8) & 0xff, s->ue_ipv4 & 0xff);
+         log_imsi, (unsigned)resp_seq, v1_cause,
+         (log_sgwu_ip >> 24) & 0xff, (log_sgwu_ip >> 16) & 0xff,
+         (log_sgwu_ip >> 8) & 0xff, log_sgwu_ip & 0xff,
+         log_sgwu_teid,
+         (log_ue_ip >> 24) & 0xff, (log_ue_ip >> 16) & 0xff,
+         (log_ue_ip >> 8) & 0xff, log_ue_ip & 0xff);
     iwf_log_hex("translate", "Create-PDP-Resp", outbuf, (size_t)total);
 
-    return iwf_send_v1(rt, &s->sgsn_ep, outbuf, (size_t)total);
+    return iwf_send_v1(rt, &resp_ep, outbuf, (size_t)total);
 }
 
 static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)

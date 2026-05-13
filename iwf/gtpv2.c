@@ -98,9 +98,56 @@ int gtpv2_parse_grouped(const iwf_ie_t *grp,
 
 int gtpv2_decode_cause(const iwf_ie_t *ie, uint8_t *cause)
 {
-    if (!ie || ie->length < 2) return -1;
+    if (!ie || ie->length < 1) return -1;
     *cause = ie->value[0];
     return 0;
+}
+
+int gtpv2_find_cause_value(const iwf_msg_t *msg, uint8_t *cause_out)
+{
+    if (!msg || !cause_out) return -1;
+
+    uint8_t first_top = 0xff;
+    uint8_t first_bc  = 0xff;
+
+    for (size_t i = 0; i < msg->n_ies; i++) {
+        if (msg->ies[i].type != GTPV2_IE_CAUSE) continue;
+        uint8_t c;
+        if (gtpv2_decode_cause(&msg->ies[i], &c) != 0) continue;
+        if (c == GTPV2_CAUSE_REQUEST_ACCEPTED) {
+            *cause_out = c;
+            return 0;
+        }
+        if (first_top == 0xff) first_top = c;
+    }
+
+    for (size_t i = 0; i < msg->n_ies; i++) {
+        if (msg->ies[i].type != GTPV2_IE_BEARER_CONTEXT) continue;
+        iwf_ie_t inner[IWF_MAX_IES];
+        size_t n = 0;
+        if (gtpv2_parse_grouped(&msg->ies[i], inner, IWF_MAX_IES, &n) != 0)
+            continue;
+        for (size_t j = 0; j < n; j++) {
+            if (inner[j].type != GTPV2_IE_CAUSE) continue;
+            uint8_t c;
+            if (gtpv2_decode_cause(&inner[j], &c) != 0) continue;
+            if (c == GTPV2_CAUSE_REQUEST_ACCEPTED) {
+                *cause_out = c;
+                return 0;
+            }
+            if (first_bc == 0xff) first_bc = c;
+        }
+    }
+
+    if (first_top != 0xff) {
+        *cause_out = first_top;
+        return 0;
+    }
+    if (first_bc != 0xff) {
+        *cause_out = first_bc;
+        return 0;
+    }
+    return -1;
 }
 
 int gtpv2_decode_fteid(const iwf_ie_t *ie,
