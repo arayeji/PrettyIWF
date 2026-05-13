@@ -433,10 +433,16 @@ int translate_v1_request(iwf_runtime_t *rt,
 static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
 {
     sess_t *s = sess_find_by_iwf_s4_c_teid(v2->teid);
+    if (!s)
+        s = sess_find_by_pending_v2_seq(v2->seq, SESS_WAIT_CS_RESP);
     if (!s) {
-        LOGW("translate", "CSResp for unknown S4 TEID 0x%08x", v2->teid);
+        LOGW("translate", "CSResp: no session for S4 TEID 0x%08x seq=%u (expected iwf_s4_c_teid or pending CS)",
+             v2->teid, (unsigned)(v2->seq & 0xffffffu));
         return -1;
     }
+    if (v2->teid != s->iwf_s4_c_teid)
+        LOGI("translate", "CSResp imsi=%s matched via seq=%u (hdr teid=0x%08x, iwf_s4_c=0x%08x)",
+             s->key.imsi, (unsigned)(v2->seq & 0xffffffu), v2->teid, s->iwf_s4_c_teid);
 
     uint8_t cause = 0;
     const iwf_ie_t *ie = gtpv2_find_ie(v2, GTPV2_IE_CAUSE, 0);
@@ -551,8 +557,11 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
 static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
 {
     sess_t *s = sess_find_by_iwf_s4_c_teid(v2->teid);
+    if (!s)
+        s = sess_find_by_pending_v2_seq(v2->seq, SESS_WAIT_MB_RESP);
     if (!s) {
-        LOGW("translate", "MBResp for unknown S4 TEID 0x%08x", v2->teid);
+        LOGW("translate", "MBResp: no session for S4 TEID 0x%08x seq=%u",
+             v2->teid, (unsigned)(v2->seq & 0xffffffu));
         return -1;
     }
 
@@ -598,8 +607,11 @@ static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
 static int handle_delete_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
 {
     sess_t *s = sess_find_by_iwf_s4_c_teid(v2->teid);
+    if (!s)
+        s = sess_find_by_pending_v2_seq(v2->seq, SESS_WAIT_DS_RESP);
     if (!s) {
-        LOGW("translate", "DSResp for unknown S4 TEID 0x%08x", v2->teid);
+        LOGW("translate", "DSResp: no session for S4 TEID 0x%08x seq=%u",
+             v2->teid, (unsigned)(v2->seq & 0xffffffu));
         return -1;
     }
 
