@@ -81,6 +81,17 @@ sess_t *sess_find_by_iwf_s4_c_teid(uint32_t teid)
     return teid_lookup(g_iwf_s4_idx, teid);
 }
 
+sess_t *sess_find_by_pending_v2_seq(uint32_t seq24, sess_state_t expect_state)
+{
+    uint32_t want = seq24 & 0xffffffu;
+    sess_t *s, *tmp;
+    HASH_ITER(hh, g_by_key, s, tmp) {
+        if (s->state == expect_state && (s->gtpv2_seq & 0xffffffu) == want)
+            return s;
+    }
+    return NULL;
+}
+
 static void teid_index_insert(teid_idx_t **idx, uint32_t teid, sess_t *s)
 {
     teid_idx_t *e = (teid_idx_t *)calloc(1, sizeof(*e));
