@@ -25,6 +25,9 @@ typedef enum {
     SESS_ACTIVE,
     SESS_MODIFYING,
     SESS_WAIT_MB_RESP,
+    /* Bearer activation MBReq sent right after CSResp (no preceding Update PDP
+     * from osmo-sgsn). MBResp must NOT generate a GTPv1 Update PDP Response. */
+    SESS_WAIT_MB_RESP_INIT,
     SESS_DELETING,
     SESS_WAIT_DS_RESP,
 } sess_state_t;
@@ -46,7 +49,7 @@ typedef struct sess_s {
     char        apn[IWF_APN_MAX];
 
     /* GTPv1 (Gn / S4-SGSN side) */
-    uint32_t    sgsn_addr_ipv4;       /* osmo-sgsn control IP from GSN Address */
+    uint32_t    sgsn_addr_ipv4;       /* SGSN GTP-U IPv4 (user-traffic GSN IE / peer) */
     uint32_t    sgsn_ctrl_teid;       /* SGSN's control-plane TEID (we send to it) */
     uint32_t    sgsn_data_teid;       /* SGSN/RNC user-plane TEID (DT: RNC TEID after Update) */
     uint16_t    sgsn_seq;             /* last GTPv1 request seq we answer with */
@@ -72,6 +75,14 @@ typedef struct sess_s {
      * to echo back in the Create PDP Response. */
     uint8_t     qos_blob[64];
     size_t      qos_len;
+
+    /* User Location Information cached from Create PDP, replayed in MBReq.
+     * uli_kind: 0 = none, 1 = real RAI (uli_rai6 holds the 6 octets),
+     *           2 = synthetic from IMSI PLMN (uli_mcc/uli_mnc used). */
+    uint8_t     uli_kind;
+    uint8_t     uli_rai6[6];
+    uint16_t    uli_mcc;
+    uint16_t    uli_mnc;
 
     /* State + timestamps */
     sess_state_t state;
