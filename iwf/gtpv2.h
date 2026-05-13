@@ -29,6 +29,8 @@ int gtpv2_parse_grouped(const iwf_ie_t *grp,
 
 /* Decoders. */
 int gtpv2_decode_cause(const iwf_ie_t *ie, uint8_t *cause);
+/* Cause at message level or inside Bearer Context (Open5GS CSRsp shape). */
+int gtpv2_find_cause_value(const iwf_msg_t *msg, uint8_t *cause_out);
 int gtpv2_decode_fteid(const iwf_ie_t *ie,
                        uint8_t *iface, uint32_t *teid,
                        uint32_t *ipv4);
