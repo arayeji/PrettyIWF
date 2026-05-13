@@ -72,6 +72,7 @@ Environment (for --install; required when listen is 0.0.0.0):
   IWF_LOG_FILE    Log file path
   PREFIX          Install prefix (default /usr/local)
   CONFIG_PATH     Config path (default /etc/iwf/iwf.conf)
+  IWF_LISTEN_ON_ANY  If set to 1, bind listen_ip literally (even when 0.0.0.0)
 
 Example:
   sudo IWF_LOCAL_IP=10.0.0.5 IWF_SGWC_IP=10.0.0.30 ./setup-ubuntu.sh --install -y
@@ -116,6 +117,7 @@ if [[ "$INSTALL" -eq 1 && "${EUID:-$(id -u)}" -ne 0 ]]; then
     SYSTEMD_UNIT="$SYSTEMD_UNIT" \
     CONFIG_PATH="$CONFIG_PATH" \
     YES="$YES" \
+    IWF_LISTEN_ON_ANY="${IWF_LISTEN_ON_ANY:-}" \
     bash "$0" --install ${YES:+-y}
 fi
 
@@ -224,6 +226,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Uncomment to bind 0.0.0.0 even when local_ip is set (rare):
+#Environment=IWF_LISTEN_ON_ANY=1
 ExecStart=$PREFIX/sbin/iwf -c $CONFIG_PATH
 Restart=on-failure
 RestartSec=3

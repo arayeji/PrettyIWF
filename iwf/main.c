@@ -210,10 +210,7 @@ int main(int argc, char **argv)
 
     sess_init();
 
-    if (open_udp(rt.cfg.listen_ip, rt.cfg.listen_port, &rt.v1_sock) < 0) return 1;
-    rt.v2_sock = rt.v1_sock; /* multiplexed - see header comment */
-
-    /* Resolve local IPv4 (network order). */
+    /* Resolve local IPv4 (network order) for GTP F-TEID / GSN Address IEs. */
     if (rt.cfg.local_ip[0]) {
         struct in_addr a;
         if (inet_pton(AF_INET, rt.cfg.local_ip, &a) == 1)
@@ -231,6 +228,26 @@ int main(int argc, char **argv)
              "local_ip must be set (listen_ip is 0.0.0.0); use [iwf] local_ip");
         return 1;
     }
+
+    /* Bind address: config listen_ip, unless 0.0.0.0 + local_ip set — then bind
+     * only on local_ip so this host can share UDP/2123 with another GTP stack
+     * (e.g. Open5GS SGW-C) on a different local address. */
+    const char *listen_any = getenv("IWF_LISTEN_ON_ANY");
+    int         force_listen_any = (listen_any && strcmp(listen_any, "1") == 0);
+
+    const char *bind_ip = rt.cfg.listen_ip;
+    if (strcmp(rt.cfg.listen_ip, "0.0.0.0") == 0 &&
+        rt.cfg.local_ip[0] != '\0' &&
+        !force_listen_any) {
+        bind_ip = rt.cfg.local_ip;
+        LOGI("iwf",
+             "listen_ip is 0.0.0.0: binding UDP on local_ip %s:%u (not on all interfaces). "
+             "Set env IWF_LISTEN_ON_ANY=1 to bind 0.0.0.0 instead.",
+             bind_ip, (unsigned)rt.cfg.listen_port);
+    }
+
+    if (open_udp(bind_ip, rt.cfg.listen_port, &rt.v1_sock) < 0) return 1;
+    rt.v2_sock = rt.v1_sock; /* multiplexed - see header comment */
 
     rt.sgwc_addr.sin_family = AF_INET;
     rt.sgwc_addr.sin_port   = htons(rt.cfg.sgwc_port);
@@ -262,8 +279,9 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
-    LOGI("iwf", "ready: Gn=%s:%u -> S4 SGW-C=%s:%u (local %s)",
-         rt.cfg.listen_ip, rt.cfg.listen_port,
+    LOGI("iwf", "ready: UDP %s:%u (listen_ip=%s) -> S4 SGW-C=%s:%u (F-TEID/GSN %s)",
+         bind_ip, rt.cfg.listen_port,
+         rt.cfg.listen_ip,
          rt.cfg.sgwc_ip, rt.cfg.sgwc_port,
          inet_ntoa(*(struct in_addr *)&rt.local_ipv4_be));
 
