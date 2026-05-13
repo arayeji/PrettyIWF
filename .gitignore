@@ -1,0 +1,4 @@
+# Build outputs
+iwf/iwf
+iwf/*.o
+iwf/*.d
