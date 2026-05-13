@@ -25,6 +25,11 @@ int  gtpv1_parse(const uint8_t *buf, size_t len, iwf_msg_t *msg);
 /* Locate an IE in a parsed message; returns NULL if absent. */
 const iwf_ie_t *gtpv1_find_ie(const iwf_msg_t *msg, uint8_t type);
 
+/* Last IE 133 (GSN Address) in wire order — Create PDP Req lists Control
+ * Plane then User Traffic (TS 29.060 Table 7.3.1-1); the SGSN GTP-U source
+ * is the user-plane address (second IE when both present). */
+int gtpv1_last_gsn_addr_ipv4(const iwf_msg_t *msg, uint32_t *ipv4);
+
 /* IE-specific decoders.  All return 0 on success, -1 on malformed input. */
 int gtpv1_decode_imsi(const iwf_ie_t *ie, char *imsi_str, size_t cap);
 int gtpv1_decode_msisdn(const iwf_ie_t *ie, char *msisdn_str, size_t cap);

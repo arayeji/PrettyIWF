@@ -27,6 +27,10 @@ static const char *v1_msg_str(uint8_t t)
     }
 }
 
+/* Forward decl — used both for spontaneous activation MBReq after CSResp and
+ * for the Update-PDP-Context-triggered MBReq path. */
+static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi);
+
 static const char *v2_msg_str(uint8_t t)
 {
     switch (t) {
@@ -172,8 +176,16 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         gtpv1_decode_teid(ie, &s->sgsn_ctrl_teid);
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_TEID_DATA_I)))
         gtpv1_decode_teid(ie, &s->sgsn_data_teid);
-    if ((ie = gtpv1_find_ie(v1, GTPV1_IE_GSN_ADDRESS)))
-        gtpv1_decode_gsn_addr(ie, &s->sgsn_addr_ipv4);
+    /* S4-SGSN-U F-TEID IPv4 must match the source of real GTP-U (sgsnemu host).
+     * TS 29.060 orders two IE 133 as Control Plane then User Traffic; the first
+     * IE alone is often only control — Open5GS would then expect GTP-U from the
+     * IWF local_ip and drop packets from the SGSN. Use last GSN IE, else UDP src. */
+    if (gtpv1_last_gsn_addr_ipv4(v1, &s->sgsn_addr_ipv4) != 0) {
+        if (from->addr.sin_family == AF_INET)
+            s->sgsn_addr_ipv4 = ntohl(from->addr.sin_addr.s_addr);
+        else
+            s->sgsn_addr_ipv4 = 0;
+    }
 
     /* QoS Profile - keep verbatim to echo in the Create PDP Response. */
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_QOS_PROFILE))) {
@@ -212,11 +224,18 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     }
 
     /* ULI (RAI) — Open5GS SGW-C often requires this for UTRAN (GTPv2 cause 103
-     * "Conditional IE missing" if absent). Map from GTPv1 RAI TV IE. */
+     * "Conditional IE missing" if absent). Map from GTPv1 RAI TV IE. Cache the
+     * 6-octet RAI on the session so the activation Modify Bearer Req can
+     * replay the same ULI (Open5GS rejects MBReq without ULI as cause 70). */
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_RAI)) && ie->length >= 6) {
+        memcpy(s->uli_rai6, ie->value, 6);
+        s->uli_kind = 1;
         if (gtpv2_enc_uli_from_v1_rai(&e, ie->value) != 0)
             LOGW("translate", "encoding ULI from RAI failed");
     } else if (rt->cfg.synthetic_uli_no_rai && have_sn) {
+        s->uli_kind = 2;
+        s->uli_mcc  = mcc_sn;
+        s->uli_mnc  = mnc_sn;
         if (gtpv2_enc_uli_synthetic_plmn(&e, mcc_sn, mnc_sn) != 0)
             LOGW("translate", "encoding synthetic ULI failed");
         else
@@ -304,10 +323,15 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
          * updated later via Modify Bearer Request once the RNC TEID is
          * known.  We send a placeholder (the SGSN's data TEID) here so the
          * SGW-U has somewhere to forward DL packets if Update is delayed. */
+        if (!s->sgsn_addr_ipv4) {
+            LOGE("translate",
+                 "Create-Session: cannot derive S4-SGSN-U IPv4 (no GSN IE, invalid peer) imsi=%s",
+                 imsi);
+            sess_remove(s);
+            return -1;
+        }
         gtpv2_enc_fteid_ipv4(&e, /*instance*/ 1, FTEID_IFACE_S4_SGSN_GTPU,
-                             s->sgsn_data_teid,
-                             s->sgsn_addr_ipv4 ? s->sgsn_addr_ipv4
-                                               : ntohl(rt->local_ipv4_be));
+                             s->sgsn_data_teid, s->sgsn_addr_ipv4);
     gtpv2_enc_group_finish(&e, patch_pos);
 
     int total = gtpv2_enc_finish(&e);
@@ -361,47 +385,29 @@ static int translate_update_pdp_context(iwf_runtime_t *rt,
     uint32_t rnc_ipv4 = s->sgsn_addr_ipv4;
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_TEID_DATA_I)))
         gtpv1_decode_teid(ie, &rnc_teid);
-    if ((ie = gtpv1_find_ie(v1, GTPV1_IE_GSN_ADDRESS)))
-        gtpv1_decode_gsn_addr(ie, &rnc_ipv4);
+    {
+        uint32_t gsn_u = 0;
+        if (gtpv1_last_gsn_addr_ipv4(v1, &gsn_u) == 0)
+            rnc_ipv4 = gsn_u;
+        else if (from->addr.sin_family == AF_INET)
+            rnc_ipv4 = ntohl(from->addr.sin_addr.s_addr);
+    }
     s->sgsn_data_teid   = rnc_teid;
     s->sgsn_addr_ipv4   = rnc_ipv4;
     s->state            = SESS_MODIFYING;
-    s->gtpv2_seq        = ++rt->v2_seq;
 
     log_msg("RX-Gn", v1, imsi, s->apn);
 
-    /* Build Modify Bearer Request - addressed to SGW-C using its TEID. */
-    uint8_t outbuf[IWF_MAX_PKT];
-    gtpv2_enc_t e;
-    gtpv2_enc_init(&e, outbuf, sizeof(outbuf));
-    gtpv2_enc_begin(&e, GTPV2_MODIFY_BEARER_REQUEST,
-                    s->sgwc_ctrl_teid, s->gtpv2_seq);
-
-    gtpv2_enc_rat_type(&e, rt->cfg.rat_type);
-    gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00); /* DTF */
-
-    /* Bearer Contexts To Be Modified (grouped IE 93, instance 0). */
-    size_t patch_pos;
-    gtpv2_enc_group_begin(&e, GTPV2_IE_BEARER_CONTEXT, 0, &patch_pos);
-        gtpv2_enc_ebi(&e, 0, nsapi);
-        /* Direct Tunnel: tell SGW-U to send DL straight to the RNC. */
-        gtpv2_enc_fteid_ipv4(&e, /*instance*/ 1, FTEID_IFACE_S4_SGSN_GTPU,
-                             s->sgsn_data_teid, s->sgsn_addr_ipv4);
-    gtpv2_enc_group_finish(&e, patch_pos);
-
-    int total = gtpv2_enc_finish(&e);
-    if (total <= 0) return -1;
+    int rc = send_modify_bearer_req(rt, s, nsapi);
+    if (rc < 0) return rc;
 
     s->state = SESS_WAIT_MB_RESP;
-    sess_touch(s);
 
     LOGI("translate", "TX-S4 Modify-Bearer-Req imsi=%s seq=%u rnc_teid=0x%08x rnc_ip=%u.%u.%u.%u",
          imsi, s->gtpv2_seq, rnc_teid,
          (rnc_ipv4 >> 24) & 0xff, (rnc_ipv4 >> 16) & 0xff,
          (rnc_ipv4 >> 8) & 0xff, rnc_ipv4 & 0xff);
-    iwf_log_hex("translate", "MBReq", outbuf, (size_t)total);
-
-    return iwf_send_v2(rt, outbuf, (size_t)total);
+    return rc;
 }
 
 static int translate_delete_pdp_context(iwf_runtime_t *rt,
@@ -484,9 +490,102 @@ int translate_v1_request(iwf_runtime_t *rt,
     }
 }
 
+/* Send Modify Bearer Request toward SGW-C carrying the S4-SGSN GTP-U F-TEID.
+ * Used both for spontaneous bearer activation after Create Session Response
+ * (Open5GS SGW-U otherwise leaves DL FAR in BUFFER) and for Update PDP Context
+ * forwarding. The caller sets the session state after the call. */
+static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
+{
+    s->gtpv2_seq = ++rt->v2_seq;
+
+    uint8_t outbuf[IWF_MAX_PKT];
+    gtpv2_enc_t e;
+    gtpv2_enc_init(&e, outbuf, sizeof(outbuf));
+    gtpv2_enc_begin(&e, GTPV2_MODIFY_BEARER_REQUEST,
+                    s->sgwc_ctrl_teid, s->gtpv2_seq);
+
+    /* User Location Information — Open5GS sgwcd validates ULI on Modify Bearer
+     * for S4 and answers cause 70 (Mandatory IE missing) if absent. Replay
+     * whatever we cached during Create PDP. */
+    if (s->uli_kind == 1) {
+        gtpv2_enc_uli_from_v1_rai(&e, s->uli_rai6);
+    } else if (s->uli_kind == 2) {
+        gtpv2_enc_uli_synthetic_plmn(&e, s->uli_mcc, s->uli_mnc);
+    }
+
+    /* Sender F-TEID for Control Plane (S4-SGSN GTP-C) — Open5GS sgwcd treats
+     * this as conditional/mandatory on MBReq to identify the S4-SGSN peer. */
+    gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S4_SGSN_GTPC,
+                         s->iwf_s4_c_teid, ntohl(rt->local_ipv4_be));
+
+    gtpv2_enc_rat_type(&e, rt->cfg.rat_type);
+    gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00); /* DTF */
+
+    /* Bearer Context (modified). Open5GS sgwc validates the access-side F-TEID
+     * by *instance number* (sgwc/s11-handler.c looks at instance 0, which it
+     * names s1_u_enodeb_f_teid), not by interface-type. For S4 interworking we
+     * still set Interface Type = S4-SGSN GTP-U (15) — Open5GS only reads
+     * TEID + IPv4 on this path — but the IE instance must be 0 or cause 70
+     * (Mandatory IE Missing) comes back even though instance 1 is the spec
+     * slot for S4-SGSN F-TEID in Modify Bearer Request. */
+    size_t patch_pos;
+    gtpv2_enc_group_begin(&e, GTPV2_IE_BEARER_CONTEXT, 0, &patch_pos);
+        gtpv2_enc_ebi(&e, 0, ebi);
+        gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S4_SGSN_GTPU,
+                             s->sgsn_data_teid, s->sgsn_addr_ipv4);
+    gtpv2_enc_group_finish(&e, patch_pos);
+
+    int total = gtpv2_enc_finish(&e);
+    if (total <= 0) return -1;
+
+    sess_touch(s);
+    iwf_log_hex("translate", "MBReq", outbuf, (size_t)total);
+    return iwf_send_v2(rt, outbuf, (size_t)total);
+}
+
 /* ------------------------------------------------------------------- */
 /* Southbound: GTPv2-C from SGW-C -> GTPv1-C back to osmo-sgsn          */
 /* ------------------------------------------------------------------- */
+
+/* Create Session Response bearer may list several F-TEIDs (e.g. S5/S8 PGW
+ * GTP-U before S4 SGW GTP-U). The SGSN must send GTP-U to the S4/S1 SGW-U
+ * leg only — never the PGW S5-U address (iface 5). Rank by TS 29.274 type. */
+static int bearer_fteid_rank_sgwu(uint8_t iface)
+{
+    switch (iface) {
+    case FTEID_IFACE_S4_SGW_GTPU:   return 0;
+    case FTEID_IFACE_S1U_SGW_GTPU:  return 1;
+    case FTEID_IFACE_S5S8_SGW_GTPU: return 2;
+    case FTEID_IFACE_S11_SGW_GTPU:   return 3;
+    default:                         return 99;
+    }
+}
+
+static void bearer_pick_sgwu_fteid(const iwf_ie_t *inner, size_t n_inner,
+                                   uint32_t *out_teid, uint32_t *out_ipv4)
+{
+    int best = 100;
+    *out_teid = 0;
+    *out_ipv4 = 0;
+    for (size_t i = 0; i < n_inner; i++) {
+        if (inner[i].type != GTPV2_IE_FTEID)
+            continue;
+        uint8_t iface;
+        uint32_t teid, ipv4;
+        if (gtpv2_decode_fteid(&inner[i], &iface, &teid, &ipv4))
+            continue;
+        if (!ipv4)
+            continue;
+        if (iface == FTEID_IFACE_S5S8_PGW_GTPU)
+            continue;
+        int r = bearer_fteid_rank_sgwu(iface);
+        if (r < best) {
+            best = r;
+            *out_teid  = teid;
+            *out_ipv4  = ipv4;
+        }
+    }
+}
 
 static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
 {
@@ -551,24 +650,18 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
         if (!gtpv2_decode_paa_ipv4(ie, &pt, &ip)) s->ue_ipv4 = ip;
     }
 
-    /* Bearer Context - SGW-U F-TEID (Direct Tunnel target). */
+    /* Bearer Context — pick SGW user-plane F-TEID (S4=16, S1-U=1), not PGW S5-U (5). */
     if ((ie = gtpv2_find_ie(v2, GTPV2_IE_BEARER_CONTEXT, 0))) {
         iwf_ie_t inner[IWF_MAX_IES];
         size_t n_inner = 0;
-        if (gtpv2_parse_grouped(ie, inner, IWF_MAX_IES, &n_inner) == 0) {
-            for (size_t i = 0; i < n_inner; i++) {
-                if (inner[i].type == GTPV2_IE_FTEID) {
-                    uint8_t iface; uint32_t teid, ipv4;
-                    if (!gtpv2_decode_fteid(&inner[i], &iface, &teid, &ipv4)) {
-                        /* S1-U SGW GTP-U (1) is the EUTRAN encoding; for S4
-                         * the standard uses S4 SGW GTP-U as well. Accept any
-                         * SGW user-plane F-TEID. */
-                        s->sgwu_teid      = teid;
-                        s->sgwu_addr_ipv4 = ipv4;
-                    }
-                }
-            }
-        }
+        if (gtpv2_parse_grouped(ie, inner, IWF_MAX_IES, &n_inner) == 0)
+            bearer_pick_sgwu_fteid(inner, n_inner, &s->sgwu_teid, &s->sgwu_addr_ipv4);
+    }
+
+    if (gtpv2_cause == GTPV2_CAUSE_REQUEST_ACCEPTED && !s->sgwu_addr_ipv4) {
+        LOGW("translate",
+             "CSResp imsi=%s no SGW-U F-TEID in Bearer (expected iface 16 S4 SGW GTP-U or 1 S1-U SGW GTP-U)",
+             s->key.imsi);
     }
 
     log_msg("RX-S4", v2, s->key.imsi, s->apn);
@@ -612,11 +705,12 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
         /* TEID Control Plane = IWF's GGSN-side ctrl TEID. */
         gtpv1_enc_tv_u32(&e, GTPV1_IE_TEID_CTRL_PLANE, s->iwf_ctrl_teid);
 
-        /* GSN Address (User Plane) = SGW-U IP. */
+        /* Two GTPv1 IE type 133 (GSN Address) — TS 29.060 Table 6: Control Plane
+         * then user traffic. osmo-sgsn/libgtp maps by order; if reversed, GTP-U
+         * is sent to local_ip (IWF) instead of SGW-U. */
+        gtpv1_enc_gsn_addr_ipv4(&e, ntohl(rt->local_ipv4_be));
         if (s->sgwu_addr_ipv4)
             gtpv1_enc_gsn_addr_ipv4(&e, s->sgwu_addr_ipv4);
-        /* GSN Address (Control Plane) = IWF local IP. */
-        gtpv1_enc_gsn_addr_ipv4(&e, ntohl(rt->local_ipv4_be));
 
         /* QoS Profile echoed back. */
         if (s->qos_len)
@@ -640,7 +734,37 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
          (log_ue_ip >> 8) & 0xff, log_ue_ip & 0xff);
     iwf_log_hex("translate", "Create-PDP-Resp", outbuf, (size_t)total);
 
-    return iwf_send_v1(rt, &resp_ep, outbuf, (size_t)total);
+    int sent_v1 = iwf_send_v1(rt, &resp_ep, outbuf, (size_t)total);
+
+    /* Spontaneous Modify Bearer Request: Open5GS sgwcd installs the SGW-U DL
+     * FAR in BUFFER until a Modify Bearer Request supplies the access-side
+     * F-TEID. The SGSN F-TEID is already known from Create PDP Context Req,
+     * so push it now; otherwise downlink stays buffered and ping never works.
+     *
+     * In Direct Tunnel deployments with a real RNC, osmo-sgsn will later send
+     * Update PDP Context with the RNC's F-TEID; that path issues another MBReq
+     * and SGW-U is reprogrammed accordingly. */
+    if (v1_cause == GTPV1_CAUSE_REQUEST_ACCEPTED && s->sgsn_addr_ipv4) {
+        /* Flip state BEFORE the send so an MBResp processed in the same
+         * event-loop iteration matches WAIT_MB_RESP_INIT, not ACTIVE.
+         * iwf_send_v2 returns byte count on success (>= 0 means dispatched). */
+        s->state = SESS_WAIT_MB_RESP_INIT;
+        int mb_rc = send_modify_bearer_req(rt, s, s->key.nsapi);
+        if (mb_rc < 0) {
+            LOGW("translate",
+                 "activation MBReq send failed imsi=%s — DL FAR may stay BUFFER on SGW-U",
+                 s->key.imsi);
+            s->state = SESS_ACTIVE;
+        } else {
+            LOGI("translate",
+                 "TX-S4 Modify-Bearer-Req (activate) imsi=%s seq=%u sgsn_teid=0x%08x sgsn_ip=%u.%u.%u.%u",
+                 s->key.imsi, s->gtpv2_seq, s->sgsn_data_teid,
+                 (s->sgsn_addr_ipv4 >> 24) & 0xff, (s->sgsn_addr_ipv4 >> 16) & 0xff,
+                 (s->sgsn_addr_ipv4 >> 8)  & 0xff,  s->sgsn_addr_ipv4 & 0xff);
+        }
+    }
+
+    return sent_v1;
 }
 
 static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
@@ -648,6 +772,8 @@ static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
     sess_t *s = sess_find_by_iwf_s4_c_teid(v2->teid);
     if (!s)
         s = sess_find_by_pending_v2_seq(v2->seq, SESS_WAIT_MB_RESP);
+    if (!s)
+        s = sess_find_by_pending_v2_seq(v2->seq, SESS_WAIT_MB_RESP_INIT);
     if (!s) {
         LOGW("translate", "MBResp: no session for S4 TEID 0x%08x seq=%u",
              v2->teid, (unsigned)(v2->seq & 0xffffffu));
@@ -659,6 +785,25 @@ static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
     if (ie) gtpv2_decode_cause(ie, &cause);
 
     log_msg("RX-S4", v2, s->key.imsi, s->apn);
+
+    /* Spontaneous bearer-activation MBReq (no preceding GTPv1 Update PDP).
+     * Also catch the case where state already moved on (ACTIVE) but no real
+     * Update PDP Context was ever requested by osmo-sgsn — never synthesize a
+     * GTPv1 Update PDP Response the SGSN did not ask for. */
+    if (s->state != SESS_WAIT_MB_RESP) {
+        if (cause == GTPV2_CAUSE_REQUEST_ACCEPTED) {
+            LOGI("translate",
+                 "MBResp (activate) imsi=%s seq=%u cause=16 — bearer ACTIVE, DL FAR should be FORWARD",
+                 s->key.imsi, (unsigned)(v2->seq & 0xffffffu));
+        } else {
+            LOGW("translate",
+                 "MBResp (activate) imsi=%s seq=%u gtpv2_cause=%u — DL may stay BUFFER on SGW-U",
+                 s->key.imsi, (unsigned)(v2->seq & 0xffffffu), (unsigned)cause);
+        }
+        s->state = SESS_ACTIVE;
+        sess_touch(s);
+        return 0;
+    }
 
     uint8_t outbuf[IWF_MAX_PKT];
     gtpv1_enc_t e;
@@ -675,9 +820,9 @@ static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
         if (s->sgwu_teid)
             gtpv1_enc_tv_u32(&e, GTPV1_IE_TEID_DATA_I, s->sgwu_teid);
         gtpv1_enc_tv_u32(&e, GTPV1_IE_TEID_CTRL_PLANE, s->iwf_ctrl_teid);
+        gtpv1_enc_gsn_addr_ipv4(&e, ntohl(rt->local_ipv4_be));
         if (s->sgwu_addr_ipv4)
             gtpv1_enc_gsn_addr_ipv4(&e, s->sgwu_addr_ipv4);
-        gtpv1_enc_gsn_addr_ipv4(&e, ntohl(rt->local_ipv4_be));
         if (s->qos_len)
             gtpv1_enc_qos_profile(&e, s->qos_blob, s->qos_len);
         s->state = SESS_ACTIVE;

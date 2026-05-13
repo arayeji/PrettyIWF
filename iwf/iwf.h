@@ -117,15 +117,19 @@
 #define GTPV2_CAUSE_CONTEXT_NOT_FOUND      64
 #define GTPV2_CAUSE_SYSTEM_FAILURE         72
 
-/* F-TEID interface types (TS 29.274 §8.22) */
+/* F-TEID interface types (TS 29.274 §8.22 Table) */
 #define FTEID_IFACE_S1U_ENB_GTPU           0
 #define FTEID_IFACE_S1U_SGW_GTPU           1
+#define FTEID_IFACE_S5S8_SGW_GTPU          4
+#define FTEID_IFACE_S5S8_PGW_GTPU          5
 #define FTEID_IFACE_S5S8_SGW_GTPC          6
 #define FTEID_IFACE_S5S8_PGW_GTPC          7
-#define FTEID_IFACE_S11_S4_SGW_GTPC        11
 #define FTEID_IFACE_S11_MME_GTPC           10
-#define FTEID_IFACE_S4_SGSN_GTPC           35
-#define FTEID_IFACE_S4_SGSN_GTPU           36
+#define FTEID_IFACE_S11_S4_SGW_GTPC        11
+#define FTEID_IFACE_S4_SGSN_GTPU           15
+#define FTEID_IFACE_S4_SGW_GTPU            16
+#define FTEID_IFACE_S4_SGSN_GTPC           17
+#define FTEID_IFACE_S11_SGW_GTPU           39
 
 /* RAT types */
 #define GTPV2_RAT_UTRAN                    1
