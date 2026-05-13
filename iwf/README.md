@@ -25,6 +25,21 @@ make            # produces ./iwf
 sudo make install   # optional, copies to /usr/local/sbin
 ```
 
+### Automated Ubuntu setup
+
+```bash
+cd iwf
+chmod +x setup-ubuntu.sh
+# Compile only (installs build-essential via apt; may use sudo):
+./setup-ubuntu.sh --build-only
+
+# Full install: binary, /etc/iwf/iwf.conf, log dir, systemd unit
+sudo IWF_LOCAL_IP=10.0.0.5 IWF_SGWC_IP=10.0.0.30 ./setup-ubuntu.sh --install -y
+sudo systemctl status iwf
+```
+
+See `setup-ubuntu.sh --help` and the comment block at the top of that script for manual step-by-step instructions and all environment variables.
+
 ## Configuration
 
 Edit `iwf.conf` (the install target also drops a sample at
