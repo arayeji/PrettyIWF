@@ -103,7 +103,8 @@ static int build_imsi_from_v1(const iwf_msg_t *v1, char *imsi)
     imsi[0] = '\0';
     const iwf_ie_t *ie = gtpv1_find_ie(v1, GTPV1_IE_IMSI);
     if (!ie) return -1;
-    return gtpv1_decode_imsi(ie, imsi, IWF_IMSI_MAX);
+    if (gtpv1_decode_imsi(ie, imsi, IWF_IMSI_MAX) < 0) return -2;
+    return 0;
 }
 
 /* ------------------------------------------------------------------- */
@@ -115,8 +116,13 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
                                         const iwf_msg_t *v1)
 {
     char imsi[IWF_IMSI_MAX] = {0};
-    if (build_imsi_from_v1(v1, imsi) < 0) {
-        LOGE("translate", "Create PDP Context Req without IMSI - dropping");
+    int ir = build_imsi_from_v1(v1, imsi);
+    if (ir == -1) {
+        LOGE("translate", "Create PDP Context Req missing IMSI IE (type 2) — dropping");
+        return -1;
+    }
+    if (ir == -2) {
+        LOGE("translate", "Create PDP Context Req IMSI BCD decode failed — dropping");
         return -1;
     }
 

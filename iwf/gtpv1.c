@@ -132,14 +132,16 @@ const iwf_ie_t *gtpv1_find_ie(const iwf_msg_t *msg, uint8_t type)
 /* IMSI is BCD, 8 octets, low nibble first within each octet. 0xF = pad. */
 static int bcd_to_str(const uint8_t *p, size_t n, char *out, size_t cap)
 {
-    if (cap < n * 2 + 1) return -1;
+    if (!out || cap < 1) return -1;
     size_t k = 0;
     for (size_t i = 0; i < n; i++) {
         uint8_t lo = p[i] & 0x0f;
         uint8_t hi = (p[i] >> 4) & 0x0f;
         if (lo == 0x0f) break;
+        if (k + 1 >= cap) return -1;
         out[k++] = (char)('0' + lo);
         if (hi == 0x0f) break;
+        if (k + 1 >= cap) return -1;
         out[k++] = (char)('0' + hi);
     }
     out[k] = '\0';
