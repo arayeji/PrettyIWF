@@ -51,9 +51,11 @@ static int open_udp(const char *bind_ip, uint16_t port, int *out_fd)
 
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-#ifdef SO_REUSEPORT
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-#endif
+    /* SO_REUSEPORT is deliberately NOT set: with REUSEPORT, a second iwf
+     * instance can silently bind the same UDP socket and the kernel
+     * load-balances datagrams between the two processes — visible in logs
+     * as every Create-PDP / Create-Session pair appearing twice with
+     * identical TEIDs. Refuse to start a second instance instead. */
 
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
@@ -199,6 +201,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to load config %s\n", conf_path);
         return 1;
     }
+    strncpy(rt.cfg.cfg_path, conf_path, sizeof(rt.cfg.cfg_path) - 1);
+    rt.cfg.cfg_path[sizeof(rt.cfg.cfg_path) - 1] = '\0';
 
     iwf_log_init(iwf_log_level_from_str(level_override ? level_override
                                                        : rt.cfg.log_level),

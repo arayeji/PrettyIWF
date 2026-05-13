@@ -63,6 +63,20 @@ If you see `/usr/bin/env: 'bash\r': No such file or directory`, the script has W
    - **`bad sgwc ip`** — typo or empty `[sgwc] ip` in `/etc/iwf/iwf.conf`.
    - **`failed to load config`** — wrong path in `ExecStart` or unreadable `/etc/iwf/iwf.conf`.
 
+### GTPv2 Create Session Response: cause **103**
+
+TS 29.274 value **103** = *Conditional IE missing*. With **Open5GS SGW-C**, this often means the **PGW S5/S8-C F-TEID** IE (GTPv2 **F-TEID** instance **1**) is missing from **Create Session Request** — SGWC logs **`No PGW IP`**. Set **`[smf] ip`** to your **SMF / PGW-C GTP-C IPv4** (same address as in `smf.yaml`).
+
+**`[smf] teid` must be `0`** for an initial Create Session. Open5GS SMF treats a non-zero header TEID as a lookup into existing sessions; if no match is found it logs **`No Session`**, returns Cause **64 (Context Not Found)** with no further IEs, and Open5GS SGW-C then reports **`No GTP TEID`** / **`No PDN Address Allocation`** in `src/sgwc/s5c-handler.c` and forwards GTP cause **103** back to the IWF. SMF allocates its own S5/S8-C TEID and returns it in the Create Session Response.
+
+### GTPv2 Create Session Response: cause **70**
+
+`[smf] ERROR: Unknown RAT Type [1]` (smf/s5c-handler.c) means Open5GS SMF received **RAT Type = UTRAN (1)** and only accepts **EUTRAN (6)** and **WLAN (3)**. SMF returns Cause **MANDATORY_IE_INCORRECT (70)** which SGW-C forwards as GTP **70** back to the IWF. The IWF setting **`[iwf] rat_type = eutran`** (the default) makes Open5GS accept the session regardless of the real radio. Set `rat_type = utran` only if your EPC core actually supports UTRAN on S5/S8.
+
+**ULI** can also trigger 103 for **RAT = UTRAN** if the SGW expects it. The IWF builds **ULI** from GTPv1 **RAI** when present; if your emulator omits RAI, use **`[iwf] synthetic_uli_no_rai = 1`** (lab only: IMSI PLMN + zero LAC/RAC).
+
+If **Create Session Request** already includes **ULI** and **PGW/SMF F-TEID** (logged `len=` is larger than without `[smf]`) but the response is still **103**, Open5GS may be mapping a **PFCP** failure on **SGW-C ⇄ SGW-U** to GTP cause **103** (`gtp_cause_from_pfcp` maps PFCP *Conditional IE missing* to GTP **103**). Check **SGW-C** / **SGW-U** (or UPF) logs and **`sudo tcpdump -ni any udp port 8805 -vv`** during the attempt.
+
 ## Configuration
 
 Edit `iwf.conf` (the install target also drops a sample at
@@ -73,6 +87,7 @@ Edit `iwf.conf` (the install target also drops a sample at
 listen_ip   = 0.0.0.0
 listen_port = 2123
 local_ip    = 10.234.241.10     ; advertised in F-TEID / GSN Address
+; synthetic_uli_no_rai = 1      ; optional lab: ULI from IMSI if Gn omits RAI
 
 [sgsn]
 ip          = 10.234.241.20     ; informational only
@@ -80,6 +95,12 @@ ip          = 10.234.241.20     ; informational only
 [sgwc]
 ip          = 10.234.241.30
 port        = 2123
+
+[smf]
+# SMF / PGW-C S5/S8 GTP-C — F-TEID instance 1 in Create Session Request (required by Open5GS SGWC).
+# teid MUST be 0 for an initial Create Session (the SMF allocates its TEID in the response).
+ip          = 10.234.241.9
+teid        = 0
 
 [logging]
 level       = info              ; error|warn|info|debug|trace
@@ -153,6 +174,8 @@ No explicit per-SGSN peer config is needed — Open5GS accepts S4 by
 source IP. Just make sure routing lets the IWF's `local_ip` reach SGW-C
 on UDP/2123.
 
+The IWF must also send **SMF’s S5/S8-C F-TEID** inside **Create Session Request** (see **`[smf]`** in `iwf.conf`). Match **`[smf] ip`** to the SMF GTP-C address in **`smf.yaml`** (`s5c` / `gtpc`). **`[smf] teid`** must be the TEID SMF uses for that GTP peer (see SGWC/SMF logs or a packet capture from a known-good session).
+
 ## PFCP verification on UPG-VPP
 
 After a PDP Context is established you can confirm UPG-VPP has the
@@ -202,8 +225,9 @@ osmo-sgsn → IWF       GTPv1 Create PDP Context Request seq=42
                        IMSI=001010000000001 NSAPI=5 APN=internet
                        TEID-C=0xa0 TEID-D=0xb0 GSN=10.234.241.20
 IWF      → SGW-C      GTPv2 Create Session Request    seq=1 TEID=0
-                       IMSI MSISDN ServingNet RAT=UTRAN
+                       IMSI MSISDN ULI ServingNet RAT=UTRAN
                        F-TEID(S4-SGSN-C)=0x10000002@10.234.241.10
+                       F-TEID(S5/S8-PGW-C)=<smf>@<smf-ip>
                        APN=internet PDN=IPv4 PAA=0.0.0.0 AMBR=1G/1G
                        BearerCtx{EBI=5 QoS{QCI=9} F-TEID(S4-SGSN-U)}
 SGW-C    → IWF        GTPv2 Create Session Response   seq=1 cause=16
