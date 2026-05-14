@@ -39,13 +39,14 @@ LDLIBS  ?=
 # Source set: GTP IWF (always built) + MAP IWF translation units (always
 # compiled; SS7 backend is conditional via -DMAP_IWF_WITH_OSMO_SIGTRAN).
 SRCS    := main.c gtpv1.c gtpv2.c session.c translate.c config.c logging.c \
-           map_iwf.c map_session.c tcap.c map_codec.c diameter.c ss7_link.c
+           map_iwf.c map_session.c tcap.c map_codec.c diameter.c ss7_link.c \
+           test_cmd.c
 OBJS    := $(SRCS:.c=.o)
 DEPS    := $(SRCS:.c=.d)
 HDRS    := iwf.h gtpv1.h gtpv2.h session.h translate.h config.h logging.h \
            runtime.h uthash.h \
            map_iwf.h map_iwf_priv.h map_session.h tcap.h map_codec.h \
-           diameter.h ss7_link.h
+           diameter.h ss7_link.h test_cmd.h
 
 BIN     := iwf
 

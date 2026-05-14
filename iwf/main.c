@@ -20,6 +20,7 @@
 #include "session.h"
 #include "translate.h"
 #include "map_iwf.h"
+#include "test_cmd.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,8 +41,15 @@
 #endif
 
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_sigusr1_test_sai = 0;
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+static void on_sigusr1(int sig)
+{
+    (void)sig;
+    g_sigusr1_test_sai = 1;
+}
 
 static int set_nonblock(int fd)
 {
@@ -350,6 +358,7 @@ int main(int argc, char **argv)
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGUSR1, on_sigusr1);
     signal(SIGPIPE, SIG_IGN);
 
     LOGI("iwf", "ready: UDP %s:%u (listen_ip=%s) -> S4 SGW-C=%s:%u (F-TEID/GSN %s)%s",
@@ -392,6 +401,9 @@ int main(int argc, char **argv)
             case MAP_EPOLL_ROLE_DWA_TIMER:
                 map_iwf_on_dwa_timer_tick(&rt);
                 break;
+            case MAP_EPOLL_ROLE_TEST_CMD:
+                test_cmd_on_readable(&rt);
+                break;
             default:
                 LOGW("iwf", "epoll event for unknown role=%lu", (unsigned long)role);
                 break;
@@ -403,6 +415,11 @@ int main(int argc, char **argv)
          * M3UA toward [stp] never runs (no SCTP connect / ASP-UP). */
         if (map_iwf_enabled(&rt))
             map_iwf_on_ss7_readable(&rt);
+
+        if (g_sigusr1_test_sai) {
+            g_sigusr1_test_sai = 0;
+            map_iwf_sigusr1_test_sai(&rt);
+        }
     }
 
     LOGI("iwf", "shutting down");

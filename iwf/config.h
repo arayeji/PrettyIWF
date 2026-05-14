@@ -44,6 +44,7 @@ typedef struct {
     char        map_local_pc[16];         /* dotted SS7 point code         */
     uint8_t     map_local_ssn;            /* default 149 (SGSN)            */
     int         map_t_dialogue_ms;        /* TCAP T-timeout default        */
+    char        map_cmd_sock_path[128];   /* UNIX cmd socket (SAI test); default /tmp/iwf_cmd.sock */
 
     /* [stp] */
     char        stp_local_ip[64];   /* optional: source IPv4 for M3UA SCTP (0.0.0.0 = any) */

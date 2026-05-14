@@ -64,6 +64,8 @@ map_session_t *map_sess_create(uint32_t tid)
     s->created_at       = time(NULL);
     s->last_activity    = s->created_at;
     s->t_dialogue_ms    = 10000;       /* tcap.h default; map_iwf overrides */
+    s->cmd_test         = false;
+    s->cmd_test_reply_fd = -1;
     HASH_ADD(hh_tid, g_by_tid, tcap_dialogue_id,
              sizeof(s->tcap_dialogue_id), s);
     return s;
@@ -147,7 +149,7 @@ const char *map_op_str(map_op_t op)
     return "?";
 }
 
-int map_sess_sweep(time_t now)
+int map_sess_sweep(time_t now, map_sess_timeout_hook_t hook, void *hook_ctx)
 {
     int killed = 0;
     map_session_t *s, *tmp;
@@ -161,6 +163,8 @@ int map_sess_sweep(time_t now)
                  map_op_str(s->map_op),
                  (long)(now - s->last_activity));
             s->state = MAP_SESS_ABORTED;
+            if (hook)
+                hook(s, hook_ctx);
             map_sess_remove(s);
             killed++;
         }

@@ -50,6 +50,7 @@ enum map_iwf_epoll_role {
     MAP_EPOLL_ROLE_DIAMETER = 0x102, /* TCP fd to PyHSS                   */
     MAP_EPOLL_ROLE_T_TIMER  = 0x103, /* TCAP dialogue T-timeout sweep     */
     MAP_EPOLL_ROLE_DWA_TIMER= 0x104, /* Diameter watchdog (DWR every Tw)  */
+    MAP_EPOLL_ROLE_TEST_CMD = 0x105, /* UNIX /tmp/iwf_cmd.sock listener   */
 };
 
 /* Tell main.c which fds to add to the loop.  Each fd value is < 0 when the
@@ -69,6 +70,16 @@ void map_iwf_on_dwa_timer_tick(struct iwf_runtime *rt);
 void map_iwf_shutdown(struct iwf_runtime *rt);
 
 bool map_iwf_enabled(const struct iwf_runtime *rt);
+
+/* Local test trigger: Diameter AIR for IMSI digits (no TCAP toward SS7).
+ * reply_unix_fd < 0 means log only (e.g. SIGUSR1). On validation error the FD
+ * remains owned by the caller. Otherwise the FD is owned until AIA, error,
+ * or timeout. Returns 0 when the caller must not close reply_unix_fd; -1
+ * when the caller still owns reply_unix_fd (validation errors only). */
+int  map_iwf_cmd_test_sai(struct iwf_runtime *rt,
+                          const char *imsi_digits,
+                          int reply_unix_fd);
+void map_iwf_sigusr1_test_sai(struct iwf_runtime *rt);
 
 /* ------------------------------------------------------------------- */
 /* Cross-module callbacks invoked by the Diameter layer when a response */
