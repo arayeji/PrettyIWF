@@ -85,6 +85,15 @@
 #define GTPV2_MODIFY_BEARER_RESPONSE       35
 #define GTPV2_DELETE_SESSION_REQUEST       36
 #define GTPV2_DELETE_SESSION_RESPONSE      37
+#define GTPV2_CONTEXT_REQUEST              130
+#define GTPV2_CONTEXT_RESPONSE             131
+
+#define GTPV1_SGSN_CONTEXT_REQUEST         50
+#define GTPV1_SGSN_CONTEXT_RESPONSE        51
+
+/* GTPv1 IE — MM / PDP Context (TS 29.060 §7.7) */
+#define GTPV1_IE_MM_CONTEXT                129
+#define GTPV1_IE_PDP_CONTEXT               130
 
 /* GTPv2-C IE types (TS 29.274 §8.1) */
 #define GTPV2_IE_IMSI                      1
@@ -111,6 +120,12 @@
 #define GTPV2_IE_APN_RESTRICTION           127
 #define GTPV2_IE_SELECTION_MODE            128
 #define GTPV2_IE_FQ_CSID                   132
+#define GTPV2_IE_PDN_CONNECTION            109
+/* MM Context variants (TS 29.274 Table 8.1-1) */
+#define GTPV2_IE_MM_CONTEXT_GSM_KEY_TRIP   103
+#define GTPV2_IE_MM_CONTEXT_UMTS_KEY_QUINT 104
+#define GTPV2_IE_MM_CONTEXT_GSM_KEY_QUINT 105
+#define GTPV2_IE_MM_CONTEXT_UMTS_KEY_QUINT2 106
 
 /* GTPv2 cause values */
 #define GTPV2_CAUSE_REQUEST_ACCEPTED       16

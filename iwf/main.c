@@ -19,6 +19,7 @@
 #include "gtpv2.h"
 #include "session.h"
 #include "translate.h"
+#include "map_iwf.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +33,11 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+
+#ifdef MAP_IWF_WITH_OSMO_SIGTRAN
+#  include <osmocom/core/talloc.h>
+#  include <osmocom/core/application.h>
+#endif
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -98,19 +104,29 @@ int iwf_send_v1(iwf_runtime_t *rt, const iwf_endpoint_t *to,
     return (int)r;
 }
 
-int iwf_send_v2(iwf_runtime_t *rt, const uint8_t *buf, size_t len)
+int iwf_send_v2_addr(iwf_runtime_t *rt, const struct sockaddr_in *to,
+                     socklen_t tolen, const uint8_t *buf, size_t len)
 {
-    /* v2 leaves on the same multiplexed socket. */
+    if (!to || tolen < (socklen_t)sizeof(*to))
+        return -1;
     ssize_t r = sendto(rt->v1_sock, buf, len, 0,
-                       (const struct sockaddr *)&rt->sgwc_addr,
-                       sizeof(rt->sgwc_addr));
+                       (const struct sockaddr *)to, tolen);
     if (r < 0) {
-        LOGE("net", "sendto v2 failed: %s", strerror(errno));
+        LOGE("net", "sendto v2 (peer=%s:%u) failed: %s",
+             inet_ntoa(to->sin_addr), ntohs(to->sin_port), strerror(errno));
         return -1;
     }
     return (int)r;
 }
 
+int iwf_send_v2(iwf_runtime_t *rt, const uint8_t *buf, size_t len)
+{
+    return iwf_send_v2_addr(rt, &rt->sgwc_addr, sizeof(rt->sgwc_addr), buf, len);
+}
+
+/* Epoll role tags. SOCK_GTP / SOCK_TIMER are the original GTP IWF roles;
+ * the MAP-IWF roles are defined in map_iwf.h (MAP_EPOLL_ROLE_*) and sit
+ * in a disjoint numeric range so there is no overlap. */
 enum sock_role { SOCK_GTP = 1, SOCK_TIMER = 3 };
 
 static void handle_v1_packet(iwf_runtime_t *rt,
@@ -260,6 +276,25 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    rt.sgsn_gtp_addr.sin_family = AF_INET;
+    rt.sgsn_gtp_addr.sin_port   = htons(rt.cfg.sgsn_port);
+    if (inet_pton(AF_INET, rt.cfg.sgsn_ip, &rt.sgsn_gtp_addr.sin_addr) != 1) {
+        /* 0.0.0.0 is accepted for setups that only use Create PDP (no Context Req). */
+        if (strcmp(rt.cfg.sgsn_ip, "0.0.0.0") != 0 || rt.cfg.sgsn_port != GTP_PORT) {
+            LOGW("iwf", "sgsn ip %s not usable for inet_pton; Context-Req→Gn disabled until [sgsn] is valid",
+                 rt.cfg.sgsn_ip);
+        }
+    }
+
+    rt.mme_gtp_addr.sin_family = AF_INET;
+    rt.mme_gtp_addr.sin_port   = htons(rt.cfg.mme_port);
+    memset(&rt.mme_gtp_addr.sin_addr, 0, sizeof(rt.mme_gtp_addr.sin_addr));
+    if (rt.cfg.mme_ip[0] && strcmp(rt.cfg.mme_ip, "0.0.0.0") != 0) {
+        if (inet_pton(AF_INET, rt.cfg.mme_ip, &rt.mme_gtp_addr.sin_addr) != 1)
+            LOGW("iwf", "[mme] ip %s invalid — Gn SGSN-Ctx-Req relay toward MME disabled",
+                 rt.cfg.mme_ip);
+    }
+
     /* Sweep timer: fires every 5 s. */
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (tfd < 0) { perror("timerfd"); return 1; }
@@ -279,15 +314,50 @@ int main(int argc, char **argv)
     ev.data.u64 = SOCK_TIMER;
     epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &ev);
 
+#ifdef MAP_IWF_WITH_OSMO_SIGTRAN
+    /* libosmo-sigtran triggers log_check_level() during osmo_ss7_init(); libosmocore
+     * aborts if osmo_log_info is still NULL (see log_init / osmo_init_logging2). */
+    {
+        void *osmo_log_ctx = talloc_named_const(NULL, 1, "iwf_osmo");
+        if (!osmo_log_ctx) {
+            LOGE("iwf", "talloc iwf_osmo failed");
+            close(epfd);
+            close(tfd);
+            close(rt.v1_sock);
+            return 1;
+        }
+        int lo = osmo_init_logging2(osmo_log_ctx, NULL);
+        if (lo != 0 && lo != -EEXIST) {
+            LOGE("iwf", "osmo_init_logging2 failed: %d", lo);
+            talloc_free(osmo_log_ctx);
+            close(epfd);
+            close(tfd);
+            close(rt.v1_sock);
+            return 1;
+        }
+    }
+#endif
+
+    /* MAP-IWF bring-up. When disabled or not built with libosmo-sigtran
+     * (see Makefile), this is a no-op and the GTP-only path is unaffected.
+     * The module owns its own fd registration with epoll, including the
+     * reconnect path on Diameter peer drops. */
+    if (map_iwf_init(&rt, epfd) < 0) {
+        LOGE("iwf", "MAP-IWF init failed; check [map_iwf] / [stp] / "
+                    "[diameter_s6d] config or rebuild with MAP_IWF_ENABLED=1");
+        if (rt.cfg.map_iwf_enabled) return 1;
+    }
+
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
-    LOGI("iwf", "ready: UDP %s:%u (listen_ip=%s) -> S4 SGW-C=%s:%u (F-TEID/GSN %s)",
+    LOGI("iwf", "ready: UDP %s:%u (listen_ip=%s) -> S4 SGW-C=%s:%u (F-TEID/GSN %s)%s",
          bind_ip, rt.cfg.listen_port,
          rt.cfg.listen_ip,
          rt.cfg.sgwc_ip, rt.cfg.sgwc_port,
-         inet_ntoa(*(struct in_addr *)&rt.local_ipv4_be));
+         inet_ntoa(*(struct in_addr *)&rt.local_ipv4_be),
+         map_iwf_enabled(&rt) ? "; MAP-IWF active" : "");
 
     while (!g_stop) {
         struct epoll_event events[IWF_MAX_EVENTS];
@@ -299,18 +369,44 @@ int main(int argc, char **argv)
         }
         for (int i = 0; i < n; i++) {
             uint64_t role = events[i].data.u64;
-            if (role == SOCK_GTP) {
+            switch (role) {
+            case SOCK_GTP:
                 drain_gtp_socket(&rt);
-            } else if (role == SOCK_TIMER) {
+                break;
+            case SOCK_TIMER: {
                 uint64_t exp;
                 ssize_t r = read(tfd, &exp, sizeof(exp));
                 (void)r;
                 sess_sweep(time(NULL), IWF_SESSION_TIMEOUT_S);
+                break;
+            }
+            case MAP_EPOLL_ROLE_SS7:
+                map_iwf_on_ss7_readable(&rt);
+                break;
+            case MAP_EPOLL_ROLE_DIAMETER:
+                map_iwf_on_diameter_readable(&rt);
+                break;
+            case MAP_EPOLL_ROLE_T_TIMER:
+                map_iwf_on_ttimer_tick(&rt);
+                break;
+            case MAP_EPOLL_ROLE_DWA_TIMER:
+                map_iwf_on_dwa_timer_tick(&rt);
+                break;
+            default:
+                LOGW("iwf", "epoll event for unknown role=%lu", (unsigned long)role);
+                break;
             }
         }
+
+        /* libosmo-sigtran keeps SCTP/M3UA on its own osmo_fd list (our ss7 fd stays -1),
+         * so no MAP_EPOLL_ROLE_SS7 events fire. Without pumping osmo_select_main_ctx(),
+         * M3UA toward [stp] never runs (no SCTP connect / ASP-UP). */
+        if (map_iwf_enabled(&rt))
+            map_iwf_on_ss7_readable(&rt);
     }
 
     LOGI("iwf", "shutting down");
+    map_iwf_shutdown(&rt);
     close(epfd);
     close(tfd);
     close(rt.v1_sock);

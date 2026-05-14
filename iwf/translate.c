@@ -3,6 +3,7 @@
 #include "gtpv1.h"
 #include "gtpv2.h"
 #include "logging.h"
+#include "session.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -21,6 +22,8 @@ static const char *v1_msg_str(uint8_t t)
     case GTPV1_UPDATE_PDP_CONTEXT_RESPONSE: return "Update-PDP-Resp";
     case GTPV1_DELETE_PDP_CONTEXT_REQUEST:  return "Delete-PDP-Req";
     case GTPV1_DELETE_PDP_CONTEXT_RESPONSE: return "Delete-PDP-Resp";
+    case GTPV1_SGSN_CONTEXT_REQUEST:         return "SGSN-Ctx-Req";
+    case GTPV1_SGSN_CONTEXT_RESPONSE:       return "SGSN-Ctx-Resp";
     case GTPV1_ECHO_REQUEST:                return "Echo-Req";
     case GTPV1_ECHO_RESPONSE:               return "Echo-Resp";
     default:                                return "?";
@@ -40,6 +43,8 @@ static const char *v2_msg_str(uint8_t t)
     case GTPV2_MODIFY_BEARER_RESPONSE:  return "Modify-Bearer-Resp";
     case GTPV2_DELETE_SESSION_REQUEST:  return "Delete-Session-Req";
     case GTPV2_DELETE_SESSION_RESPONSE: return "Delete-Session-Resp";
+    case GTPV2_CONTEXT_REQUEST:         return "Context-Req";
+    case GTPV2_CONTEXT_RESPONSE:        return "Context-Resp";
     case GTPV2_ECHO_REQUEST:            return "Echo-Req";
     case GTPV2_ECHO_RESPONSE:           return "Echo-Resp";
     default:                            return "?";
@@ -102,14 +107,1089 @@ static void log_msg(const char *dir, const iwf_msg_t *m,
          imsi[0] ? imsi : "-", apn[0] ? apn : "-", m->n_ies);
 }
 
-static int build_imsi_from_v1(const iwf_msg_t *v1, char *imsi)
+/* 0 ok, -1 missing IMSI IE, -2 BCD decode failure */
+static int build_imsi_from_v1(const iwf_msg_t *v1, char *imsi_out)
 {
-    imsi[0] = '\0';
+    if (!v1 || !imsi_out)
+        return -1;
+    imsi_out[0] = '\0';
     const iwf_ie_t *ie = gtpv1_find_ie(v1, GTPV1_IE_IMSI);
-    if (!ie) return -1;
-    if (gtpv1_decode_imsi(ie, imsi, IWF_IMSI_MAX) < 0) return -2;
+    if (!ie)
+        return -1;
+    if (gtpv1_decode_imsi(ie, imsi_out, IWF_IMSI_MAX) != 0)
+        return -2;
     return 0;
 }
+
+/* ------------------------------------------------------------------- */
+/* GTPv2 Context Req/Resp <-> GTPv1 SGSN Context Req/Resp (Gn)         */
+/* ------------------------------------------------------------------- */
+
+typedef enum {
+    CTX_FLOW_MME_TO_GN,   /* GTPv2 CR from MME; await GTPv1 SGSN Ctx Resp from [sgsn] */
+    CTX_FLOW_GN_TO_MME,   /* GTPv1 SGSN Ctx Req from osmo; await GTPv2 Context Resp */
+} ctx_pend_flow_t;
+
+typedef struct ctx_pend_s {
+    ctx_pend_flow_t flow;
+    int             gn_seq_key;   /* HASH gn: SCR seq echoed in SGSN Ctx Resp (MME-init) */
+    int             v2_seq_key;   /* HASH v2: our outbound CR seq (Gn-init) */
+
+    UT_hash_handle  hh_gn;
+    UT_hash_handle  hh_v2;
+    int             in_gn_hash;
+    int             in_v2_hash;
+
+    /* MME-init: UDP source where v2 Context Request arrived. */
+    iwf_endpoint_t  mme_sa;
+    /* Gn-init (osmo SCR): UDP source — SGSN Context Response must return here. */
+    iwf_endpoint_t  gn_peer_sa;
+
+    uint32_t        mme_teid;
+    uint32_t        mme_seq24;
+    int             mme_t_present;
+
+    /* Gn-init: wire fields from SCR to echo on SGSN Context Response header. */
+    uint16_t        gn_req_seq16;
+    uint32_t        gn_req_hdr_teid;
+
+    uint32_t        sgsn_src_teid;
+    uint32_t        sgsn_src_ipv4;
+
+    char            req_imsi[IWF_IMSI_MAX];
+} ctx_pend_t;
+
+static ctx_pend_t *g_ctx_pend_gn = NULL;
+static ctx_pend_t *g_ctx_pend_v2 = NULL;
+
+static void ctx_pend_detach(ctx_pend_t *p)
+{
+    if (!p)
+        return;
+    if (p->in_gn_hash) {
+        HASH_DELETE_HH(hh_gn, g_ctx_pend_gn, &(p)->hh_gn);
+        p->in_gn_hash = 0;
+    }
+    if (p->in_v2_hash) {
+        HASH_DELETE_HH(hh_v2, g_ctx_pend_v2, &(p)->hh_v2);
+        p->in_v2_hash = 0;
+    }
+}
+
+static void ctx_pend_free(ctx_pend_t *p)
+{
+    if (!p)
+        return;
+    ctx_pend_detach(p);
+    free(p);
+}
+
+typedef struct parsed_pdp130_s {
+    uint8_t  nsapi;
+    uint32_t ul_teid_cp;
+    uint32_t ul_teid_data;
+    uint32_t ggsn_cp_ipv4;
+    uint32_t ggsn_up_ipv4;
+    uint32_t ue_ipv4;
+    uint8_t  qos_neg[64];
+    size_t   qos_neg_len;
+    char     apn[IWF_APN_MAX];
+    int      ok;
+} parsed_pdp130_t;
+
+static int v2_teid_present_in_hdr(const iwf_msg_t *m)
+{
+    if (!m->raw || m->raw_len < 1)
+        return 1;
+    return (((m->raw[0] >> 3) & 1u) != 0) ? 1 : 0;
+}
+
+static const iwf_ie_t *ctx_find_sender_fteid_v2(const iwf_msg_t *m)
+{
+    const iwf_ie_t *chosen = NULL;
+    for (size_t i = 0; i < m->n_ies; i++) {
+        if (m->ies[i].type != GTPV2_IE_FTEID)
+            continue;
+        uint8_t iface;
+        uint32_t teid, ipv4;
+        if (gtpv2_decode_fteid(&m->ies[i], &iface, &teid, &ipv4))
+            continue;
+        if (iface == FTEID_IFACE_S11_MME_GTPC ||
+            iface == FTEID_IFACE_S11_S4_SGW_GTPC ||
+            iface == FTEID_IFACE_S4_SGSN_GTPC)
+            return &m->ies[i];
+        if (!chosen)
+            chosen = &m->ies[i];
+    }
+    return chosen;
+}
+
+static void ctx_synthetic_rai(const char *imsi, uint8_t rai6[6])
+{
+    uint16_t mcc = 0, mnc = 0;
+    if (strlen(imsi) >= 5) {
+        char mc[4] = { imsi[0], imsi[1], imsi[2], 0 };
+        char mn[4] = { imsi[3], imsi[4], 0, 0 };
+        mcc = (uint16_t)atoi(mc);
+        mnc = (uint16_t)atoi(mn);
+    }
+    /* PLMN via same BCD packing as Serving Network encoder (gtpv2.c). */
+    uint8_t plmn[3];
+    uint8_t m1 = (uint8_t)((mcc / 100) % 10), m2 = (uint8_t)((mcc / 10) % 10),
+            m3 = (uint8_t)(mcc % 10);
+    uint8_t n1, n2, n3;
+    if (mnc >= 100) {
+        n1 = (uint8_t)((mnc / 100) % 10);
+        n2 = (uint8_t)((mnc / 10) % 10);
+        n3 = (uint8_t)(mnc % 10);
+    } else {
+        n1 = 0x0f;
+        n2 = (uint8_t)((mnc / 10) % 10);
+        n3 = (uint8_t)(mnc % 10);
+    }
+    plmn[0] = (uint8_t)((m2 << 4) | m1);
+    plmn[1] = (uint8_t)((n1 << 4) | m3);
+    plmn[2] = (uint8_t)((n3 << 4) | n2);
+    memcpy(rai6, plmn, 3);
+    rai6[3] = 0;
+    rai6[4] = 0;
+    rai6[5] = 0;
+}
+
+static int ctx_decode_uli_rai(const iwf_ie_t *ie, uint8_t rai6[6])
+{
+    if (!ie || ie->length < 8 || !rai6)
+        return -1;
+    if ((ie->value[0] & 0x04u) == 0) /* RAI flag */
+        return -1;
+    memcpy(rai6, ie->value + 1, 6);
+    return 0;
+}
+
+/* Map supported GTPv1 MM Context (129) UMTS+quints variants to MM Context IE 104. */
+static int mm_v129_to_v104(const uint8_t *s, uint16_t slen, uint8_t *d, size_t dc,
+                           size_t *out_len)
+{
+    if (!s || slen < 36 || !d || dc < 64)
+        return -1;
+    uint8_t sec_mode = (uint8_t)((s[1] >> 4) & 0x0f); /* Fig 41/42A oct5 */
+    if (sec_mode != 0 && sec_mode != 2) /* GSM-only / EPS not translated here */
+        return -1;
+
+    uint8_t nv = (uint8_t)((s[1] >> 1) & 0x07);
+    uint16_t qlen = iwf_be16(s + 34);
+    if ((uint32_t)36 + qlen > slen || (size_t)(3 + 32 + qlen + 2) > dc)
+        return -1;
+
+    size_t w = 0;
+    d[w++] = (uint8_t)(((uint8_t)((s[1] >> 4) & 0x0fu) << 4) |
+                       ((s[0] & 0x0fu) & 0x0fu));            /* §8.38-2 oct5-ish */
+    d[w++] = (uint8_t)((nv << 5) |
+                       ((((s[0] >> 7) & 1u) << 3) |
+                        (((s[0] >> 6) & 1u) << 2)));          /* GUPII / UGIPAI */
+    d[w++] = (uint8_t)((((s[0] >> 5) & 0x07u) << 3) |
+                       ((s[1] & 0x07u) & 0x07u));           /* int alg bits + cipher */
+    memcpy(d + w, s + 2, 32);                                 /* CK+IK */
+    w += 32;
+    memcpy(d + w, s + 36, qlen);
+    w += qlen;
+    if (slen >= 36 + qlen + 2) {
+        memcpy(d + w, s + 36 + qlen, 2);                       /* DRX if present */
+        w += 2;
+    }
+    *out_len = w;
+    return 0;
+}
+
+/* Inverse mm_v129_to_v104 — no DRX round-trip yet (Gn→MME path). */
+static int mm_v104_to_v129(const uint8_t *v104, size_t v104_len,
+                           uint8_t *u129, size_t uc, size_t *out_len)
+{
+    if (!v104 || v104_len < 37 || !u129 || !out_len || uc < 64)
+        return -1;
+
+    uint8_t V0 = v104[0], V1 = v104[1], V2 = v104[2];
+    uint8_t sec_mode = (uint8_t)((V0 >> 4) & 0x0fu);
+    if (sec_mode != 0 && sec_mode != 2)
+        return -1;
+
+    uint8_t nv = (uint8_t)(((uint32_t)V1 >> 5) & 7u);
+    uint8_t low3 = (uint8_t)(V2 & 7u);
+    uint8_t n0 = (uint8_t)(nv & 1u), n1 = (uint8_t)((nv >> 1) & 1u),
+            n2 = (uint8_t)((nv >> 2) & 1u);
+    /* s1 positions 3..1 must match nv; positions 2..0 must equal low3. */
+    if (((low3 >> 1) & 3u) != (nv & 3u))
+        return -1;
+
+    uint8_t s0 = (uint8_t)((V0 & 0x0fu) |
+                           (((V1 >> 3) & 1u) << 7) |
+                           (((V1 >> 2) & 1u) << 6) |
+                           (((V2 >> 3) & 7u) << 5));
+    uint8_t s1 = (uint8_t)((sec_mode << 4) | (uint8_t)(n2 << 3) |
+                           (uint8_t)(n1 << 2) | (uint8_t)(n0 << 1) |
+                           (uint8_t)(low3 & 1u));
+
+    uint16_t qlen = (uint16_t)(v104_len - 35);
+    size_t total_u = (size_t)36 + (size_t)qlen;
+    if ((size_t)35 + (size_t)qlen != v104_len || total_u > uc)
+        return -1;
+
+    u129[0] = s0;
+    u129[1] = s1;
+    memcpy(u129 + 2, v104 + 3, 32);
+    iwf_put_be16(u129 + 34, qlen);
+    memcpy(u129 + 36, v104 + 35, qlen);
+    *out_len = total_u;
+    return 0;
+}
+
+static int decode_apn_from_labels(const uint8_t *buf, uint8_t apn_len,
+                                  char *apn, size_t apn_cap)
+{
+    size_t pos = 0;
+    size_t ai = 0;
+    while (pos < apn_len) {
+        uint8_t lab = buf[pos++];
+        if (lab == 0)
+            break;
+        if ((size_t)pos + lab > apn_len)
+            return -1;
+        if (ai > 0 && ai + 1 < apn_cap)
+            apn[ai++] = '.';
+        for (uint8_t j = 0; j < lab && ai + 1 < apn_cap; j++)
+            apn[ai++] = (char)buf[pos++];
+        if (ai >= apn_cap)
+            return -1;
+        apn[ai] = '\0';
+    }
+    return ai > 0 ? 0 : -1;
+}
+
+static int parse_gtpu_pdp130(const iwf_ie_t *ie, parsed_pdp130_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!ie || ie->length < 40)
+        return -1;
+    const uint8_t *p = ie->value;
+    size_t len = ie->length;
+    size_t i = 0;
+    out->nsapi = (uint8_t)(p[i++] & 0x0fu);
+    i++; /* SAPI */
+    uint8_t qs = p[i++];
+    if (i + qs > len)
+        return -1;
+    i += qs;
+    uint8_t qr = p[i++];
+    if (i + qr > len)
+        return -1;
+    i += qr;
+    uint8_t qn = p[i++];
+    if (i + qn > len)
+        return -1;
+    size_t qos_copy = qn > sizeof(out->qos_neg) ? sizeof(out->qos_neg) : (size_t)qn;
+    memcpy(out->qos_neg, p + i, qos_copy);
+    out->qos_neg_len = qos_copy;
+    i += qn;
+    if (i + 10 > len)
+        return -1;
+    /* SND,SNU,N-PDU nums */
+    i += 10;
+    out->ul_teid_cp = iwf_be32(p + i);
+    i += 4;
+    out->ul_teid_data = iwf_be32(p + i);
+    i += 4;
+    i++; /* PDP ctxt id */
+    i++; /* spare + PDP type org */
+    uint8_t pdp_type_no = p[i++];
+    uint8_t pd_len = p[i++];
+    if (i + pd_len > len)
+        return -1;
+    if (pd_len >= 4 && (pdp_type_no == 0x21 || pdp_type_no == 0x57))
+        out->ue_ipv4 = iwf_be32(p + i); /* simplified */
+    i += pd_len;
+
+    uint8_t gcp_len = p[i++];
+    if (i + gcp_len > len)
+        return -1;
+    if (gcp_len >= 4)
+        out->ggsn_cp_ipv4 = iwf_be32(p + i);
+    i += gcp_len;
+
+    uint8_t gup_len = p[i++];
+    if (i + gup_len > len)
+        return -1;
+    if (gup_len >= 4)
+        out->ggsn_up_ipv4 = iwf_be32(p + i);
+    i += gup_len;
+
+    uint8_t apnlen = p[i++];
+    if (i + apnlen > len)
+        return -1;
+    decode_apn_from_labels(p + i, apnlen, out->apn, sizeof(out->apn));
+    out->ok = 1;
+    return 0;
+}
+
+static size_t encode_apn_dotted_wire(const char *dot_apn,
+                                    uint8_t *wire, size_t wcap)
+{
+    size_t wi = 0;
+    const char *p = dot_apn;
+    if (!p || !*p || wcap < 3)
+        return 0;
+
+    while (*p) {
+        const char *d = strchr(p, '.');
+        size_t lab = d ? (size_t)(d - p) : strlen(p);
+        if (lab == 0 || lab > 63 || wi + 1 + lab >= wcap)
+            return 0;
+        wire[wi++] = (uint8_t)lab;
+        memcpy(wire + wi, p, lab);
+        wi += lab;
+        if (!d)
+            break;
+        p = d + 1;
+    }
+    if (wi >= wcap)
+        return 0;
+    wire[wi++] = 0;
+    return wi;
+}
+
+static int encode_gtpu_pdp130_from_parse(const parsed_pdp130_t *p,
+                                         uint8_t *buf, size_t cap,
+                                         size_t *out_len)
+{
+    uint8_t apn_wire[192];
+    const char *apn_src = (p->apn[0] ? p->apn : "internet");
+
+    uint8_t qn = (p->qos_neg_len > (size_t)255) ? (uint8_t)255 : (uint8_t)p->qos_neg_len;
+
+    size_t apnw = encode_apn_dotted_wire(apn_src, apn_wire, sizeof(apn_wire));
+    if (apnw < 2 || apnw > sizeof(apn_wire))
+        return -1;
+
+    size_t est = (size_t)1 + (size_t)1 + /* nsapi+sapi placeholder */
+                  (size_t)1 + (size_t)1 + /* qs/qr skips */
+                  (size_t)1 + qn +
+                  (size_t)10 +            /*SND…*/
+                  (size_t)4 + (size_t)4 + /* ctrl + user teid */
+                  (size_t)1 + (size_t)1 + /* pdp ctxt id spare */
+                  (size_t)1 + (size_t)1 + /* type + pd len */
+                  (size_t)4 +             /* ue ipv4 */
+                  (size_t)1 + (size_t)4 + /* gsn cp len+ */
+                  (size_t)1 + (size_t)4 +
+                  apnw;
+    if (est > cap)
+        return -1;
+
+    size_t i = 0;
+    buf[i++] = (uint8_t)(p->nsapi & 0x0fu);
+    buf[i++] = 0; /* spare SAPI / MS not reachable */
+    buf[i++] = 0; /* requested QoS sub length */
+    buf[i++] = 0; /* req QoS profile len */
+    buf[i++] = qn;
+    if (qn && i + qn <= cap)
+        memcpy(buf + i, p->qos_neg, qn);
+    i += qn;
+
+    memset(buf + i, 0, 10); /*SND/SNU/N-PDU placeholders */
+    i += 10;
+
+    iwf_put_be32(buf + i, p->ul_teid_cp);
+    i += 4;
+    iwf_put_be32(buf + i, p->ul_teid_data);
+    i += 4;
+
+    buf[i++] = 1;    /* PDP context id */
+    buf[i++] = 0xf1; /* PDP type org / spare like osmo payloads */
+    buf[i++] = 0x21; /* PDP type IPv4 */
+    buf[i++] = 4;
+    iwf_put_be32(buf + i, p->ue_ipv4);
+    i += 4;
+
+    buf[i++] = 4;
+    iwf_put_be32(buf + i, p->ggsn_cp_ipv4);
+    i += 4;
+
+    buf[i++] = 4;
+    iwf_put_be32(buf + i, p->ggsn_up_ipv4);
+    i += 4;
+
+    if (i + apnw > cap)
+        return -1;
+    memcpy(buf + i, apn_wire, apnw);
+    i += apnw;
+
+    *out_len = i;
+    return 0;
+}
+
+static int unpack_v2_pdn_for_reverse(const iwf_msg_t *v2rsp,
+                                  parsed_pdp130_t *pdp_out)
+{
+    memset(pdp_out, 0, sizeof(*pdp_out));
+    const iwf_ie_t *pdn = gtpv2_find_ie(v2rsp, GTPV2_IE_PDN_CONNECTION, 0);
+    if (!pdn)
+        return -1;
+    iwf_ie_t inn[IWF_MAX_IES];
+    size_t nin = 0;
+    if (gtpv2_parse_grouped(pdn, inn, IWF_MAX_IES, &nin) != 0)
+        return -1;
+
+    uint8_t ebi = 5;
+
+    for (size_t i = 0; i < nin; i++) {
+        if (inn[i].type == GTPV2_IE_APN && inn[i].length)
+            decode_apn_from_labels(inn[i].value, (uint8_t)inn[i].length,
+                                   pdp_out->apn, sizeof(pdp_out->apn));
+        else if (inn[i].type == GTPV2_IE_IP_ADDRESS &&
+                 inn[i].length >= (uint16_t)sizeof(uint32_t))
+            pdp_out->ue_ipv4 = iwf_be32(inn[i].value);
+        else if (inn[i].type == GTPV2_IE_EBI && inn[i].length >= 1) {
+            uint8_t ee = ebi;
+            if (gtpv2_decode_ebi(&inn[i], &ee) == 0 && ee <= 15u)
+                ebi = ee;
+        } else if (inn[i].type == GTPV2_IE_BEARER_CONTEXT &&
+                   inn[i].instance == 0) {
+            iwf_ie_t bn[IWF_MAX_IES];
+            size_t nbn = 0;
+            if (gtpv2_parse_grouped(&inn[i], bn, IWF_MAX_IES, &nbn) != 0)
+                continue;
+            for (size_t k = 0; k < nbn; k++) {
+                uint8_t ifc;
+                uint32_t tid, ipa;
+                if (bn[k].type == GTPV2_IE_FTEID &&
+                    !gtpv2_decode_fteid(&bn[k], &ifc, &tid, &ipa) && ipa) {
+                    if (ifc == FTEID_IFACE_S5S8_PGW_GTPC && tid && ipa) {
+                        pdp_out->ul_teid_cp = tid;
+                        pdp_out->ggsn_cp_ipv4 = ipa;
+                    } else if ((ifc == FTEID_IFACE_S5S8_PGW_GTPU ||
+                                ifc == FTEID_IFACE_S5S8_SGW_GTPU ||
+                                ifc == FTEID_IFACE_S4_SGW_GTPU ||
+                                ifc == FTEID_IFACE_S1U_SGW_GTPU) &&
+                               tid && ipa && !pdp_out->ul_teid_data) {
+                        pdp_out->ul_teid_data = tid;
+                        pdp_out->ggsn_up_ipv4 = ipa;
+                    }
+                } else if (bn[k].type == GTPV2_IE_BEARER_QOS &&
+                           bn[k].length &&
+                           bn[k].length <= sizeof(pdp_out->qos_neg) &&
+                           pdp_out->qos_neg_len == 0) {
+                    memcpy(pdp_out->qos_neg, bn[k].value, bn[k].length);
+                    pdp_out->qos_neg_len = bn[k].length;
+                }
+            }
+        } else if (inn[i].type == GTPV2_IE_PAA &&
+                   inn[i].length >= (uint16_t)5 &&
+                   inn[i].value[0] == GTPV2_PDN_TYPE_IPV4 && !pdp_out->ue_ipv4) {
+            pdp_out->ue_ipv4 = iwf_be32(inn[i].value + 1);
+        }
+    }
+
+    pdp_out->nsapi = ebi;
+
+    if (pdp_out->qos_neg_len == 0) {
+        pdp_out->qos_neg[0] = 0;
+        pdp_out->qos_neg_len = (size_t)1;
+    }
+    if (!pdp_out->ggsn_cp_ipv4 || !pdp_out->ul_teid_cp ||
+        !pdp_out->ggsn_up_ipv4 || !pdp_out->ul_teid_data ||
+        !pdp_out->ue_ipv4 || !pdp_out->apn[0])
+        return -1;
+    pdp_out->ok = 1;
+    return 0;
+}
+
+static uint8_t map_gtpu_v2_cause_to_v1_basic(uint8_t c)
+{
+    if (c == GTPV2_CAUSE_REQUEST_ACCEPTED)
+        return GTPV1_CAUSE_REQUEST_ACCEPTED;
+    if (c == GTPV2_CAUSE_CONTEXT_NOT_FOUND)
+        return GTPV1_CAUSE_NON_EXISTENT;
+    return GTPV1_CAUSE_SYSTEM_FAILURE;
+}
+
+static int sin_addr_matches_cfg(const struct sockaddr_in *peer,
+                                const struct sockaddr_in *expect)
+{
+    if (!peer || !expect || peer->sin_family != AF_INET ||
+        expect->sin_family != AF_INET)
+        return 0;
+    if (expect->sin_addr.s_addr == htonl(INADDR_ANY))
+        return 1;
+    return peer->sin_addr.s_addr == expect->sin_addr.s_addr;
+}
+
+static int send_v1_sgsn_ctx_resp_quick(iwf_runtime_t *rt,
+                                     const iwf_endpoint_t *to,
+                                     uint32_t req_hdr_teid, uint16_t req_seq16,
+                                     uint8_t v1cause, const char *imsi_digits)
+{
+    uint8_t out[IWF_MAX_PKT];
+    gtpv1_enc_t e;
+    gtpv1_enc_init(&e, out, sizeof(out));
+    if (gtpv1_enc_begin(&e, GTPV1_SGSN_CONTEXT_RESPONSE,
+                        req_hdr_teid, req_seq16) != 0)
+        return -1;
+    if (gtpv1_enc_tv_u8(&e, GTPV1_IE_CAUSE, v1cause) != 0)
+        return -1;
+    if (imsi_digits && imsi_digits[0])
+        gtpv1_enc_imsi_tv(&e, imsi_digits);
+    int tot = gtpv1_enc_finish(&e);
+    if (tot <= 0)
+        return -1;
+    return iwf_send_v1(rt, to, out, (size_t)tot);
+}
+
+static int pick_mm104_mm_from_ctx_resp(const iwf_msg_t *v2,
+                                       uint8_t **mm_wire, uint16_t *mm_len_out)
+{
+    const iwf_ie_t *mm =
+        gtpv2_find_ie(v2, GTPV2_IE_MM_CONTEXT_UMTS_KEY_QUINT, 0);
+    if (!mm || mm->length == 0)
+        return -1;
+    *mm_wire = (uint8_t *)mm->value;
+    *mm_len_out = mm->length;
+    return 0;
+}
+
+static void pick_mme_c_from_ctx_resp(const iwf_msg_t *v2,
+                                    const iwf_endpoint_t *from_mme,
+                                    uint32_t *out_teid, uint32_t *out_ipv4)
+{
+    *out_teid = 0;
+    *out_ipv4 = 0;
+
+    const iwf_ie_t *sf = ctx_find_sender_fteid_v2(v2);
+    if (sf) {
+        uint8_t iface;
+        uint32_t tid, ipa;
+        if (!gtpv2_decode_fteid(sf, &iface, &tid, &ipa) && tid &&
+            ipa &&
+            (iface == FTEID_IFACE_S11_MME_GTPC ||
+             iface == FTEID_IFACE_S11_S4_SGW_GTPC)) {
+            *out_teid = tid;
+            *out_ipv4 = ipa;
+            return;
+        }
+    }
+    if (v2_teid_present_in_hdr(v2) && v2->teid && from_mme &&
+        from_mme->addr.sin_family == AF_INET) {
+        *out_teid = v2->teid;
+        *out_ipv4 = ntohl(from_mme->addr.sin_addr.s_addr);
+    }
+}
+
+static uint8_t map_gtpu_v1_cause_to_v2(uint8_t c)
+{
+    if (c == GTPV1_CAUSE_REQUEST_ACCEPTED)
+        return GTPV2_CAUSE_REQUEST_ACCEPTED;
+    /* Best-effort: non-existent subscriber / IMEI IMSI unknown */
+    if (c == 192 || c == GTPV1_CAUSE_NON_EXISTENT)
+        return GTPV2_CAUSE_CONTEXT_NOT_FOUND;
+    return GTPV2_CAUSE_SYSTEM_FAILURE;
+}
+
+static int encode_ctx_resp_accepted(const ctx_pend_t *pend,
+                                    const uint8_t *mm_buf, size_t mm_len,
+                                    const parsed_pdp130_t *pdp,
+                                    uint32_t sgsn_teid_cp,
+                                    uint32_t sgsn_cp_ipv4,
+                                    const char *rsp_imsi,
+                                    uint8_t *outbuf, size_t outcap)
+{
+    gtpv2_enc_t e;
+    gtpv2_enc_init(&e, outbuf, outcap);
+    gtpv2_enc_begin_tf(&e, GTPV2_CONTEXT_RESPONSE, pend->mme_teid, pend->mme_seq24,
+                       pend->mme_t_present);
+    if (gtpv2_enc_cause(&e, GTPV2_CAUSE_REQUEST_ACCEPTED) != 0)
+        return -1;
+    if (rsp_imsi && rsp_imsi[0])
+        gtpv2_enc_imsi_bcd(&e, rsp_imsi);
+    gtpv2_enc_rat_type(&e, GTPV2_RAT_GERAN);
+    if (gtpv2_enc_tlv(&e, GTPV2_IE_MM_CONTEXT_UMTS_KEY_QUINT, 0,
+                      mm_buf, (uint16_t)mm_len) != 0)
+        return -1;
+    if (sgsn_teid_cp && sgsn_cp_ipv4)
+        gtpv2_enc_fteid_ipv4(&e, 0, FTEID_IFACE_S4_SGSN_GTPC, sgsn_teid_cp,
+                             sgsn_cp_ipv4);
+
+    uint8_t qci, pl, pci, pvi;
+    uint64_t mbr_ul, mbr_dl, gbr_ul, gbr_dl;
+    uint32_t ambr_ul, ambr_dl;
+    map_qos_to_qci_ambr(pdp->qos_neg, pdp->qos_neg_len,
+                        &qci, &pl, &pci, &pvi,
+                        &mbr_ul, &mbr_dl, &gbr_ul, &gbr_dl,
+                        &ambr_ul, &ambr_dl);
+
+    size_t patch_pdn;
+    if (gtpv2_enc_group_begin(&e, GTPV2_IE_PDN_CONNECTION, 0, &patch_pdn) != 0)
+        return -1;
+    if (pdp->apn[0])
+        gtpv2_enc_apn(&e, pdp->apn);
+    else
+        LOGW("translate", "Context-Resp: empty APN in decoded PDP IE");
+    gtpv2_enc_apn_restriction(&e, 0);
+    gtpv2_enc_selection_mode(&e, 0);
+    if (pdp->ue_ipv4)
+        gtpv2_enc_ipv4_ip_address(&e, 0, htonl(pdp->ue_ipv4));
+    uint8_t ebi = pdp->nsapi <= 15 ? pdp->nsapi : 5;
+    gtpv2_enc_ebi(&e, 0, ebi);
+    if (pdp->ggsn_cp_ipv4)
+        gtpv2_enc_fteid_ipv4(&e, 0, FTEID_IFACE_S5S8_PGW_GTPC, pdp->ul_teid_cp,
+                             pdp->ggsn_cp_ipv4);
+
+    size_t patch_bc;
+    if (gtpv2_enc_group_begin(&e, GTPV2_IE_BEARER_CONTEXT, 0, &patch_bc) != 0)
+        return -1;
+    gtpv2_enc_ebi(&e, 0, ebi);
+    if (pdp->ggsn_up_ipv4 && pdp->ul_teid_data)
+        gtpv2_enc_fteid_ipv4(&e, 1, FTEID_IFACE_S5S8_PGW_GTPU,
+                             pdp->ul_teid_data, pdp->ggsn_up_ipv4);
+    gtpv2_enc_bearer_qos(&e, pci, pl, pvi, qci,
+                         mbr_ul, mbr_dl, gbr_ul, gbr_dl);
+    gtpv2_enc_group_finish(&e, patch_bc);
+
+    gtpv2_enc_ambr(&e, ambr_ul, ambr_dl);
+    gtpv2_enc_group_finish(&e, patch_pdn);
+
+    return gtpv2_enc_finish(&e);
+}
+static int encode_context_response_reject_only(const ctx_pend_t *pend,
+                                               uint8_t v2cause,
+                                               uint8_t *outbuf, size_t outcap)
+{
+    gtpv2_enc_t e;
+    gtpv2_enc_init(&e, outbuf, outcap);
+    gtpv2_enc_begin_tf(&e, GTPV2_CONTEXT_RESPONSE, pend->mme_teid, pend->mme_seq24,
+                       pend->mme_t_present);
+    if (gtpv2_enc_cause(&e, v2cause) != 0)
+        return -1;
+    return gtpv2_enc_finish(&e);
+}
+
+static int handle_gtpu_context_request(iwf_runtime_t *rt,
+                                       const iwf_endpoint_t *from,
+                                       const iwf_msg_t *v2)
+{
+    char imsi[IWF_IMSI_MAX] = {0};
+    const iwf_ie_t *imsi_ie = gtpv2_find_ie(v2, GTPV2_IE_IMSI, 0);
+    if (!imsi_ie || gtpv2_decode_imsi(imsi_ie, imsi, sizeof(imsi)) != 0) {
+        LOGW("translate", "Context Request: missing/decoding IMSI — drop");
+        return -1;
+    }
+
+    uint8_t rai6[6];
+    const iwf_ie_t *uli = gtpv2_find_ie(v2, GTPV2_IE_ULI, 0);
+    if (!(uli && ctx_decode_uli_rai(uli, rai6) == 0)) {
+        /* RAI is mandatory on SGSN Context Request; derive PLMN+LAC+RAC from ULI
+         * or synthesize from IMSI digits (same idea as synthetic_uli_no_rai). */
+        ctx_synthetic_rai(imsi, rai6);
+    }
+
+    uint32_t new_ctl_teid = sess_new_teid();
+    const iwf_ie_t *sf = ctx_find_sender_fteid_v2(v2);
+    if (sf) {
+        uint8_t iface;
+        uint32_t teid, ipv4;
+        if (!gtpv2_decode_fteid(sf, &iface, &teid, &ipv4) && teid)
+            new_ctl_teid = teid;
+    }
+
+    rt->gn_seq++;
+    uint16_t gseq16 = (uint16_t)((rt->gn_seq & 0xffffu) == 0u ? 1u : rt->gn_seq & 0xffffu);
+
+    ctx_pend_t *pend = (ctx_pend_t *)calloc(1, sizeof(ctx_pend_t));
+    if (!pend)
+        return -1;
+    pend->flow = CTX_FLOW_MME_TO_GN;
+    pend->gn_seq_key = (int)(uint16_t)gseq16;
+    pend->v2_seq_key = -1;
+    pend->mme_sa = *from;
+    pend->mme_teid = v2->teid;
+    pend->mme_seq24 = v2->seq;
+    pend->mme_t_present = v2_teid_present_in_hdr(v2);
+    memcpy(pend->req_imsi, imsi, sizeof(pend->req_imsi) - 1);
+    pend->req_imsi[sizeof(pend->req_imsi) - 1] = '\0';
+    HASH_ADD(hh_gn, g_ctx_pend_gn, gn_seq_key, sizeof(int), pend);
+    pend->in_gn_hash = 1;
+
+    if (!rt->cfg.sgsn_ip[0] || strcmp(rt->cfg.sgsn_ip, "0.0.0.0") == 0) {
+        LOGE("translate", "Context Request: configure [sgsn] ip for osmo-sgsn Gn");
+        ctx_pend_free(pend);
+        return -1;
+    }
+
+    uint8_t out[IWF_MAX_PKT];
+    gtpv1_enc_t eb;
+    gtpv1_enc_init(&eb, out, sizeof(out));
+    if (gtpv1_enc_begin(&eb, GTPV1_SGSN_CONTEXT_REQUEST, 0u, gseq16) != 0) {
+        ctx_pend_free(pend);
+        return -1;
+    }
+    if (gtpv1_enc_imsi_tv(&eb, imsi) != 0 ||
+        gtpv1_enc_rai_tv(&eb, rai6) != 0 ||
+        gtpv1_enc_tv_u32(&eb, GTPV1_IE_TEID_CTRL_PLANE, new_ctl_teid) != 0 ||
+        gtpv1_enc_gsn_addr_ipv4(&eb, ntohl(rt->local_ipv4_be)) != 0) {
+        ctx_pend_free(pend);
+        return -1;
+    }
+
+    const iwf_ie_t *ratie = gtpv2_find_ie(v2, GTPV2_IE_RAT_TYPE, 0);
+    if (ratie && ratie->length >= 1)
+        gtpv1_enc_tv_u8(&eb, GTPV1_IE_RAT_TYPE, ratie->value[0]);
+
+    int tot = gtpv1_enc_finish(&eb);
+    if (tot <= 0) {
+        ctx_pend_free(pend);
+        return -1;
+    }
+
+    iwf_endpoint_t sgsn;
+    memset(&sgsn, 0, sizeof(sgsn));
+    sgsn.addr = rt->sgsn_gtp_addr;
+    sgsn.addrlen = sizeof(sgsn.addr);
+
+    LOGI("translate", "Context-Req→Gn SGSN-Ctx-Req imsi=%s gn_seq=%u peer=%s:%u teid_cp=0x%08x",
+         imsi, (unsigned)gseq16,
+         inet_ntoa(sgsn.addr.sin_addr), ntohs(sgsn.addr.sin_port),
+         new_ctl_teid);
+    iwf_log_hex("translate", "SGSN-Ctx-Req", out, (size_t)tot);
+
+    return iwf_send_v1(rt, &sgsn, out, (size_t)tot);
+}
+
+static int handle_v1_sgsn_context_resp(iwf_runtime_t *rt,
+                                     const iwf_endpoint_t *from,
+                                     const iwf_msg_t *v1rsp)
+{
+    (void)from;
+
+    uint16_t wire_seq = (uint16_t)v1rsp->seq;
+    int seq_k = (int)wire_seq;
+    ctx_pend_t *pend = NULL;
+    HASH_FIND(hh_gn, g_ctx_pend_gn, &seq_k, sizeof(int), pend);
+    if (!pend || pend->flow != CTX_FLOW_MME_TO_GN || !pend->in_gn_hash) {
+        LOGW("translate", "SGSN-Ctx-Resp seq=%u: no pending MME→Gn Context Req",
+             (unsigned)wire_seq);
+        return -1;
+    }
+
+    iwf_endpoint_t mme_sa = pend->mme_sa;
+
+    char rsp_imsi[IWF_IMSI_MAX];
+    rsp_imsi[0] = '\0';
+    const iwf_ie_t *vim = gtpv1_find_ie(v1rsp, GTPV1_IE_IMSI);
+    if (!vim || gtpv1_decode_imsi(vim, rsp_imsi, sizeof(rsp_imsi)) != 0) {
+        memcpy(rsp_imsi, pend->req_imsi, sizeof(rsp_imsi) - 1);
+        rsp_imsi[sizeof(rsp_imsi) - 1] = '\0';
+    }
+
+    log_msg("RX-Gn", v1rsp, rsp_imsi[0] ? rsp_imsi : pend->req_imsi, "-");
+
+    const iwf_ie_t *cause_tv = gtpv1_find_ie(v1rsp, GTPV1_IE_CAUSE);
+    uint8_t v1cause = cause_tv ? cause_tv->value[0] : GTPV1_CAUSE_SYSTEM_FAILURE;
+
+    uint8_t buf[IWF_MAX_PKT];
+    int tot;
+
+    if (v1cause != GTPV1_CAUSE_REQUEST_ACCEPTED) {
+        tot = encode_context_response_reject_only(pend,
+                map_gtpu_v1_cause_to_v2(v1cause),
+                buf, sizeof(buf));
+    } else {
+        const iwf_ie_t *mm_ie = NULL;
+        for (size_t k = 0; k < v1rsp->n_ies; k++) {
+            if (v1rsp->ies[k].type == GTPV1_IE_MM_CONTEXT) {
+                mm_ie = &v1rsp->ies[k];
+                break;
+            }
+        }
+        const iwf_ie_t *pd_ie = NULL;
+        for (size_t k = 0; k < v1rsp->n_ies; k++) {
+            if (v1rsp->ies[k].type == GTPV1_IE_PDP_CONTEXT) {
+                pd_ie = &v1rsp->ies[k];
+                break;
+            }
+        }
+        uint8_t mm_buf[512];
+        size_t mm_len = 0;
+        parsed_pdp130_t pdp;
+
+        if (!mm_ie ||
+            mm_v129_to_v104(mm_ie->value, mm_ie->length, mm_buf, sizeof(mm_buf),
+                            &mm_len) != 0) {
+            LOGE("translate", "SGSN-Ctx-Resp: MM Context IE 129→104 failed");
+            tot = encode_context_response_reject_only(pend,
+                    GTPV2_CAUSE_SYSTEM_FAILURE, buf, sizeof(buf));
+        } else if (!pd_ie ||
+                   parse_gtpu_pdp130(pd_ie, &pdp) != 0 || !pdp.ok) {
+            LOGE("translate", "SGSN-Ctx-Resp: PDP Context IE (130) parse failed");
+            tot = encode_context_response_reject_only(pend,
+                    GTPV2_CAUSE_SYSTEM_FAILURE, buf, sizeof(buf));
+        } else {
+            uint32_t sctl = 0, s_ipv4 = 0;
+            const iwf_ie_t *scp = gtpv1_find_ie(v1rsp, GTPV1_IE_TEID_CTRL_PLANE);
+            const iwf_ie_t *sgn = gtpv1_find_ie(v1rsp, GTPV1_IE_GSN_ADDRESS);
+            if (scp)
+                gtpv1_decode_teid(scp, &sctl);
+            if (sgn)
+                gtpv1_decode_gsn_addr(sgn, &s_ipv4);
+            tot = encode_ctx_resp_accepted(pend, mm_buf, mm_len, &pdp, sctl, s_ipv4,
+                                           rsp_imsi[0] ? rsp_imsi : pend->req_imsi,
+                                           buf, sizeof(buf));
+        }
+    }
+
+    ctx_pend_free(pend);
+
+    if (tot <= 0)
+        return -1;
+
+    LOGI("translate", "TX-v2 Context-Resp (matched gn_seq=%u v1cause=%u) len=%d",
+         (unsigned)wire_seq, (unsigned)v1cause, tot);
+    iwf_log_hex("translate", "Context-Resp", buf, (size_t)tot);
+
+    return iwf_send_v2_addr(rt, &mme_sa.addr, mme_sa.addrlen, buf, (size_t)tot);
+}
+
+/* GTPv1 SGSN Context Request from osmo (Gn) → GTPv2 Context Request → [mme]. */
+static int handle_v1_sgsn_ctx_req_gn_to_mme(iwf_runtime_t *rt,
+                                            const iwf_endpoint_t *from,
+                                            const iwf_msg_t *v1req)
+{
+    if (!sin_addr_matches_cfg(&from->addr, &rt->sgsn_gtp_addr)) {
+        LOGW("translate",
+             "Gn SGSN-Ctx-Req from unexpected %s:%u (expected peer [sgsn] %s) — ignoring",
+             inet_ntoa(from->addr.sin_addr), ntohs(from->addr.sin_port),
+             inet_ntoa(rt->sgsn_gtp_addr.sin_addr));
+        return -1;
+    }
+
+    char imsi[IWF_IMSI_MAX] = {0};
+    if (build_imsi_from_v1(v1req, imsi) != 0) {
+        LOGW("translate", "Gn SGSN-Ctx-Req: missing/decoding IMSI");
+        send_v1_sgsn_ctx_resp_quick(rt, from, v1req->teid,
+                                    (uint16_t)v1req->seq,
+                                    GTPV1_CAUSE_SYSTEM_FAILURE, "");
+        return -1;
+    }
+
+    uint8_t rai6[6];
+    const iwf_ie_t *raitv = gtpv1_find_ie(v1req, GTPV1_IE_RAI);
+    if (raitv && raitv->length == 6)
+        memcpy(rai6, raitv->value, 6);
+    else
+        ctx_synthetic_rai(imsi, rai6);
+
+    uint32_t s_teid_cp = 0;
+    uint32_t s_cp_ipv4 = 0;
+    const iwf_ie_t *stp = gtpv1_find_ie(v1req, GTPV1_IE_TEID_CTRL_PLANE);
+    if (!stp || gtpv1_decode_teid(stp, &s_teid_cp) != 0 || !s_teid_cp) {
+        LOGW("translate", "Gn SGSN-Ctx-Req imsi=%s: missing TEID Ctrl Plane IE",
+             imsi);
+        send_v1_sgsn_ctx_resp_quick(rt, from, v1req->teid,
+                                    (uint16_t)v1req->seq,
+                                    GTPV1_CAUSE_SYSTEM_FAILURE, imsi);
+        return -1;
+    }
+    const iwf_ie_t *sgn_ie = gtpv1_find_ie(v1req, GTPV1_IE_GSN_ADDRESS);
+    if (sgn_ie)
+        gtpv1_decode_gsn_addr(sgn_ie, &s_cp_ipv4);
+    if (!s_cp_ipv4)
+        s_cp_ipv4 = ntohl(from->addr.sin_addr.s_addr);
+
+    if (!rt->mme_gtp_addr.sin_port || rt->mme_gtp_addr.sin_addr.s_addr == 0) {
+        LOGE("translate",
+             "Gn SGSN-Ctx-Req imsi=%s: set [mme] ip (and port) to relay Context-Req",
+             imsi);
+        send_v1_sgsn_ctx_resp_quick(rt, from, v1req->teid,
+                                    (uint16_t)v1req->seq,
+                                    GTPV1_CAUSE_SYSTEM_FAILURE, imsi);
+        return -1;
+    }
+
+    uint32_t vseq_full = ++rt->v2_seq & 0xffffffu;
+    if (vseq_full == 0u)
+        vseq_full = 1u;
+
+    uint8_t buf[IWF_MAX_PKT];
+    gtpv2_enc_t e;
+    gtpv2_enc_init(&e, buf, sizeof(buf));
+    if (gtpv2_enc_begin_tf(&e, GTPV2_CONTEXT_REQUEST, 0, vseq_full, 0) != 0)
+        return -1;
+    if (gtpv2_enc_imsi_bcd(&e, imsi) != 0)
+        return -1;
+
+    uint8_t v2_rat = rt->cfg.rat_type;
+    const iwf_ie_t *rv1rat = gtpv1_find_ie(v1req, GTPV1_IE_RAT_TYPE);
+    if (rv1rat && rv1rat->length >= 1)
+        v2_rat = rv1rat->value[0];
+    if (gtpv2_enc_rat_type(&e, v2_rat) != 0)
+        return -1;
+    if (gtpv2_enc_uli_from_v1_rai(&e, rai6) != 0)
+        return -1;
+    if (gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S4_SGSN_GTPC,
+                            s_teid_cp, s_cp_ipv4) != 0)
+        return -1;
+
+    ctx_pend_t *pend = (ctx_pend_t *)calloc(1, sizeof(ctx_pend_t));
+    if (!pend)
+        return -1;
+    pend->flow = CTX_FLOW_GN_TO_MME;
+    pend->gn_seq_key = -1;
+    pend->v2_seq_key = (int)vseq_full;
+    pend->gn_peer_sa = *from;
+    pend->gn_req_hdr_teid = v1req->teid;
+    pend->gn_req_seq16 = (uint16_t)v1req->seq;
+    pend->sgsn_src_teid = s_teid_cp;
+    pend->sgsn_src_ipv4 = s_cp_ipv4;
+    memcpy(pend->req_imsi, imsi, sizeof(pend->req_imsi) - 1);
+    pend->req_imsi[sizeof(pend->req_imsi) - 1] = '\0';
+    HASH_ADD(hh_v2, g_ctx_pend_v2, v2_seq_key, sizeof(int), pend);
+    pend->in_v2_hash = 1;
+
+    int tot = gtpv2_enc_finish(&e);
+    if (tot <= 0) {
+        ctx_pend_free(pend);
+        return -1;
+    }
+
+    iwf_endpoint_t mme_dst;
+    memset(&mme_dst, 0, sizeof(mme_dst));
+    mme_dst.addr = rt->mme_gtp_addr;
+    mme_dst.addrlen = sizeof(mme_dst.addr);
+
+    LOGI("translate",
+         "Gn SGSN-Ctx-Req→MME Context-Req imsi=%s v2-seq=%06x peer=%s:%u gn_teid_cp=0x%08x",
+         imsi, (unsigned)vseq_full,
+         inet_ntoa(mme_dst.addr.sin_addr),
+         ntohs(mme_dst.addr.sin_port),
+         s_teid_cp);
+    iwf_log_hex("translate", "v2 Context-Req (Gn-origin)", buf, (size_t)tot);
+
+    if (iwf_send_v2_addr(rt, &mme_dst.addr, mme_dst.addrlen, buf,
+                         (size_t)tot) < 0) {
+        ctx_pend_free(pend);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Returns 1 if this was a pending Gn→MME Context transaction. */
+static int try_handle_gtpu_context_response_reverse(iwf_runtime_t *rt,
+                                                    const iwf_endpoint_t *from,
+                                                    const iwf_msg_t *v2rsp)
+{
+    int seq_k = (int)(v2rsp->seq & 0xffffffu);
+    ctx_pend_t *pend = NULL;
+    HASH_FIND(hh_v2, g_ctx_pend_v2, &seq_k, sizeof(int), pend);
+    if (!pend || pend->flow != CTX_FLOW_GN_TO_MME || !pend->in_v2_hash)
+        return 0;
+
+    uint8_t gtpv2_cause = GTPV2_CAUSE_SYSTEM_FAILURE;
+    if (gtpv2_find_cause_value(v2rsp, &gtpv2_cause) != 0)
+        gtpv2_cause = GTPV2_CAUSE_SYSTEM_FAILURE;
+
+    log_msg("RX-v2-CtxResp", v2rsp, pend->req_imsi, "-");
+
+    if (gtpv2_cause != GTPV2_CAUSE_REQUEST_ACCEPTED) {
+        uint8_t vc = map_gtpu_v2_cause_to_v1_basic(gtpv2_cause);
+        send_v1_sgsn_ctx_resp_quick(rt, &pend->gn_peer_sa, pend->gn_req_hdr_teid,
+                                    pend->gn_req_seq16, vc, pend->req_imsi);
+        ctx_pend_free(pend);
+        return 1;
+    }
+
+    uint8_t *mm104 = NULL;
+    uint16_t mm104_len_w = 0;
+    uint8_t u129_mm[512];
+    size_t u129_len = 0;
+    parsed_pdp130_t pfill;
+
+    if (pick_mm104_mm_from_ctx_resp(v2rsp, &mm104, &mm104_len_w) != 0 ||
+        mm_v104_to_v129(mm104, (size_t)mm104_len_w, u129_mm, sizeof(u129_mm),
+                        &u129_len) != 0 ||
+        unpack_v2_pdn_for_reverse(v2rsp, &pfill) != 0) {
+        LOGE("translate", "Gn→MME Context-Resp reverse map failed imsi=%s",
+             pend->req_imsi);
+        send_v1_sgsn_ctx_resp_quick(rt, &pend->gn_peer_sa, pend->gn_req_hdr_teid,
+                                    pend->gn_req_seq16, GTPV1_CAUSE_SYSTEM_FAILURE,
+                                    pend->req_imsi);
+        ctx_pend_free(pend);
+        return 1;
+    }
+
+    uint8_t pdp130[896];
+    size_t pdp130_len = 0;
+    if (encode_gtpu_pdp130_from_parse(&pfill, pdp130, sizeof(pdp130),
+                                      &pdp130_len) != 0) {
+        send_v1_sgsn_ctx_resp_quick(rt, &pend->gn_peer_sa, pend->gn_req_hdr_teid,
+                                    pend->gn_req_seq16, GTPV1_CAUSE_SYSTEM_FAILURE,
+                                    pend->req_imsi);
+        ctx_pend_free(pend);
+        return 1;
+    }
+
+    uint32_t m_teid_cp = 0, m_cp_ip = 0;
+    pick_mme_c_from_ctx_resp(v2rsp, from, &m_teid_cp, &m_cp_ip);
+
+    uint8_t out[IWF_MAX_PKT];
+    gtpv1_enc_t enc;
+    gtpv1_enc_init(&enc, out, sizeof(out));
+    if (gtpv1_enc_begin(&enc, GTPV1_SGSN_CONTEXT_RESPONSE,
+                        pend->gn_req_hdr_teid, pend->gn_req_seq16) != 0) {
+        send_v1_sgsn_ctx_resp_quick(rt, &pend->gn_peer_sa, pend->gn_req_hdr_teid,
+                                    pend->gn_req_seq16, GTPV1_CAUSE_SYSTEM_FAILURE,
+                                    pend->req_imsi);
+        ctx_pend_free(pend);
+        return 1;
+    }
+    if (gtpv1_enc_tv_u8(&enc, GTPV1_IE_CAUSE,
+                        GTPV1_CAUSE_REQUEST_ACCEPTED) != 0 ||
+        gtpv1_enc_imsi_tv(&enc, pend->req_imsi) != 0 ||
+        gtpv1_enc_tlv(&enc, GTPV1_IE_MM_CONTEXT, u129_mm, (uint16_t)u129_len) !=
+            0 ||
+        gtpv1_enc_tlv(&enc, GTPV1_IE_PDP_CONTEXT, pdp130,
+                      (uint16_t)pdp130_len) != 0) {
+        send_v1_sgsn_ctx_resp_quick(rt, &pend->gn_peer_sa, pend->gn_req_hdr_teid,
+                                    pend->gn_req_seq16, GTPV1_CAUSE_SYSTEM_FAILURE,
+                                    pend->req_imsi);
+        ctx_pend_free(pend);
+        return 1;
+    }
+    if (m_teid_cp && m_cp_ip) {
+        if (gtpv1_enc_tv_u32(&enc, GTPV1_IE_TEID_CTRL_PLANE, m_teid_cp) != 0 ||
+            gtpv1_enc_gsn_addr_ipv4(&enc, m_cp_ip) != 0) {
+            send_v1_sgsn_ctx_resp_quick(
+                rt, &pend->gn_peer_sa, pend->gn_req_hdr_teid,
+                pend->gn_req_seq16, GTPV1_CAUSE_SYSTEM_FAILURE, pend->req_imsi);
+            ctx_pend_free(pend);
+            return 1;
+        }
+    }
+
+    int tout = gtpv1_enc_finish(&enc);
+    if (tout <= 0) {
+        send_v1_sgsn_ctx_resp_quick(rt, &pend->gn_peer_sa, pend->gn_req_hdr_teid,
+                                    pend->gn_req_seq16, GTPV1_CAUSE_SYSTEM_FAILURE,
+                                    pend->req_imsi);
+        ctx_pend_free(pend);
+        return 1;
+    }
+
+    LOGI("translate",
+         "TX-Gn SGSN-Ctx-Resp imsi=%s (Gn←MME path) hdr-teid=0x%08x gn_seq=%u len=%d",
+         pend->req_imsi, pend->gn_req_hdr_teid, (unsigned)pend->gn_req_seq16,
+         tout);
+    iwf_log_hex("translate", "SGSN-Ctx-Resp(reverse)", out, (size_t)tout);
+    iwf_send_v1(rt, &pend->gn_peer_sa, out, (size_t)tout);
+    ctx_pend_free(pend);
+    return 1;
+}
+
 
 /* ------------------------------------------------------------------- */
 /* Northbound: GTPv1-C from osmo-sgsn -> GTPv2-C to SGW-C               */
@@ -484,6 +1564,10 @@ int translate_v1_request(iwf_runtime_t *rt,
         if (total > 0) iwf_send_v1(rt, from, outbuf, (size_t)total);
         return 0;
     }
+    case GTPV1_SGSN_CONTEXT_REQUEST:
+        return handle_v1_sgsn_ctx_req_gn_to_mme(rt, from, v1);
+    case GTPV1_SGSN_CONTEXT_RESPONSE:
+        return handle_v1_sgsn_context_resp(rt, from, v1);
     default:
         LOGW("translate", "unhandled GTPv1 msg_type=%u", v1->msg_type);
         return -1;
@@ -882,11 +1966,19 @@ int translate_v2_response(iwf_runtime_t *rt,
                           const iwf_endpoint_t *from,
                           const iwf_msg_t *v2)
 {
-    (void)from;
     switch (v2->msg_type) {
     case GTPV2_CREATE_SESSION_RESPONSE: return handle_create_session_response(rt, v2);
     case GTPV2_MODIFY_BEARER_RESPONSE:  return handle_modify_bearer_response(rt, v2);
     case GTPV2_DELETE_SESSION_RESPONSE: return handle_delete_session_response(rt, v2);
+    case GTPV2_CONTEXT_REQUEST:
+        return handle_gtpu_context_request(rt, from, v2);
+    case GTPV2_CONTEXT_RESPONSE: {
+        if (try_handle_gtpu_context_response_reverse(rt, from, v2))
+            return 0;
+        LOGW("translate", "unmatched v2 Context-Resp seq=%06x — no Gn.pending",
+             (unsigned)(v2->seq & 0xffffffu));
+        return 0;
+    }
     case GTPV2_ECHO_REQUEST: {
         uint8_t outbuf[IWF_MAX_PKT];
         gtpv2_enc_t e;
@@ -895,7 +1987,9 @@ int translate_v2_response(iwf_runtime_t *rt,
         uint8_t rec = 0;
         gtpv2_enc_tlv(&e, GTPV2_IE_RECOVERY, 0, &rec, 1);
         int total = gtpv2_enc_finish(&e);
-        if (total > 0) iwf_send_v2(rt, outbuf, (size_t)total);
+        if (total > 0)
+            iwf_send_v2_addr(rt, &from->addr, from->addrlen,
+                             outbuf, (size_t)total);
         return 0;
     }
     case GTPV2_ECHO_RESPONSE:
