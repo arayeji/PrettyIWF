@@ -63,7 +63,6 @@
 #endif
 
 #ifdef MAP_IWF_WITH_OSMO_SIGTRAN
-#define IWF_STP_DEFAULT_RCTX       3u
 #define IWF_SIMPLE_CLIENT_AS_NAME  "as-clnt-iwf"
 #endif
 
@@ -299,6 +298,8 @@ int ss7_link_init(struct iwf_runtime *rt)
 
     /* RKM: xua_rkm_send_reg_req() omits ROUTE_CTX when routing_key.context==0, so the
      * SG allocates a free RCTX (often 1) and may reject if permit_dyn_rkm_alloc=0.
+     * Otherwise use [stp] routing_context (default 1) — must be unique per ASP; value 3
+     * often clashes with osmo-sgsn on the same STP.
      * Set context+pc on the simple-client AS; locate cfg without a fragile struct mirror. */
     {
         struct osmo_ss7_as *as =
@@ -309,10 +310,10 @@ int ss7_link_init(struct iwf_runtime *rt)
             struct osmo_ss7_routing_key *rk = iwf_find_as_routing_key(
                 as, OSMO_SS7_ASP_PROT_M3UA);
             if (rk) {
-                rk->context = IWF_STP_DEFAULT_RCTX;
+                rk->context = rt->cfg.stp_routing_context;
                 rk->pc      = default_pc;
-                LOGI("ss7", "AS routing_key RCTX=%u OPC=0x%x (readback ctx=%u pc=0x%x)",
-                     (unsigned)IWF_STP_DEFAULT_RCTX, (unsigned)default_pc,
+                LOGI("ss7", "AS routing_key RCTX=%u OPC=0x%x readback ctx=%u pc=0x%x",
+                     (unsigned)rk->context, (unsigned)default_pc,
                      (unsigned)rk->context, (unsigned)rk->pc);
             } else {
                 LOGW("ss7", "could not locate AS cfg.routing_key (libosmo layout?)");
