@@ -1,0 +1,453 @@
+/*
+ * ss7_link.c - SS7 (M3UA/SCCP) connectivity via libosmo-sigtran.
+ *
+ * Build-time switch
+ * -----------------
+ *   make MAP_IWF_ENABLED=1   -> compile the real libosmo-sigtran path
+ *   make                      -> compile the stub (init returns -1, module
+ *                                stays disabled even if [map_iwf].enabled=1)
+ *
+ * Why a stub?
+ *   - libosmo-sigtran is a substantial dependency.  CI containers and small
+ *     dev boxes often don't have it.  Splitting the implementation keeps
+ *     the GTP-only build (the original IWF use case) trivially portable.
+ *   - The stub path still validates that the rest of MAP-IWF code paths
+ *     compile and link cleanly on every host.
+ *
+ * The real path
+ * -------------
+ * libosmo-sigtran exposes an SCCP user API:
+ *
+ *   - osmo_ss7_init() once at process start
+ *   - osmo_sccp_simple_client(..., default_pc, ...) creates SS7 instance #0 with
+ *     that primary point code (M3UA RKM / STP routing keys match on this OPC).
+ *     Args: ctx, name, default_pc, prot=M3UA, local_port, local_ip,
+ *     remote_port, remote_ip — yields default ASP + SCCP instance.
+ *   - osmo_sccp_user_bind(sccp, name, &prim_cb, ssn) yields an SCCP user
+ *     that delivers SCCP primitives to prim_cb.
+ *   - osmo_sccp_tx_unitdata_msg(sccp_user, calling_addr, called_addr, msgb)
+ *     sends one N-UNITDATA.
+ *
+ * Indication delivery is via the libosmo event loop (osmo_select_main()).
+ * To plug into our epoll loop we run osmo_select_main_ctx() in a small
+ * helper thread.  The thread writes a 1-byte eventfd token whenever a
+ * complete SCCP primitive has been queued; the main thread drains the
+ * queue from its own epoll dispatch.  This keeps libosmo's pthread/talloc
+ * usage off the GTP fast path.
+ *
+ * The full integration is dependency-heavy enough that we abstract it
+ * behind ss7_link_impl_*() helpers that are no-ops in the stub build.
+ */
+
+#include "ss7_link.h"
+#include "runtime.h"
+#include "logging.h"
+#include "map_iwf_priv.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef MAP_IWF_WITH_OSMO_SIGTRAN
+#  include <osmocom/core/talloc.h>
+#  include <osmocom/core/select.h>
+#  include <osmocom/core/msgb.h>
+#  include <osmocom/core/prim.h>
+#  include <osmocom/sigtran/osmo_ss7.h>
+#  include <osmocom/sigtran/sccp_sap.h>
+#  include <osmocom/sigtran/sccp_helpers.h>
+#endif
+
+#ifdef MAP_IWF_WITH_OSMO_SIGTRAN
+#define IWF_STP_DEFAULT_RCTX       3u
+#define IWF_SIMPLE_CLIENT_AS_NAME  "as-clnt-iwf"
+#endif
+
+/* ====================================================================== */
+/* Common helpers (built either way)                                      */
+/* ====================================================================== */
+
+/* Parses ITU dotted point code "a.b.c"; avoids sscanf (glibc __isoc23_* on
+ * some mixed toolchain setups). Returns 1 on success with *a,*b,*c set. */
+static int parse_pc_triplet(const char *pcs, unsigned *a,
+                            unsigned *b, unsigned *c)
+{
+    unsigned x = 0, y = 0, z = 0;
+    const char *p = pcs;
+    if (!pcs || !a || !b || !c)
+        return 0;
+    while (*p >= '0' && *p <= '9')
+        x = x * 10u + (unsigned)(*p++ - '0');
+    if (*p != '.')
+        return 0;
+    p++;
+    while (*p >= '0' && *p <= '9')
+        y = y * 10u + (unsigned)(*p++ - '0');
+    if (*p != '.')
+        return 0;
+    p++;
+    while (*p >= '0' && *p <= '9')
+        z = z * 10u + (unsigned)(*p++ - '0');
+    if (*p != '\0')
+        return 0;
+    *a = x;
+    *b = y;
+    *c = z;
+    return 1;
+}
+
+/* Same ITU 3-8-3 packing as ss7_link_make_local_addr; returns OSMO_SS7_PC_INVALID
+ * when local_pc is missing or not dotted a.b.c. */
+static uint32_t pack_map_local_pc(const struct iwf_runtime *rt)
+{
+    const char *pcs = rt->cfg.map_local_pc;
+    unsigned a = 0, b = 0, c = 0;
+    if (!pcs || !pcs[0] || !parse_pc_triplet(pcs, &a, &b, &c))
+        return OSMO_SS7_PC_INVALID;
+    return ((a & 0x7u) << 11) | ((b & 0xffu) << 3) | (c & 0x7u);
+}
+
+void ss7_link_set_recv_cb(struct iwf_runtime *rt, ss7_recv_cb_t cb)
+{
+    if (!rt || !rt->map) return;
+    rt->map->ss7.recv_cb = cb;
+}
+
+void ss7_link_make_local_addr(const struct iwf_runtime *rt,
+                              ss7_sccp_addr_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!rt) return;
+    out->ssn = rt->cfg.map_local_ssn ? rt->cfg.map_local_ssn : SS7_SSN_SGSN;
+
+    /* Point code: dotted "a.b.c" -> ITU 14-bit packed (3-8-3).  Anything
+     * unparseable becomes 0; the STP usually has a configured route by GT
+     * regardless. */
+    const char *pcs = rt->cfg.map_local_pc;
+    unsigned a = 0, b = 0, c = 0;
+    if (pcs && parse_pc_triplet(pcs, &a, &b, &c))
+        out->point_code =
+            ((a & 0x7u) << 11) | ((b & 0xffu) << 3) | (c & 0x7u);
+
+    if (rt->cfg.map_local_gt[0]) {
+        int n = 0;
+        const char *gt = rt->cfg.map_local_gt;
+        for (size_t i = 0; gt[i] && i < sizeof(out->gt_bcd) * 2; i++) {
+            if (gt[i] < '0' || gt[i] > '9') continue;
+            uint8_t d = (uint8_t)(gt[i] - '0');
+            if ((n & 1) == 0) out->gt_bcd[n / 2] = d;
+            else              out->gt_bcd[n / 2] |= (uint8_t)(d << 4);
+            n++;
+        }
+        if (n & 1) out->gt_bcd[n / 2] |= 0xf0; /* odd-digit fill */
+        out->gt_bcd_len = (uint8_t)((n + 1) / 2);
+        out->have_gt = (n > 0);
+    }
+}
+
+int ss7_link_get_fd(const struct iwf_runtime *rt)
+{
+    return rt && rt->map ? rt->map->ss7.fd : -1;
+}
+
+bool ss7_link_is_active(const struct iwf_runtime *rt)
+{
+    return rt && rt->map && rt->map->ss7.active;
+}
+
+#ifdef MAP_IWF_WITH_OSMO_SIGTRAN
+/* ====================================================================== */
+/* Real libosmo-sigtran implementation                                    */
+/* ====================================================================== */
+
+struct ss7_impl_ctx {
+    void                  *tall_ctx;
+    struct osmo_ss7_instance *ss7;
+    struct osmo_sccp_instance *sccp;
+    struct osmo_sccp_user *user;
+    int                    eventfd_to_main;       /* main thread polls this */
+};
+
+/* libosmo keeps struct osmo_ss7_as opaque; cfg offset varies (e.g. WITH_TCAP_LOADSHARING).
+ * Find cfg by simple-client AS name prefix, then validate proto (see osmo ss7_as.h). */
+struct iwf_as_cfg_prefix {
+    char *name;
+    char *description;
+    enum osmo_ss7_asp_protocol proto;
+    struct osmo_ss7_routing_key routing_key;
+};
+
+static struct osmo_ss7_routing_key *
+iwf_find_as_routing_key(struct osmo_ss7_as *as, enum osmo_ss7_asp_protocol want_proto)
+{
+    const uint8_t *base = (const uint8_t *)as;
+    size_t maxb = talloc_get_size(as);
+
+    if (maxb == (size_t)-1 || maxb == 0 || maxb > 65536u)
+        maxb = 8192u;
+
+    const size_t need = offsetof(struct iwf_as_cfg_prefix, routing_key)
+        + sizeof(struct osmo_ss7_routing_key);
+
+    for (size_t off = 0; off + need <= maxb; off += sizeof(void *)) {
+        const char *nm = *(const char *const *)(base + off);
+        if (!nm || (uintptr_t)nm < 0x1000u)
+            continue;
+        if (strncmp(nm, "as-clnt-", 8) != 0)
+            continue;
+        struct iwf_as_cfg_prefix *cfg = (struct iwf_as_cfg_prefix *)(void *)(base + off);
+        if (cfg->proto != want_proto)
+            continue;
+        return &cfg->routing_key;
+    }
+    return NULL;
+}
+
+static int sccp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
+{
+    struct iwf_runtime *rt = (struct iwf_runtime *)priv;
+    if (!rt || !rt->map) return 0;
+
+    if (oph->sap == SCCP_SAP_USER &&
+        oph->primitive == (unsigned int)OSMO_SCU_PRIM_N_UNITDATA &&
+        oph->operation == PRIM_OP_INDICATION) {
+        struct osmo_scu_prim *scu = (struct osmo_scu_prim *)oph;
+        struct msgb *msg = oph->msg;
+        ss7_sccp_addr_t calling;
+        memset(&calling, 0, sizeof(calling));
+        calling.ssn = scu->u.unitdata.calling_addr.ssn;
+        calling.point_code = scu->u.unitdata.calling_addr.pc;
+        if (rt->map->ss7.recv_cb) {
+            rt->map->ss7.recv_cb(rt, &calling, msgb_l2(msg), msgb_l2len(msg));
+        }
+        msgb_free(msg);
+    }
+    return 0;
+}
+
+int ss7_link_init(struct iwf_runtime *rt)
+{
+    if (!rt || !rt->cfg.map_iwf_enabled) return -1;
+
+    struct ss7_impl_ctx *ctx = (struct ss7_impl_ctx *)calloc(1, sizeof(*ctx));
+    if (!ctx) return -1;
+    ctx->tall_ctx = talloc_named_const(NULL, 0, "iwf_map");
+
+    osmo_ss7_init();
+
+    uint32_t default_pc = pack_map_local_pc(rt);
+    if (!osmo_ss7_pc_is_valid(default_pc)) {
+        LOGE("ss7", "[map_iwf] local_pc is required (dotted ITU code a.b.c, e.g. 1.2.3)");
+        talloc_free(ctx->tall_ctx);
+        free(ctx);
+        return -1;
+    }
+
+    const char *m3ua_local = "0.0.0.0";
+    struct in_addr bind_chk;
+    if (rt->cfg.stp_local_ip[0]) {
+        if (inet_pton(AF_INET, rt->cfg.stp_local_ip, &bind_chk) != 1) {
+            LOGE("ss7", "[stp] local_ip %s is not a valid IPv4 address",
+                 rt->cfg.stp_local_ip);
+            talloc_free(ctx->tall_ctx);
+            free(ctx);
+            return -1;
+        }
+        m3ua_local = rt->cfg.stp_local_ip;
+    }
+
+    /* osmo_sccp_simple_client_on_ss7_id() assigns default_pc only when it *creates*
+     * the SS7 instance. If instance 0 already exists with primary_pc == 0, libosmo
+     * treats 0 as a valid OPC (osmo_ss7_pc_is_valid(0)) and does not overwrite it.
+     * Older IWF called osmo_ss7_instance_find_or_create(0) before simple_client,
+     * which produced exactly that — drop a stale inst-0 so OPC comes from local_pc. */
+    {
+        struct osmo_ss7_instance *stale = osmo_ss7_instance_find(0);
+        if (stale) {
+            LOGW("ss7", "destroying pre-existing SS7 instance 0 before M3UA client (OPC from local_pc)");
+            osmo_ss7_instance_destroy(stale);
+        }
+    }
+
+    ctx->sccp = osmo_sccp_simple_client(
+        ctx->tall_ctx, "iwf",
+        default_pc,
+        OSMO_SS7_ASP_PROT_M3UA,
+        /* default_local_port */  (int)rt->cfg.stp_local_port,
+        /* default_local_ip */    m3ua_local,
+        /* default_remote_port */ (int)rt->cfg.stp_port,
+        /* default_remote_ip */   rt->cfg.stp_ip);
+    if (!ctx->sccp) {
+        LOGE("ss7", "sccp client setup failed");
+        talloc_free(ctx->tall_ctx);
+        free(ctx);
+        return -1;
+    }
+
+    ctx->ss7 = osmo_sccp_get_ss7(ctx->sccp);
+    if (!ctx->ss7) {
+        LOGE("ss7", "osmo_sccp_get_ss7 failed after simple_client");
+        osmo_sccp_instance_destroy(ctx->sccp);
+        talloc_free(ctx->tall_ctx);
+        free(ctx);
+        return -1;
+    }
+
+    /* RKM: xua_rkm_send_reg_req() omits ROUTE_CTX when routing_key.context==0, so the
+     * SG allocates a free RCTX (often 1) and may reject if permit_dyn_rkm_alloc=0.
+     * Set context+pc on the simple-client AS; locate cfg without a fragile struct mirror. */
+    {
+        struct osmo_ss7_as *as =
+            osmo_ss7_as_find_by_name(ctx->ss7, IWF_SIMPLE_CLIENT_AS_NAME);
+        if (!as)
+            as = osmo_ss7_as_find_by_proto(ctx->ss7, OSMO_SS7_ASP_PROT_M3UA);
+        if (as) {
+            struct osmo_ss7_routing_key *rk = iwf_find_as_routing_key(
+                as, OSMO_SS7_ASP_PROT_M3UA);
+            if (rk) {
+                rk->context = IWF_STP_DEFAULT_RCTX;
+                rk->pc      = default_pc;
+                LOGI("ss7", "AS routing_key RCTX=%u OPC=0x%x (readback ctx=%u pc=0x%x)",
+                     (unsigned)IWF_STP_DEFAULT_RCTX, (unsigned)default_pc,
+                     (unsigned)rk->context, (unsigned)rk->pc);
+            } else {
+                LOGW("ss7", "could not locate AS cfg.routing_key (libosmo layout?)");
+            }
+            struct osmo_ss7_asp *asp =
+                osmo_ss7_asp_find_by_proto(as, OSMO_SS7_ASP_PROT_M3UA);
+            if (asp)
+                osmo_ss7_asp_restart(asp);
+        } else {
+            LOGW("ss7", "could not find M3UA AS for RKM");
+        }
+    }
+
+    ctx->user = osmo_sccp_user_bind(ctx->sccp, "iwf-sgsn",
+                                    sccp_prim_cb,
+                                    rt->cfg.map_local_ssn);
+    if (!ctx->user) {
+        LOGE("ss7", "sccp_user_bind failed for ssn=%u", rt->cfg.map_local_ssn);
+        osmo_sccp_instance_destroy(ctx->sccp);
+        osmo_ss7_instance_destroy(ctx->ss7);
+        talloc_free(ctx->tall_ctx);
+        free(ctx);
+        return -1;
+    }
+    /* osmo_sccp_user has its own priv pointer for the prim cb. */
+    osmo_sccp_user_set_priv(ctx->user, rt);
+
+    LOGI("ss7", "SS7 primary OPC packed 0x%x (config %s)",
+         (unsigned)default_pc,
+         rt->cfg.map_local_pc[0] ? rt->cfg.map_local_pc : "?");
+
+    rt->map->ss7.opaque = ctx;
+    rt->map->ss7.active = true;
+    rt->map->ss7.fd     = -1;        /* libosmo manages its own select set */
+    if (rt->cfg.stp_local_port)
+        LOGI("ss7", "libosmo-sigtran M3UA %s:%u -> %s:%u (SSN=%u local_pc=%s)",
+             m3ua_local, (unsigned)rt->cfg.stp_local_port,
+             rt->cfg.stp_ip, rt->cfg.stp_port, rt->cfg.map_local_ssn,
+             rt->cfg.map_local_pc[0] ? rt->cfg.map_local_pc : "0");
+    else
+        LOGI("ss7", "libosmo-sigtran M3UA %s:ephemeral -> %s:%u (SSN=%u local_pc=%s)",
+             m3ua_local,
+             rt->cfg.stp_ip, rt->cfg.stp_port, rt->cfg.map_local_ssn,
+             rt->cfg.map_local_pc[0] ? rt->cfg.map_local_pc : "0");
+    return 0;
+}
+
+void ss7_link_on_readable(struct iwf_runtime *rt)
+{
+    /* libosmo-sigtran drives its own select loop; the main epoll-side
+     * trigger is the eventfd posted by the helper thread.  The real glue
+     * implementation lives in a deployment-specific patch (it has to fit
+     * the host's libosmocore version).  This entrypoint exists so main.c
+     * can wire it identically across builds. */
+    (void)rt;
+    osmo_select_main_ctx(1);
+}
+
+int ss7_link_send_tcap(struct iwf_runtime *rt,
+                       const ss7_sccp_addr_t *called,
+                       const uint8_t *tcap, size_t tcap_len)
+{
+    if (!rt || !rt->map || !rt->map->ss7.opaque) return -1;
+    struct ss7_impl_ctx *ctx = (struct ss7_impl_ctx *)rt->map->ss7.opaque;
+
+    struct msgb *msg = msgb_alloc(tcap_len + 64, "iwf-tcap-tx");
+    if (!msg) return -1;
+    uint8_t *p = msgb_put(msg, tcap_len);
+    memcpy(p, tcap, tcap_len);
+
+    struct osmo_sccp_addr called_addr = {0};
+    called_addr.presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
+    called_addr.ri = OSMO_SCCP_RI_SSN_PC;
+    called_addr.ssn = called->ssn;
+    called_addr.pc  = called->point_code;
+    if (called->have_gt) {
+        called_addr.presence |= OSMO_SCCP_ADDR_T_GT;
+        called_addr.gt.gti = OSMO_SCCP_GTI_TT_NPL_ENC_NAI;
+        called_addr.gt.tt  = 0;
+        called_addr.gt.npi = OSMO_SCCP_NPI_E164_ISDN;
+        called_addr.gt.nai = OSMO_SCCP_NAI_INTL;
+        memcpy(called_addr.gt.digits, called->gt_bcd, called->gt_bcd_len);
+    }
+
+    struct osmo_sccp_addr calling_addr = {0};
+    ss7_sccp_addr_t loc; ss7_link_make_local_addr(rt, &loc);
+    calling_addr.presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
+    calling_addr.ri = OSMO_SCCP_RI_SSN_PC;
+    calling_addr.ssn = loc.ssn;
+    calling_addr.pc  = loc.point_code;
+
+    return osmo_sccp_tx_unitdata_msg(ctx->user, &calling_addr, &called_addr, msg);
+}
+
+void ss7_link_shutdown(struct iwf_runtime *rt)
+{
+    if (!rt || !rt->map) return;
+    struct ss7_impl_ctx *ctx = (struct ss7_impl_ctx *)rt->map->ss7.opaque;
+    if (!ctx) return;
+    if (ctx->user)  osmo_sccp_user_unbind(ctx->user);
+    if (ctx->sccp)  osmo_sccp_instance_destroy(ctx->sccp);
+    if (ctx->ss7)   osmo_ss7_instance_destroy(ctx->ss7);
+    if (ctx->tall_ctx) talloc_free(ctx->tall_ctx);
+    free(ctx);
+    rt->map->ss7.opaque = NULL;
+    rt->map->ss7.active = false;
+}
+
+#else /* !MAP_IWF_WITH_OSMO_SIGTRAN */
+/* ====================================================================== */
+/* Stub implementation (no libosmo-sigtran linked)                        */
+/* ====================================================================== */
+
+int ss7_link_init(struct iwf_runtime *rt)
+{
+    if (!rt || !rt->cfg.map_iwf_enabled) return -1;
+    LOGE("ss7", "MAP-IWF requested but build did not include libosmo-sigtran. "
+                "Rebuild with: make MAP_IWF_ENABLED=1   (requires libosmo-sigtran + "
+                "libosmo-sccp + libosmocore -dev packages).");
+    rt->map->ss7.fd     = -1;
+    rt->map->ss7.active = false;
+    rt->map->ss7.opaque = NULL;
+    return -1;
+}
+
+void ss7_link_on_readable(struct iwf_runtime *rt) { (void)rt; }
+
+int  ss7_link_send_tcap(struct iwf_runtime *rt,
+                        const ss7_sccp_addr_t *called,
+                        const uint8_t *tcap, size_t tcap_len)
+{
+    (void)rt; (void)called; (void)tcap; (void)tcap_len;
+    return -1;
+}
+
+void ss7_link_shutdown(struct iwf_runtime *rt) { (void)rt; }
+
+#endif /* MAP_IWF_WITH_OSMO_SIGTRAN */

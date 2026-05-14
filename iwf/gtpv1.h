@@ -64,6 +64,10 @@ int gtpv1_enc_tv_u8(gtpv1_enc_t *e, uint8_t type, uint8_t v);
 int gtpv1_enc_tv_u32(gtpv1_enc_t *e, uint8_t type, uint32_t v);
 int gtpv1_enc_tlv(gtpv1_enc_t *e, uint8_t type,
                   const uint8_t *val, uint16_t len);
+/* TV type 2, 8-byte TBCD IMSI (TS 29.060 §7.7.2). */
+int gtpv1_enc_imsi_tv(gtpv1_enc_t *e, const char *digits);
+/* TV type 3, 6 octets PLMN+LAC+RAC (TS 29.060 §7.7.3). */
+int gtpv1_enc_rai_tv(gtpv1_enc_t *e, const uint8_t rai6[6]);
 int gtpv1_enc_cause(gtpv1_enc_t *e, uint8_t cause);
 int gtpv1_enc_eua_ipv4(gtpv1_enc_t *e, uint32_t ipv4);
 int gtpv1_enc_gsn_addr_ipv4(gtpv1_enc_t *e, uint32_t ipv4);
