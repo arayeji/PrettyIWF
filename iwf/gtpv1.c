@@ -287,6 +287,43 @@ int gtpv1_enc_tv_u8(gtpv1_enc_t *e, uint8_t type, uint8_t v)
     return 0;
 }
 
+int gtpv1_enc_imsi_tv(gtpv1_enc_t *e, const char *digits)
+{
+    if (!e || !digits || !digits[0]) return -1;
+    uint8_t bcd[8];
+    memset(bcd, 0xff, sizeof(bcd));
+    size_t dn = strlen(digits);
+    for (size_t i = 0; i < 8; i++) {
+        uint8_t d0 = 0x0f;
+        uint8_t d1 = 0x0f;
+        if (2 * i < dn) {
+            if (digits[2 * i] < '0' || digits[2 * i] > '9') return -1;
+            d0 = (uint8_t)(digits[2 * i] - '0');
+        }
+        if (2 * i + 1 < dn) {
+            if (digits[2 * i + 1] < '0' || digits[2 * i + 1] > '9')
+                return -1;
+            d1 = (uint8_t)(digits[2 * i + 1] - '0');
+        }
+        if (d0 > 9 || d1 > 9) return -1;
+        bcd[i] = (uint8_t)((d1 << 4) | d0);
+    }
+    if (need(e, 1 + 8) < 0) return -1;
+    e->buf[e->pos++] = GTPV1_IE_IMSI;
+    memcpy(e->buf + e->pos, bcd, 8);
+    e->pos += 8;
+    return 0;
+}
+
+int gtpv1_enc_rai_tv(gtpv1_enc_t *e, const uint8_t rai6[6])
+{
+    if (!rai6 || need(e, 1 + 6) < 0) return -1;
+    e->buf[e->pos++] = GTPV1_IE_RAI;
+    memcpy(e->buf + e->pos, rai6, 6);
+    e->pos += 6;
+    return 0;
+}
+
 int gtpv1_enc_tv_u32(gtpv1_enc_t *e, uint8_t type, uint32_t v)
 {
     if (need(e, 5) < 0) return -1;

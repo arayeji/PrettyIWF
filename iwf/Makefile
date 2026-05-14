@@ -1,9 +1,24 @@
-# Makefile for the GTPv1-C <-> GTPv2-C IWF.
+# Makefile for the IWF.
 #
-# Build:    make            (produces ./iwf)
-# Run:      ./iwf -c iwf.conf
-# Clean:    make clean
-# Install:  sudo make install   (copies iwf to /usr/local/sbin)
+# Two build modes:
+#
+#   make                       GTP-only IWF (default; no MAP/Diameter, no
+#                              libosmo-sigtran required).  The MAP source
+#                              files still compile - they just stub the SS7
+#                              layer so the binary refuses to enable
+#                              [map_iwf] if it is set in the config.
+#
+#   make MAP_IWF_ENABLED=1     Full IWF: GTP + MAP-Diameter S6d.  Requires
+#                              libosmocore, libosmo-sccp, libosmo-sigtran
+#                              development headers and libraries.
+#                              On Debian/Ubuntu install:
+#                                sudo apt install libosmocore-dev \
+#                                  libosmo-sccp-dev libosmo-sigtran-dev
+#
+# Other targets:
+#   make clean      Remove objects and binary.
+#   make install    Copy iwf -> /usr/local/sbin and iwf.conf -> /etc/iwf/.
+#   make uninstall  Remove the installed binary.
 
 CC      ?= gcc
 PREFIX  ?= /usr/local
@@ -13,17 +28,42 @@ CFLAGS  += -std=c11 -D_GNU_SOURCE \
            -Wall -Wextra -Wpedantic \
            -Wno-unused-parameter -Wno-pedantic \
            -Wno-unused-function -Wno-missing-field-initializers
+# Newer libc headers inline atoi/strtol/strtoul/sscanf to __isoc23_* wrappers.
+# If you link against an older libc (toolchain/OS mix, some containers), ld
+# reports undefined references. These flags force the classic libc entry points.
+CFLAGS  += -fno-builtin-atoi -fno-builtin-strtol -fno-builtin-strtoul \
+           -fno-builtin-sscanf
 LDFLAGS ?=
 LDLIBS  ?=
 
-# uthash is header-only, vendored next to the sources.
-SRCS    := main.c gtpv1.c gtpv2.c session.c translate.c config.c logging.c
+# Source set: GTP IWF (always built) + MAP IWF translation units (always
+# compiled; SS7 backend is conditional via -DMAP_IWF_WITH_OSMO_SIGTRAN).
+SRCS    := main.c gtpv1.c gtpv2.c session.c translate.c config.c logging.c \
+           map_iwf.c map_session.c tcap.c map_codec.c diameter.c ss7_link.c
 OBJS    := $(SRCS:.c=.o)
 DEPS    := $(SRCS:.c=.d)
 HDRS    := iwf.h gtpv1.h gtpv2.h session.h translate.h config.h logging.h \
-           runtime.h uthash.h
+           runtime.h uthash.h \
+           map_iwf.h map_iwf_priv.h map_session.h tcap.h map_codec.h \
+           diameter.h ss7_link.h
 
 BIN     := iwf
+
+# --- Optional MAP-IWF (libosmo-sigtran) integration ----------------------
+# Set MAP_IWF_ENABLED=1 on the make command line to link libosmo-sigtran in.
+# Without it, ss7_link.c compiles a stub that refuses to bring [map_iwf] up
+# at runtime.
+MAP_IWF_ENABLED ?= 0
+ifeq ($(MAP_IWF_ENABLED),1)
+  PKG_OSMO_CFLAGS := $(shell pkg-config --cflags libosmocore libosmo-sigtran libosmo-sccp 2>/dev/null)
+  PKG_OSMO_LIBS   := $(shell pkg-config --libs   libosmocore libosmo-sigtran libosmo-sccp 2>/dev/null)
+  CFLAGS  += -DMAP_IWF_WITH_OSMO_SIGTRAN $(PKG_OSMO_CFLAGS)
+  LDLIBS  += $(PKG_OSMO_LIBS)
+  ifeq ($(strip $(PKG_OSMO_LIBS)),)
+    $(error MAP_IWF_ENABLED=1 but pkg-config cannot find libosmocore/libosmo-sigtran/libosmo-sccp. \
+            Install: sudo apt install libosmocore-dev libosmo-sccp-dev libosmo-sigtran-dev)
+  endif
+endif
 
 .PHONY: all clean install uninstall
 

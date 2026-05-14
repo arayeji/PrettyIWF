@@ -36,6 +36,7 @@ int gtpv2_decode_fteid(const iwf_ie_t *ie,
                        uint32_t *ipv4);
 int gtpv2_decode_paa_ipv4(const iwf_ie_t *ie, uint8_t *pdn_type, uint32_t *ipv4);
 int gtpv2_decode_ebi(const iwf_ie_t *ie, uint8_t *ebi);
+int gtpv2_decode_imsi(const iwf_ie_t *ie, char *digits, size_t cap);
 
 /* Encoder. */
 typedef struct {
@@ -48,6 +49,9 @@ typedef struct {
 void gtpv2_enc_init(gtpv2_enc_t *e, uint8_t *buf, size_t cap);
 int  gtpv2_enc_begin(gtpv2_enc_t *e, uint8_t msg_type,
                      uint32_t teid, uint32_t seq);
+/* T=1 when teid_present; T=0 omits TEID octets (Echo / some requests). */
+int  gtpv2_enc_begin_tf(gtpv2_enc_t *e, uint8_t msg_type,
+                        uint32_t teid, uint32_t seq, int teid_present);
 int  gtpv2_enc_finish(gtpv2_enc_t *e);
 
 /* Raw TLIV. */
@@ -70,6 +74,8 @@ int gtpv2_enc_apn_restriction(gtpv2_enc_t *e, uint8_t restr);
 int gtpv2_enc_serving_network(gtpv2_enc_t *e,
                               uint16_t mcc, uint16_t mnc);
 int gtpv2_enc_cause(gtpv2_enc_t *e, uint8_t cause);
+/* GTP IE 74 — IPv4 only (network byte order in val). */
+int gtpv2_enc_ipv4_ip_address(gtpv2_enc_t *e, uint8_t instance, uint32_t ipv4_be);
 /* ULI with RAI only, from 6-octet GTPv1 / TS 24.008 RAI (PLMN+LAC+RAC). */
 int gtpv2_enc_uli_from_v1_rai(gtpv2_enc_t *e, const uint8_t rai6[6]);
 /* Same wire shape, PLMN from MCC/MNC and LAC=RAC=0 (lab fallback when Gn has no RAI). */
