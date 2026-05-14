@@ -381,6 +381,7 @@ t_dialogue_ms = 10000
 ip            = 127.0.0.1        ; osmo-stp SCTP IP
 port          = 2905             ; M3UA port
 remote_pc     = 1.2.1
+; routing_context = 1   ; M3UA RKM RCTX — default 1; 0 = omit (SG allocates). Avoid 3 if osmo-sgsn uses RCTX 3.
 
 [diameter_s6d]
 peer_ip       = 10.234.241.50    ; PyHSS Diameter IP
