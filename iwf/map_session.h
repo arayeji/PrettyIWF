@@ -114,6 +114,12 @@ typedef struct map_session {
     time_t              last_activity;
     int                 t_dialogue_ms;          /* deadline knob, see tcap.h */
 
+    /* Optional: UNIX command-triggered "test sai" session (Diameter AIR only).
+     * When cmd_test_reply_fd >= 0, AIA replies with OK/ERR on that FD then close.
+     * When cmd_test is true and fd < 0 (e.g. SIGUSR1), only log vectors. */
+    bool                cmd_test;
+    int                 cmd_test_reply_fd;
+
     UT_hash_handle      hh_tid;                 /* indexed by tcap_dialogue_id */
     UT_hash_handle      hh_sid;                 /* indexed by diameter_session_id */
 } map_session_t;
@@ -136,9 +142,14 @@ void            map_sess_touch(map_session_t *s);
 const char     *map_sess_state_str(map_sess_state_t st);
 const char     *map_op_str(map_op_t op);
 
+/* Optional hook invoked immediately before tearing down each timed-out session. */
+typedef void (*map_sess_timeout_hook_t)(map_session_t *s, void *hook_ctx);
+
 /* Periodic sweep: TCAP T-timeout fires per-dialogue.  Returns the number
- * of dialogues that were timed out and torn down. */
-int             map_sess_sweep(time_t now);
+ * of dialogues that were timed out and torn down.
+ * If hook is non-NULL it is called (s valid) before map_sess_remove. */
+int             map_sess_sweep(time_t now, map_sess_timeout_hook_t hook,
+                             void *hook_ctx);
 
 /* Iteration (for stats / shutdown). */
 typedef void (*map_sess_iter_fn)(map_session_t *s, void *ctx);

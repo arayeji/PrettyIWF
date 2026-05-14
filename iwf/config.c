@@ -29,6 +29,9 @@ static void defaults(iwf_config_t *c)
      * Default to EUTRAN so the IWF works against vanilla Open5GS out of the box. */
     c->rat_type = 6;
 
+    strncpy(c->map_cmd_sock_path, "/tmp/iwf_cmd.sock", sizeof(c->map_cmd_sock_path) - 1);
+    c->map_cmd_sock_path[sizeof(c->map_cmd_sock_path) - 1] = '\0';
+
     /* MAP-IWF: disabled by default - existing GTP-only deployments need no changes. */
     c->map_iwf_enabled    = 0;
     c->map_local_ssn      = 149;
@@ -158,6 +161,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "local_pc"))       copy_str(out->map_local_pc, sizeof(out->map_local_pc), val);
             else if (!strcmp(key, "local_ssn"))      out->map_local_ssn    = (uint8_t)atoi(val);
             else if (!strcmp(key, "t_dialogue_ms"))  out->map_t_dialogue_ms = atoi(val);
+            else if (!strcmp(key, "cmd_sock"))
+                copy_str(out->map_cmd_sock_path, sizeof(out->map_cmd_sock_path), val);
             else LOGW("config", "unknown key [map_iwf].%s", key);
         } else if (!strcmp(section, "stp")) {
             if      (!strcmp(key, "local_ip"))   copy_str(out->stp_local_ip, sizeof(out->stp_local_ip), val);
@@ -207,10 +212,11 @@ void iwf_config_dump(const iwf_config_t *c)
          c->log_level, c->log_file);
 
     if (c->map_iwf_enabled) {
-        LOGI("config", "map_iwf: local_gt=%s local_pc=%s ssn=%u t_dialogue=%dms",
+        LOGI("config", "map_iwf: local_gt=%s local_pc=%s ssn=%u t_dialogue=%dms cmd_sock=%s",
              c->map_local_gt[0] ? c->map_local_gt : "(unset)",
              c->map_local_pc[0] ? c->map_local_pc : "(unset)",
-             (unsigned)c->map_local_ssn, c->map_t_dialogue_ms);
+             (unsigned)c->map_local_ssn, c->map_t_dialogue_ms,
+             c->map_cmd_sock_path[0] ? c->map_cmd_sock_path : "(default)");
         {
             char lports[24];
             if (c->stp_local_port)

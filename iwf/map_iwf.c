@@ -56,10 +56,13 @@
 #include "ss7_link.h"
 #include "runtime.h"
 #include "logging.h"
+#include "test_cmd.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdio.h>
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
@@ -94,6 +97,35 @@ static int send_tcap_end_with_result(struct iwf_runtime *rt,
                                      uint8_t invoke_id,
                                      int local_opcode,
                                      const uint8_t *params, size_t params_len);
+
+/* UNIX / SIGUSR1 test session: never send TCAP toward SS7; use cmd_test_abort. */
+static void cmd_test_abort(map_session_t *s, const char *reason)
+{
+    if (!s || !s->cmd_test) return;
+    const char *r = reason ? reason : "abort";
+    if (s->cmd_test_reply_fd >= 0) {
+        test_cmd_reply_err(s->cmd_test_reply_fd, r);
+        close(s->cmd_test_reply_fd);
+        s->cmd_test_reply_fd = -1;
+    } else {
+        LOGW("map", "cmd-test SAI failed imsi=%s: %s",
+             s->imsi_str[0] ? s->imsi_str : "?", r);
+    }
+    s->cmd_test = false;
+    map_sess_remove(s);
+}
+
+static void map_sess_timeout_hook_cmd(map_session_t *s, void *hook_ctx)
+{
+    (void)hook_ctx;
+    if (!s || !s->cmd_test) return;
+    if (s->cmd_test_reply_fd >= 0) {
+        test_cmd_reply_err(s->cmd_test_reply_fd, "timeout");
+        close(s->cmd_test_reply_fd);
+        s->cmd_test_reply_fd = -1;
+    }
+    s->cmd_test = false;
+}
 
 /* ----- Begin handlers ---------------------------------------------- */
 
@@ -335,6 +367,10 @@ static int send_tcap_end_with_result(struct iwf_runtime *rt,
                                      int local_opcode,
                                      const uint8_t *params, size_t params_len)
 {
+    if (s->cmd_test) {
+        cmd_test_abort(s, "unexpected_tcap_result");
+        return -1;
+    }
     /* Build component portion. */
     uint8_t cmp[2048]; size_t co = 0;
     if (tcap_enc_return_result(cmp, sizeof(cmp), &co,
@@ -381,6 +417,10 @@ static int send_tcap_end_with_error(struct iwf_runtime *rt,
                                     int map_error_code,
                                     uint8_t network_resource)
 {
+    if (s->cmd_test) {
+        cmd_test_abort(s, "map_failure");
+        return 0;
+    }
     uint8_t param[8]; size_t plen = 0;
     if (map_error_code == MAP_ERR_SYSTEM_FAILURE) {
         int n = map_encode_systemfailure_diag(network_resource, param, sizeof(param));
@@ -456,10 +496,16 @@ static int parse_vector_avp(const uint8_t *body, size_t len,
 void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
                     const uint8_t *body, size_t body_len)
 {
+    const bool is_cmd_test = s->cmd_test;
+
     diameter_avp_t auth_info;
     if (diameter_avp_find(body, body_len, AVP_3GPP_AUTHENTICATION_INFO,
                           DIAMETER_VENDOR_3GPP, &auth_info) < 0) {
         LOGW("map", "AIA imsi=%s: no Authentication-Info AVP", s->imsi_str);
+        if (is_cmd_test) {
+            cmd_test_abort(s, "no_authentication_info_avp");
+            return;
+        }
         send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
         return;
     }
@@ -480,6 +526,27 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
     }
     LOGI("map", "AIA imsi=%s vectors=%u -> emitting MAP SAI Resp",
          s->imsi_str, s->n_av);
+
+    if (is_cmd_test) {
+        if (s->n_av == 0) {
+            cmd_test_abort(s, "no_vectors");
+            return;
+        }
+        int fd = s->cmd_test_reply_fd;
+        s->cmd_test_reply_fd = -1;
+        s->cmd_test = false;
+        if (fd >= 0) {
+            test_cmd_reply_ok(fd, (unsigned)s->n_av,
+                              s->av[0].rand, s->av[0].autn);
+            close(fd);
+        } else {
+            LOGI("map", "cmd-test SAI OK imsi=%s vectors=%u",
+                 s->imsi_str, (unsigned)s->n_av);
+        }
+        map_sess_remove(s);
+        return;
+    }
+
     if (s->n_av == 0) {
         send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
         return;
@@ -707,6 +774,12 @@ void map_iwf_diameter_error(struct iwf_runtime *rt, map_session_t *s,
 {
     LOGW("map", "Diameter error rc=%u imsi=%s op=%s; sending MAP SystemFailure",
          (unsigned)rc, s->imsi_str, map_op_str(s->map_op));
+    if (s->cmd_test) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "diameter_%u", (unsigned)rc);
+        cmd_test_abort(s, buf);
+        return;
+    }
     int map_err = MAP_ERR_SYSTEM_FAILURE;
     if (rc == DIAM_EXP_RC_USER_UNKNOWN)        map_err = MAP_ERR_UNKNOWN_SUBSCRIBER;
     else if (rc == DIAM_EXP_RC_ROAMING_NOT_ALLOWED) map_err = MAP_ERR_ROAMING_NOT_ALLOWED;
@@ -741,7 +814,7 @@ void map_iwf_on_ttimer_tick(struct iwf_runtime *rt)
     uint64_t exp;
     ssize_t r = read(rt->map->t_timer_fd, &exp, sizeof(exp));
     (void)r;
-    int killed = map_sess_sweep(time(NULL));
+    int killed = map_sess_sweep(time(NULL), map_sess_timeout_hook_cmd, NULL);
     if (killed) rt->map->stat_timeouts += (uint64_t)killed;
 }
 
@@ -817,12 +890,20 @@ int map_iwf_init(struct iwf_runtime *rt, int epfd)
                 "origin=%s realm=%s)",
          rt->cfg.diam_peer_ip, rt->cfg.diam_peer_port,
          rt->cfg.diam_origin_host, rt->cfg.diam_origin_realm);
+
+    if (test_cmd_init(rt, epfd) < 0) {
+        const char *p = rt->cfg.map_cmd_sock_path[0]
+                            ? rt->cfg.map_cmd_sock_path
+                            : IWF_TEST_CMD_SOCK_PATH;
+        LOGW("map", "test command socket not available (%s)", p);
+    }
     return 0;
 }
 
 void map_iwf_shutdown(struct iwf_runtime *rt)
 {
     if (!rt || !rt->map) return;
+    test_cmd_shutdown();
     LOGI("map", "shutting down (map_rx=%lu map_tx=%lu diam_rx=%lu diam_tx=%lu "
                 "timeouts=%lu sysfail=%lu)",
          (unsigned long)rt->map->stat_map_rx,
@@ -837,4 +918,91 @@ void map_iwf_shutdown(struct iwf_runtime *rt)
     map_sess_shutdown();
     free(rt->map);
     rt->map = NULL;
+}
+
+/* ====================================================================== */
+/* UNIX / SIGUSR1 test SAI (Diameter AIR only; no SS7 TCAP reply)         */
+/* ====================================================================== */
+
+int map_iwf_cmd_test_sai(struct iwf_runtime *rt,
+                         const char *imsi_digits,
+                         int reply_unix_fd)
+{
+    if (!map_iwf_enabled(rt)) {
+        if (reply_unix_fd >= 0)
+            test_cmd_reply_err(reply_unix_fd, "map_iwf_disabled");
+        return reply_unix_fd >= 0 ? -1 : 0;
+    }
+    if (!imsi_digits || !imsi_digits[0]) {
+        if (reply_unix_fd >= 0)
+            test_cmd_reply_err(reply_unix_fd, "invalid_imsi");
+        return -1;
+    }
+
+    for (const char *p = imsi_digits; *p; p++) {
+        if (!isdigit((unsigned char)*p)) {
+            if (reply_unix_fd >= 0)
+                test_cmd_reply_err(reply_unix_fd, "invalid_imsi");
+            return -1;
+        }
+    }
+
+    size_t L = strlen(imsi_digits);
+    if (L < 10 || L > 15) {
+        if (reply_unix_fd >= 0)
+            test_cmd_reply_err(reply_unix_fd, "invalid_imsi_length");
+        return -1;
+    }
+
+    map_session_t *s = map_sess_create(map_sess_new_tid());
+    if (!s) {
+        if (reply_unix_fd >= 0)
+            test_cmd_reply_err(reply_unix_fd, "no_session");
+        return -1;
+    }
+
+    s->map_op = MAP_OP_SAI;
+    s->state  = MAP_SESS_WAIT_DIAMETER;
+    s->have_peer_tid = false;
+    s->peer_tcap_dialogue_id = 0;
+
+    int bn = map_str_to_bcd(imsi_digits, s->imsi_bcd, sizeof(s->imsi_bcd));
+    if (bn < 0) {
+        if (reply_unix_fd >= 0)
+            test_cmd_reply_err(reply_unix_fd, "bcd_encode_failed");
+        map_sess_remove(s);
+        return -1;
+    }
+    s->imsi_bcd_len = (uint8_t)bn;
+    strncpy(s->imsi_str, imsi_digits, sizeof(s->imsi_str) - 1);
+    s->imsi_str[sizeof(s->imsi_str) - 1] = '\0';
+
+    if (s->imsi_bcd_len >= 3) {
+        memcpy(s->visited_plmn_bcd, s->imsi_bcd, 3);
+        s->have_visited_plmn = true;
+    }
+
+    s->cmd_test = true;
+    s->cmd_test_reply_fd = reply_unix_fd;
+    s->t_dialogue_ms = 10000;
+    map_sess_touch(s);
+
+    LOGI("map", "cmd-test TX AIR imsi=%s tid=0x%08x",
+         s->imsi_str, s->tcap_dialogue_id);
+
+    if (diameter_send_air(rt, s) < 0) {
+        cmd_test_abort(s, "air_send_failed");
+        return 0;
+    }
+    return 0;
+}
+
+void map_iwf_sigusr1_test_sai(struct iwf_runtime *rt)
+{
+    if (!map_iwf_enabled(rt)) {
+        LOGW("map", "SIGUSR1 cmd-test SAI ignored (MAP-IWF not active)");
+        return;
+    }
+    LOGI("map", "SIGUSR1: cmd-test SAI imsi=432120000000001");
+    (void)map_iwf_cmd_test_sai(rt, "432120000000001", -1);
 }
