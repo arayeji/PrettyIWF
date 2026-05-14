@@ -151,7 +151,10 @@ static int bcd_to_str(const uint8_t *p, size_t n, char *out, size_t cap)
 int gtpv1_decode_imsi(const iwf_ie_t *ie, char *out, size_t cap)
 {
     if (!ie || ie->length < 8) return -1;
-    return bcd_to_str(ie->value, 8, out, cap);
+    int n = bcd_to_str(ie->value, 8, out, cap);
+    if (n < 0) return -1;
+    if (n == 0) return -1;
+    return 0;
 }
 
 int gtpv1_decode_msisdn(const iwf_ie_t *ie, char *out, size_t cap)
