@@ -1482,6 +1482,7 @@ static int translate_update_pdp_context(iwf_runtime_t *rt,
     if (rc < 0) return rc;
 
     s->state = SESS_WAIT_MB_RESP;
+    s->mb_pending_update_seq = s->gtpv2_seq;
 
     LOGI("translate", "TX-S4 Modify-Bearer-Req imsi=%s seq=%u rnc_teid=0x%08x rnc_ip=%u.%u.%u.%u",
          imsi, s->gtpv2_seq, rnc_teid,
@@ -1845,6 +1846,7 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
                  s->key.imsi, s->gtpv2_seq, s->sgsn_data_teid,
                  (s->sgsn_addr_ipv4 >> 24) & 0xff, (s->sgsn_addr_ipv4 >> 16) & 0xff,
                  (s->sgsn_addr_ipv4 >> 8)  & 0xff,  s->sgsn_addr_ipv4 & 0xff);
+            s->mb_pending_init_seq = s->gtpv2_seq;
         }
     }
 
@@ -1870,24 +1872,60 @@ static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
 
     log_msg("RX-S4", v2, s->key.imsi, s->apn);
 
-    /* Spontaneous bearer-activation MBReq (no preceding GTPv1 Update PDP).
-     * Also catch the case where state already moved on (ACTIVE) but no real
-     * Update PDP Context was ever requested by osmo-sgsn — never synthesize a
-     * GTPv1 Update PDP Response the SGSN did not ask for. */
-    if (s->state != SESS_WAIT_MB_RESP) {
+    uint32_t seq24 = v2->seq & 0xffffffu;
+    int match_init = s->mb_pending_init_seq &&
+        seq24 == (s->mb_pending_init_seq & 0xffffffu);
+    int match_upd = s->mb_pending_update_seq &&
+        seq24 == (s->mb_pending_update_seq & 0xffffffu);
+
+    /* Activation MB after CSResp may complete after we've already sent Update PDP's MBReq
+     * (WAIT_MB_RESP). Old logic treated any MBResp in WAIT_MB_RESP as Update PDP completion,
+     * mis-delivered Update PDP Resp too early and left DL FAR confused until uplink arrived. */
+    if (match_init) {
+        s->mb_pending_init_seq = 0;
         if (cause == GTPV2_CAUSE_REQUEST_ACCEPTED) {
             LOGI("translate",
                  "MBResp (activate) imsi=%s seq=%u cause=16 — bearer ACTIVE, DL FAR should be FORWARD",
-                 s->key.imsi, (unsigned)(v2->seq & 0xffffffu));
+                 s->key.imsi, (unsigned)seq24);
         } else {
             LOGW("translate",
                  "MBResp (activate) imsi=%s seq=%u gtpv2_cause=%u — DL may stay BUFFER on SGW-U",
-                 s->key.imsi, (unsigned)(v2->seq & 0xffffffu), (unsigned)cause);
+                 s->key.imsi, (unsigned)seq24, (unsigned)cause);
         }
-        s->state = SESS_ACTIVE;
         sess_touch(s);
+        if (s->mb_pending_update_seq)
+            s->state = SESS_WAIT_MB_RESP;
+        else
+            s->state = SESS_ACTIVE;
         return 0;
     }
+
+    if (!match_upd) {
+        /* Duplicate MBResp or TEID correlation without pending seq — tolerate activate-only path */
+        if (s->state != SESS_WAIT_MB_RESP) {
+            if (cause == GTPV2_CAUSE_REQUEST_ACCEPTED) {
+                LOGI("translate",
+                     "MBResp (activate/legacy) imsi=%s seq=%u cause=16 — bearer ACTIVE",
+                     s->key.imsi, (unsigned)seq24);
+            } else {
+                LOGW("translate",
+                     "MBResp (activate/legacy) imsi=%s seq=%u gtpv2_cause=%u",
+                     s->key.imsi, (unsigned)seq24, (unsigned)cause);
+            }
+            s->state = SESS_ACTIVE;
+            sess_touch(s);
+            return 0;
+        }
+        LOGW("translate",
+             "MBResp imsi=%s seq=%u unexpected (pending_init=%u pending_upd=%u state=%s)",
+             s->key.imsi, (unsigned)seq24,
+             (unsigned)(s->mb_pending_init_seq & 0xffffffu),
+             (unsigned)(s->mb_pending_update_seq & 0xffffffu),
+             sess_state_str(s->state));
+        return 0;
+    }
+
+    s->mb_pending_update_seq = 0;
 
     uint8_t outbuf[IWF_MAX_PKT];
     gtpv1_enc_t e;

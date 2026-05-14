@@ -38,6 +38,7 @@ static void defaults(iwf_config_t *c)
     c->map_t_dialogue_ms  = 10000;
     strncpy(c->stp_ip,   "127.0.0.1", sizeof(c->stp_ip)   - 1);
     c->stp_port           = 2905;
+    c->stp_routing_context = 1u;
     c->diam_peer_port     = 3868;
     c->diam_watchdog_ms   = 30000;
     c->diam_request_timeout_ms = 10000;
@@ -170,6 +171,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "ip"))         copy_str(out->stp_ip, sizeof(out->stp_ip), val);
             else if (!strcmp(key, "port"))       out->stp_port = (uint16_t)atoi(val);
             else if (!strcmp(key, "remote_pc"))  copy_str(out->stp_remote_pc, sizeof(out->stp_remote_pc), val);
+            else if (!strcmp(key, "routing_context") || !strcmp(key, "rctx"))
+                out->stp_routing_context = (uint32_t)strtoul(val, NULL, 0);
             else LOGW("config", "unknown key [stp].%s", key);
         } else if (!strcmp(section, "diameter_s6d")) {
             if      (!strcmp(key, "peer_ip"))       copy_str(out->diam_peer_ip, sizeof(out->diam_peer_ip), val);
@@ -224,10 +227,11 @@ void iwf_config_dump(const iwf_config_t *c)
                          (unsigned)c->stp_local_port);
             else
                 strcpy(lports, "ephemeral");
-            LOGI("config", "map_iwf: stp M3UA bind %s:%s -> peer %s:%u remote_pc=%s",
+            LOGI("config", "map_iwf: stp M3UA bind %s:%s -> peer %s:%u remote_pc=%s rctx=%u",
                  c->stp_local_ip[0] ? c->stp_local_ip : "(any)",
                  lports, c->stp_ip, c->stp_port,
-                 c->stp_remote_pc[0] ? c->stp_remote_pc : "(unset)");
+                 c->stp_remote_pc[0] ? c->stp_remote_pc : "(unset)",
+                 (unsigned)c->stp_routing_context);
         }
         LOGI("config", "map_iwf: diameter peer=%s:%u origin=%s/%s dest=%s/%s "
                        "watchdog=%dms timeout=%dms",

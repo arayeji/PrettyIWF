@@ -52,6 +52,10 @@ typedef struct {
     char        stp_ip[64];
     uint16_t    stp_port;
     char        stp_remote_pc[16];
+    /* M3UA RKM routing context ID (distinct per ASP on shared STP). 0 =
+     * omit ROUTE_CTX so SG allocates (libosmo). Default 1 avoids clashes
+     * with stacks that commonly use RCTX 3 (e.g. osmo-sgsn). */
+    uint32_t    stp_routing_context;
 
     /* [diameter_s6d] */
     char        diam_peer_ip[64];

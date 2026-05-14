@@ -2,3 +2,7 @@
 iwf/iwf
 iwf/*.o
 iwf/*.d
+
+# IDE
+.vs/
+*.user
