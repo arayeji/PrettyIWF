@@ -6,7 +6,11 @@
  *      ^-- CSResp arrives, send Create PDP Resp --> ACTIVE
  *
  *   ACTIVE --Update PDP--> MODIFYING --MBReq sent--> WAIT_MB_RESP
- *      ^-- MBResp arrives, send Update PDP Resp --> ACTIVE
+ *      ^-- MBResp arrives (matching seq), send Update PDP Resp --> ACTIVE
+ *
+ *   After CSResp we may send an activation Modify Bearer before GTPv1 Update PDP.
+ *   If Update PDP arrives before that activation MBResp returns, two MB sequences
+ *   are outstanding — correlate MBResp by mb_pending_*_seq, not only state.
  *
  *   ACTIVE --Delete PDP--> DELETING --DSReq sent--> WAIT_DS_RESP
  *      ^-- DSResp arrives, send Delete PDP Resp --> IDLE (and free)
@@ -70,6 +74,12 @@ typedef struct sess_s {
 
     /* Outstanding transaction (Gn-side seq we'll answer with on SGW response) */
     uint32_t    gtpv2_seq;            /* sequence used toward SGW-C */
+
+    /* Outstanding Modify Bearer toward SGW-C (24-bit seq match on MBResp).
+     * Activation MB after CSResp vs Update PDP MB may overlap — never attach the
+     * wrong MBResp to GTPv1 Update PDP Response. */
+    uint32_t    mb_pending_init_seq;
+    uint32_t    mb_pending_update_seq;
 
     /* QoS we received from osmo-sgsn (3GPP TS 24.008 §10.5.6.5), kept verbatim
      * to echo back in the Create PDP Response. */
