@@ -30,7 +30,7 @@ const iwf_ie_t *gtpv1_find_ie(const iwf_msg_t *msg, uint8_t type);
  * is the user-plane address (second IE when both present). */
 int gtpv1_last_gsn_addr_ipv4(const iwf_msg_t *msg, uint32_t *ipv4);
 
-/* IE-specific decoders.  All return 0 on success, -1 on malformed input. */
+/* IE-specific decoders. Most return 0 on success, -1 on malformed input. */
 int gtpv1_decode_imsi(const iwf_ie_t *ie, char *imsi_str, size_t cap);
 int gtpv1_decode_msisdn(const iwf_ie_t *ie, char *msisdn_str, size_t cap);
 int gtpv1_decode_apn(const iwf_ie_t *ie, char *apn_str, size_t cap);

@@ -345,6 +345,7 @@ map_codec.{c,h}    ASN.1 BER codec for the five MAP operations + AARQ/AARE
 diameter.{c,h}     Diameter base (CER/DWR/DPR) + S6d AIR/ULR/CLR/PUR codec
 ss7_link.{c,h}     libosmo-sigtran M3UA/SCCP glue (stubbed when
                    built without MAP_IWF_ENABLED=1)
+test_cmd.{c,h}     optional UNIX `sai <IMSI>` trigger (AIR/AIA lab test)
 ```
 
 ### Build
@@ -374,6 +375,7 @@ local_gt      = 1234567890      ; your network E.164 Global Title
 local_pc      = 1.2.3            ; ITU 3-8-3 point code
 local_ssn     = 149              ; SGSN SSN
 t_dialogue_ms = 10000
+; cmd_sock    = /run/iwf/iwf_cmd.sock   ; optional; default /tmp/iwf_cmd.sock
 
 [stp]
 ip            = 127.0.0.1        ; osmo-stp SCTP IP
@@ -393,18 +395,48 @@ request_timeout_ms = 10000
 
 ### Event-loop wiring
 
-`main.c` adds four extra fds to its single epoll set when
+`main.c` adds five extra fds to its single epoll set when
 `map_iwf_enabled()` is true:
 
-| Role                       | fd source                       | Handler                          |
-|----------------------------|---------------------------------|----------------------------------|
-| `MAP_EPOLL_ROLE_SS7`       | libosmo-sigtran SCCP user       | `map_iwf_on_ss7_readable()`      |
-| `MAP_EPOLL_ROLE_DIAMETER`  | TCP socket to PyHSS             | `map_iwf_on_diameter_readable()` |
-| `MAP_EPOLL_ROLE_DWA_TIMER` | timerfd (Tw, default 30s)       | `map_iwf_on_dwa_timer_tick()`    |
-| `MAP_EPOLL_ROLE_T_TIMER`   | timerfd (1s sweep)              | `map_iwf_on_ttimer_tick()`       |
+| Role                         | fd source                       | Handler                          |
+|------------------------------|---------------------------------|----------------------------------|
+| `MAP_EPOLL_ROLE_SS7`         | libosmo-sigtran SCCP user       | `map_iwf_on_ss7_readable()`      |
+| `MAP_EPOLL_ROLE_DIAMETER`    | TCP socket to PyHSS             | `map_iwf_on_diameter_readable()` |
+| `MAP_EPOLL_ROLE_DWA_TIMER`   | timerfd (Tw, default 30s)       | `map_iwf_on_dwa_timer_tick()`    |
+| `MAP_EPOLL_ROLE_T_TIMER`     | timerfd (1s sweep)              | `map_iwf_on_ttimer_tick()`       |
+| `MAP_EPOLL_ROLE_TEST_CMD`    | UNIX stream (`test_cmd`)        | `test_cmd_on_readable()`         |
 
 Role tags live in a disjoint numeric range from `SOCK_GTP` / `SOCK_TIMER`,
 so the dispatcher in `main.c` is a single `switch` with no overlap.
+
+### Local test commands (UNIX socket)
+
+When `[map_iwf] enabled = 1` and MAP-IWF init finishes successfully, the
+IWF listens on a **stream** UNIX domain socket so you can fire an outbound
+**Diameter AIR** (same path as MAP `sendAuthenticationInfo` toward PyHSS),
+without emitting MAP/TCAP toward the SGSN.
+
+| Item | Detail |
+|------|--------|
+| **Default path** | `/tmp/iwf_cmd.sock` |
+| **Config** | `[map_iwf] cmd_sock = /path/to/sock` (optional; parent directory is created when possible) |
+| **Startup log** | `test_cmd listening on <path> (fd=…)` |
+| **Protocol** | One line per accepted connection, newline-terminated: `sai <IMSI>` (digits only, 10–15 length). |
+| **Success reply** | `OK vectors=<n> rand=<hex> autn=<hex>` (first quintuplet; up to `n` vectors from HSS). |
+| **Error reply** | `ERR <reason>` — e.g. `timeout`, `diameter_<Result-Code>`, `air_send_failed`, or validation text. |
+| **SIGUSR1** | Sends the same test for IMSI `432120000000001` with **no** UNIX reply (log only). Timeout is controlled like other dialogues (`t_dialogue_ms`, default 10s). |
+
+**systemd:** If the unit uses `PrivateTmp=yes`, the daemon’s `/tmp` is not the
+host `/tmp`, so `ls /tmp/iwf_cmd.sock` may show nothing even when the socket
+is bound. Prefer `cmd_sock = /run/iwf/iwf_cmd.sock` (with `RuntimeDirectory=iwf`
+in the unit) or adjust `PrivateTmp` for debugging.
+
+```bash
+printf 'sai 432120000000001\n' | socat - UNIX-CONNECT:/tmp/iwf_cmd.sock
+```
+
+Sources: `test_cmd.c`, `test_cmd.h`; MAP hook `map_iwf_cmd_test_sai()` in
+`map_iwf.c`.
 
 ### Per-dialogue state
 
