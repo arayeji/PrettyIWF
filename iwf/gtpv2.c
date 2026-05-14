@@ -189,6 +189,29 @@ int gtpv2_decode_ebi(const iwf_ie_t *ie, uint8_t *ebi)
     return 0;
 }
 
+int gtpv2_decode_imsi(const iwf_ie_t *ie, char *digits, size_t cap)
+{
+    /* Same TBCD packing as gtpv2_enc_imsi_bcd (low nibble first per pair). */
+    if (!digits || cap < 2 || !ie || ie->length < 1 || ie->length > 16)
+        return -1;
+    size_t k = 0;
+    for (size_t i = 0; i < ie->length; i++) {
+        uint8_t lo = ie->value[i] & 0x0f;
+        uint8_t hi = (ie->value[i] >> 4) & 0x0f;
+        if (lo == 0x0f) break;
+        if (k + 1 >= cap) return -1;
+        if (lo > 9) return -1;
+        digits[k++] = (char)('0' + lo);
+        if (hi == 0x0f) break;
+        if (hi > 9) return -1;
+        if (k + 1 >= cap) return -1;
+        digits[k++] = (char)('0' + hi);
+    }
+    if (k == 0) return -1;
+    digits[k] = '\0';
+    return 0;
+}
+
 /* ------------------------------------------------------------------- */
 /* Encoder                                                             */
 /* ------------------------------------------------------------------- */
@@ -205,19 +228,38 @@ static int v2_need(gtpv2_enc_t *e, size_t n)
     return 0;
 }
 
+int gtpv2_enc_begin_tf(gtpv2_enc_t *e, uint8_t msg_type,
+                       uint32_t teid, uint32_t seq, int teid_present)
+{
+    if (teid_present) {
+        if (v2_need(e, 12) < 0) return -1;
+        /* Version=2, T=1 -> 0b010_0_1_000 = 0x48 */
+        e->buf[0] = 0x48;
+        e->buf[1] = msg_type;
+        e->buf[2] = 0;
+        e->buf[3] = 0;
+        iwf_put_be32(e->buf + 4, teid);
+        iwf_put_be24(e->buf + 8, seq & 0xffffff);
+        e->buf[11] = 0;
+        e->pos = 12;
+        return 0;
+    }
+    if (v2_need(e, 8) < 0) return -1;
+    /* Version=2, T=0 -> 0b010_0_0_000 = 0x40 */
+    e->buf[0] = 0x40;
+    e->buf[1] = msg_type;
+    e->buf[2] = 0;
+    e->buf[3] = 0;
+    iwf_put_be24(e->buf + 4, seq & 0xffffff);
+    e->buf[7] = 0;
+    e->pos = 8;
+    return 0;
+}
+
 int gtpv2_enc_begin(gtpv2_enc_t *e, uint8_t msg_type,
                     uint32_t teid, uint32_t seq)
 {
-    if (v2_need(e, 12) < 0) return -1;
-    /* Version=2, T=1 -> 0b010_0_1_000 = 0x48 */
-    e->buf[0] = 0x48;
-    e->buf[1] = msg_type;
-    e->buf[2] = 0; e->buf[3] = 0;        /* length patched later */
-    iwf_put_be32(e->buf + 4, teid);
-    iwf_put_be24(e->buf + 8, seq & 0xffffff);
-    e->buf[11] = 0;
-    e->pos = 12;
-    return 0;
+    return gtpv2_enc_begin_tf(e, msg_type, teid, seq, 1);
 }
 
 int gtpv2_enc_finish(gtpv2_enc_t *e)
@@ -398,6 +440,13 @@ int gtpv2_enc_cause(gtpv2_enc_t *e, uint8_t cause)
 {
     uint8_t v[2] = { cause, 0 };
     return gtpv2_enc_tlv(e, GTPV2_IE_CAUSE, 0, v, sizeof(v));
+}
+
+int gtpv2_enc_ipv4_ip_address(gtpv2_enc_t *e, uint8_t instance, uint32_t ipv4_be)
+{
+    uint8_t v[4];
+    memcpy(v, &ipv4_be, 4);
+    return gtpv2_enc_tlv(e, GTPV2_IE_IP_ADDRESS, instance, v, sizeof(v));
 }
 
 int gtpv2_enc_fteid_ipv4(gtpv2_enc_t *e, uint8_t instance,

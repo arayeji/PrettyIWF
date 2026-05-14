@@ -1,9 +1,17 @@
-# iwf — GTPv1-C ⇄ GTPv2-C Interworking Function
+# iwf — GTP-C and MAP↔Diameter Interworking Function
 
-A small, dependency-free signaling-only IWF that lets Osmocom **osmo-sgsn**
-(Gn, GTPv1-C) talk to Open5GS **SGW-C** (S4, GTPv2-C), while user-plane
-GTP-U flows directly between the RNC and **UPG-VPP** via 3GPP Direct
-Tunnel. The IWF itself never sees a GTP-U packet.
+Two cooperating IWF modules in one binary:
+
+1. **GTPv1-C ⇄ GTPv2-C** (always-on, dependency-free):
+   lets Osmocom **osmo-sgsn** (Gn, GTPv1-C) talk to Open5GS **SGW-C**
+   (S4, GTPv2-C), while user-plane GTP-U flows directly between the RNC
+   and **UPG-VPP** via 3GPP Direct Tunnel. The IWF itself never sees a
+   GTP-U packet.
+
+2. **MAP ⇄ Diameter S6d** (optional, requires `libosmo-sigtran`):
+   terminates inbound MAP/Gr from roaming SGSNs over SS7 (via `osmo-stp`)
+   and translates the five mobility/authentication operations to S6d
+   Diameter toward PyHSS. See **MAP-IWF** section below.
 
 ```
    RNC ──── GTPv1-U (Direct Tunnel) ─────────────────┐
@@ -290,6 +298,203 @@ iwf/
 - Retransmissions are detected via session state (a CSReq for a session
   already in `WAIT_CS_RESP` is silently coalesced); a formal T3/N3
   retry timer can be added on top of the existing timerfd loop.
+
+---
+
+## MAP-IWF (MAP ⇄ Diameter S6d)
+
+A second, independently-enabled module inside the same `iwf` binary.
+It receives MAP/Gr from a foreign SGSN (over SS7 via `osmo-stp`) and
+translates to Diameter S6d toward PyHSS. The two modules share the
+event loop, config system and logging.
+
+```
+   Foreign SGSN (roaming)
+        │  MAP/Gr (SS7 over SCTP/GRX)
+        ▼
+   osmo-stp ──── M3UA/SCCP ────► iwf (MAP-IWF) ──── Diameter S6d ────► PyHSS
+                                  ▲
+                                  └── same process, same epoll loop as
+                                      the GTP IWF described above
+```
+
+### Operations translated (3GPP TS 29.002 ⇄ TS 29.272)
+
+| MAP operation (Gr)                | Diameter command (S6d) |
+|-----------------------------------|------------------------|
+| `sendAuthenticationInfo`  (op 56) | AIR/AIA (cmd 318)      |
+| `updateGprsLocation`      (op 23) | ULR/ULA (cmd 316)      |
+| `cancelLocation`          (op 3 ) | CLR/CLA (cmd 317)      |
+| `purgeMS`                 (op 67) | PUR/PUA (cmd 321)      |
+| `insertSubscriberData`    (op 7 ) | (pushed inside UGL flow after ULA) |
+
+For `updateGprsLocation` the IWF synthesises an `insertSubscriberData`
+Invoke toward the SGSN carrying MSISDN / APN / AMBR pulled out of the
+ULA `Subscription-Data`, exactly like a real HLR would; then the
+parent UGL ReturnResult is emitted.
+
+### File map
+
+```
+map_iwf.{c,h}      module entrypoint + per-operation translation engine
+map_iwf_priv.h     internal shared state (Diameter + SS7 + sweep timer)
+map_session.{c,h}  dialogue table, keyed on TCAP TID; secondary index on
+                   Diameter Session-Id
+tcap.{c,h}         minimal TCAP (Q.771) + BER primitives
+map_codec.{c,h}    ASN.1 BER codec for the five MAP operations + AARQ/AARE
+diameter.{c,h}     Diameter base (CER/DWR/DPR) + S6d AIR/ULR/CLR/PUR codec
+ss7_link.{c,h}     libosmo-sigtran M3UA/SCCP glue (stubbed when
+                   built without MAP_IWF_ENABLED=1)
+```
+
+### Build
+
+```bash
+# GTP-only build (default; no extra deps):
+make
+
+# Full build with MAP-IWF (requires libosmocore + libosmo-sigtran + libosmo-sccp):
+sudo apt install libosmocore-dev libosmo-sccp-dev libosmo-sigtran-dev
+make clean
+make MAP_IWF_ENABLED=1
+```
+
+If `MAP_IWF_ENABLED=1` is omitted but `[map_iwf].enabled = 1` in
+`iwf.conf`, the binary refuses to bring MAP-IWF up at startup with a
+clear error pointing to the rebuild flag.
+
+### Configuration
+
+See the three new sections appended to `iwf.conf`:
+
+```ini
+[map_iwf]
+enabled       = 1
+local_gt      = 1234567890      ; your network E.164 Global Title
+local_pc      = 1.2.3            ; ITU 3-8-3 point code
+local_ssn     = 149              ; SGSN SSN
+t_dialogue_ms = 10000
+
+[stp]
+ip            = 127.0.0.1        ; osmo-stp SCTP IP
+port          = 2905             ; M3UA port
+remote_pc     = 1.2.1
+
+[diameter_s6d]
+peer_ip       = 10.0.0.50    ; PyHSS Diameter IP
+peer_port     = 3868
+origin_host   = iwf.mnc012.mcc432.3gppnetwork.org
+origin_realm  = mnc012.mcc432.3gppnetwork.org
+dest_host     = pyhss.mnc012.mcc432.3gppnetwork.org
+dest_realm    = mnc012.mcc432.3gppnetwork.org
+watchdog_ms   = 30000
+request_timeout_ms = 10000
+```
+
+### Event-loop wiring
+
+`main.c` adds four extra fds to its single epoll set when
+`map_iwf_enabled()` is true:
+
+| Role                       | fd source                       | Handler                          |
+|----------------------------|---------------------------------|----------------------------------|
+| `MAP_EPOLL_ROLE_SS7`       | libosmo-sigtran SCCP user       | `map_iwf_on_ss7_readable()`      |
+| `MAP_EPOLL_ROLE_DIAMETER`  | TCP socket to PyHSS             | `map_iwf_on_diameter_readable()` |
+| `MAP_EPOLL_ROLE_DWA_TIMER` | timerfd (Tw, default 30s)       | `map_iwf_on_dwa_timer_tick()`    |
+| `MAP_EPOLL_ROLE_T_TIMER`   | timerfd (1s sweep)              | `map_iwf_on_ttimer_tick()`       |
+
+Role tags live in a disjoint numeric range from `SOCK_GTP` / `SOCK_TIMER`,
+so the dispatcher in `main.c` is a single `switch` with no overlap.
+
+### Per-dialogue state
+
+```c
+struct map_session {
+    uint32_t   tcap_dialogue_id;     /* our originating TID  */
+    uint32_t   peer_tcap_dialogue_id;/* SGSN-allocated peer  */
+    char       imsi_str[16];         /* "001010000000001"    */
+    char       diameter_session_id[128];
+    uint32_t   diameter_hop_by_hop;
+    uint32_t   diameter_end_to_end;
+    map_op_t   map_op;
+    map_sess_state_t state;          /* IDLE / WAIT_DIAMETER / WAIT_MAP_TX /
+                                        WAIT_MAP_ACK / DONE / ABORTED */
+    struct in_addr sgsn_ip;
+    uint32_t   sccp_conn_id;
+    uint8_t    visited_plmn_bcd[3];  /* TS 24.008 packed     */
+    map_auth_vector_t av[5];         /* for SAI flow         */
+    char       msisdn_str[24];       /* extracted from ULA   */
+    char       ula_apn[64];
+    uint64_t   ula_ambr_ul_bps, ula_ambr_dl_bps;
+    time_t     created_at, last_activity;
+    int        t_dialogue_ms;
+};
+```
+
+Primary index `hh_tid` is keyed on `tcap_dialogue_id`; secondary index
+`hh_sid` is keyed on the Diameter `Session-Id` string so answer messages
+arriving on the shared TCP connection can be routed back in O(1).
+
+### IE mappings
+
+**SAI → AIR**
+
+| MAP                                    | Diameter (S6d)                          |
+|----------------------------------------|------------------------------------------|
+| `IMSI`                                 | `User-Name`                              |
+| derived from IMSI MCC/MNC              | `Visited-PLMN-Id`                        |
+| `numberOfRequestedVectors = 5`         | grouped `Requested-UTRAN-GERAN-Auth-Info`|
+| (constant)                             | `Immediate-Response-Preferred = 1`       |
+| (constant)                             | `RAT-Type = 1001 (GPRS)`                 |
+
+**AIA → SAI Resp**
+
+| Diameter `Authentication-Info` child   | MAP `AuthenticationQuintuplet`          |
+|----------------------------------------|------------------------------------------|
+| `E-UTRAN-Vector` / `UTRAN-Vector`      | one quintuplet per vector                |
+| `RAND, AUTN, XRES, CK, IK`             | repacked verbatim into MAP OCTET STRINGs |
+
+(Up to 5 vectors are returned in `AuthenticationSetList`.)
+
+**UGL → ULR**
+
+| MAP                | Diameter                                    |
+|--------------------|---------------------------------------------|
+| `IMSI`             | `User-Name`                                 |
+| `sgsn-Number`      | (used to derive `Origin-Host` of the SGSN — informational) |
+| derived from IMSI  | `Visited-PLMN-Id`                           |
+| (constant)         | `ULR-Flags = S6d-Indicator + GPRS-Subscription-Required` |
+| (constant)         | `RAT-Type = 1001 (GPRS)`                    |
+
+**ULA → ISD (Invoke) + UGL Resp**
+
+| Diameter `Subscription-Data`           | MAP `InsertSubscriberData` Invoke argument |
+|----------------------------------------|--------------------------------------------|
+| `MSISDN` AVP (701)                     | `msisdn` (ISDN-AddressString)              |
+| `APN-Configuration.Service-Selection`  | `apn-Configuration-Profile.APN`            |
+| `APN-Configuration.AMBR`               | `apn-Configuration.AMBR` (kbps, /1000)     |
+
+### Error handling
+
+| Condition                              | Behaviour                                                 |
+|----------------------------------------|------------------------------------------------------------|
+| Diameter `Result-Code` ≠ 2001/2002     | MAP `ReturnError(systemFailure)` + TCAP-End to SGSN        |
+| Diameter `User-Unknown` (5001)         | MAP `ReturnError(unknownSubscriber)`                       |
+| Diameter `Roaming-Not-Allowed`         | MAP `ReturnError(roamingNotAllowed)`                       |
+| TCAP T-dialogue (default 10s)          | dialogue swept; ABORT generated implicitly by stale TID    |
+| Diameter peer disconnect mid-request   | in-flight dialogues fail with MAP SystemFailure            |
+| TCP/SCTP failure                       | exponential backoff reconnect (1s → 60s)                   |
+
+### Operational notes
+
+- The Diameter side opens a single TCP connection; `CER/CEA` runs at
+  startup and `DWR` ticks every `watchdog_ms`. A peer `DPR` triggers a
+  clean disconnect + scheduled reconnect.
+- The SS7 side runs as an M3UA ASP (IPSP-client) against `osmo-stp`.
+  `osmo-stp` does the GT/PC routing; the IWF just owns an SSN.
+- Stats are emitted at shutdown (`map_rx`, `map_tx`, `diam_rx`,
+  `diam_tx`, `timeouts`, `sysfail`). Hook them into Prometheus later
+  via a small exporter — the counters live in `map_iwf_state.stat_*`.
 
 ## License
 
