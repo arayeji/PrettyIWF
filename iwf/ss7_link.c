@@ -52,6 +52,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef MAP_IWF_WITH_OSMO_SIGTRAN
+#  define OSMO_SS7_PC_INVALID 0xffffffffu
+#endif
+
 #ifdef MAP_IWF_WITH_OSMO_SIGTRAN
 #  include <osmocom/core/talloc.h>
 #  include <osmocom/core/select.h>
@@ -116,6 +120,33 @@ void ss7_link_set_recv_cb(struct iwf_runtime *rt, ss7_recv_cb_t cb)
     rt->map->ss7.recv_cb = cb;
 }
 
+void ss7_gt_from_digits(const char *digits, uint8_t ssn, ss7_sccp_addr_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!digits || !out) return;
+    out->ssn = ssn;
+    out->gt_bcd[0] = 0x91; /* international E.164 TON/NPI */
+    int di = 0;
+    for (size_t i = 0; digits[i] && di < 30; i++) {
+        if (digits[i] < '0' || digits[i] > '9') continue;
+        uint8_t d = (uint8_t)(digits[i] - '0');
+        size_t off = 1u + (size_t)(di / 2);
+        if (off >= sizeof(out->gt_bcd)) break;
+        if ((di & 1) == 0)
+            out->gt_bcd[off] = d;
+        else
+            out->gt_bcd[off] = (uint8_t)(out->gt_bcd[off] | (d << 4));
+        di++;
+    }
+    if (di & 1) {
+        size_t off = 1u + (size_t)(di / 2);
+        if (off < sizeof(out->gt_bcd))
+            out->gt_bcd[off] = (uint8_t)((out->gt_bcd[off] & 0x0f) | 0xf0);
+    }
+    out->gt_bcd_len = (uint8_t)(1u + (size_t)((di + 1) / 2));
+    out->have_gt = (di > 0);
+}
+
 void ss7_link_make_local_addr(const struct iwf_runtime *rt,
                               ss7_sccp_addr_t *out)
 {
@@ -168,8 +199,58 @@ struct ss7_impl_ctx {
     struct osmo_ss7_instance *ss7;
     struct osmo_sccp_instance *sccp;
     struct osmo_sccp_user *user;
+#ifdef SMS_IWF_ENABLED
+    struct osmo_sccp_user *user_hlr;
+    ss7_recv_cb_t          recv_cb_hlr;
+#endif
     int                    eventfd_to_main;       /* main thread polls this */
 };
+
+#ifdef MAP_IWF_WITH_OSMO_SIGTRAN
+static void osmo_addr_to_ss7(const struct osmo_sccp_addr *in, ss7_sccp_addr_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!in || !out) return;
+    out->ssn = in->ssn;
+    out->point_code = in->pc;
+    if (in->presence & OSMO_SCCP_ADDR_T_GT) {
+        size_t n = sizeof(in->gt.digits);
+        if (n > sizeof(out->gt_bcd)) n = sizeof(out->gt_bcd);
+        memcpy(out->gt_bcd, in->gt.digits, n);
+        out->gt_bcd_len = (uint8_t)n;
+        out->have_gt = true;
+    }
+}
+
+static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *out,
+                             bool route_by_gt)
+{
+    memset(out, 0, sizeof(*out));
+    if (!in || !out) return;
+    out->ssn = in->ssn;
+    out->pc  = in->point_code;
+    if (route_by_gt && in->have_gt) {
+        out->ri = OSMO_SCCP_RI_GT;
+        out->presence = OSMO_SCCP_ADDR_T_GT | OSMO_SCCP_ADDR_T_SSN;
+        out->gt.gti = OSMO_SCCP_GTI_TT_NPL_ENC_NAI;
+        out->gt.tt  = 0;
+        out->gt.npi = OSMO_SCCP_NPI_E164_ISDN;
+        out->gt.nai = OSMO_SCCP_NAI_INTL;
+        memcpy(out->gt.digits, in->gt_bcd, in->gt_bcd_len);
+    } else {
+        out->ri = OSMO_SCCP_RI_SSN_PC;
+        out->presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
+        if (in->have_gt) {
+            out->presence |= OSMO_SCCP_ADDR_T_GT;
+            out->gt.gti = OSMO_SCCP_GTI_TT_NPL_ENC_NAI;
+            out->gt.tt  = 0;
+            out->gt.npi = OSMO_SCCP_NPI_E164_ISDN;
+            out->gt.nai = OSMO_SCCP_NAI_INTL;
+            memcpy(out->gt.digits, in->gt_bcd, in->gt_bcd_len);
+        }
+    }
+}
+#endif
 
 /* libosmo keeps struct osmo_ss7_as opaque; cfg offset varies (e.g. WITH_TCAP_LOADSHARING).
  * Find cfg by simple-client AS name prefix, then validate proto (see osmo ss7_as.h). */
@@ -206,6 +287,20 @@ iwf_find_as_routing_key(struct osmo_ss7_as *as, enum osmo_ss7_asp_protocol want_
     return NULL;
 }
 
+static void deliver_unitdata(struct iwf_runtime *rt, ss7_recv_cb_t cb,
+                             const struct osmo_sccp_addr *calling_osmo,
+                             struct msgb *msg)
+{
+    if (!cb || !msg) {
+        if (msg) msgb_free(msg);
+        return;
+    }
+    ss7_sccp_addr_t calling;
+    osmo_addr_to_ss7(calling_osmo, &calling);
+    cb(rt, &calling, msgb_l2(msg), msgb_l2len(msg));
+    msgb_free(msg);
+}
+
 static int sccp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
 {
     struct iwf_runtime *rt = (struct iwf_runtime *)priv;
@@ -215,18 +310,52 @@ static int sccp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
         oph->primitive == (unsigned int)OSMO_SCU_PRIM_N_UNITDATA &&
         oph->operation == PRIM_OP_INDICATION) {
         struct osmo_scu_prim *scu = (struct osmo_scu_prim *)oph;
-        struct msgb *msg = oph->msg;
-        ss7_sccp_addr_t calling;
-        memset(&calling, 0, sizeof(calling));
-        calling.ssn = scu->u.unitdata.calling_addr.ssn;
-        calling.point_code = scu->u.unitdata.calling_addr.pc;
-        if (rt->map->ss7.recv_cb) {
-            rt->map->ss7.recv_cb(rt, &calling, msgb_l2(msg), msgb_l2len(msg));
-        }
-        msgb_free(msg);
+        deliver_unitdata(rt, rt->map->ss7.recv_cb,
+                         &scu->u.unitdata.calling_addr, oph->msg);
     }
     return 0;
 }
+
+#ifdef SMS_IWF_ENABLED
+static int sccp_prim_cb_hlr(struct osmo_prim_hdr *oph, void *priv)
+{
+    struct iwf_runtime *rt = (struct iwf_runtime *)priv;
+    struct ss7_impl_ctx *ctx = rt && rt->map ? rt->map->ss7.opaque : NULL;
+    if (!ctx) return 0;
+
+    if (oph->sap == SCCP_SAP_USER &&
+        oph->primitive == (unsigned int)OSMO_SCU_PRIM_N_UNITDATA &&
+        oph->operation == PRIM_OP_INDICATION) {
+        struct osmo_scu_prim *scu = (struct osmo_scu_prim *)oph;
+        deliver_unitdata(rt, ctx->recv_cb_hlr,
+                         &scu->u.unitdata.calling_addr, oph->msg);
+    }
+    return 0;
+}
+
+void ss7_link_set_hlr_recv_cb(struct iwf_runtime *rt, ss7_recv_cb_t cb)
+{
+    if (!rt || !rt->map || !rt->map->ss7.opaque) return;
+    struct ss7_impl_ctx *ctx = rt->map->ss7.opaque;
+    ctx->recv_cb_hlr = cb;
+}
+
+int ss7_link_bind_hlr_ssn(struct iwf_runtime *rt, uint8_t ssn)
+{
+    if (!rt || !rt->map || !rt->map->ss7.opaque) return -1;
+    struct ss7_impl_ctx *ctx = rt->map->ss7.opaque;
+    if (ctx->user_hlr) return 0;
+    ctx->user_hlr = osmo_sccp_user_bind(ctx->sccp, "iwf-hlr",
+                                        sccp_prim_cb_hlr, ssn);
+    if (!ctx->user_hlr) {
+        LOGE("ss7", "sccp_user_bind failed for HLR ssn=%u", (unsigned)ssn);
+        return -1;
+    }
+    osmo_sccp_user_set_priv(ctx->user_hlr, rt);
+    LOGI("ss7", "bound SCCP user for HLR SSN %u (MAP SMS)", (unsigned)ssn);
+    return 0;
+}
+#endif /* SMS_IWF_ENABLED */
 
 int ss7_link_init(struct iwf_runtime *rt)
 {
@@ -372,41 +501,55 @@ void ss7_link_on_readable(struct iwf_runtime *rt)
     osmo_select_main_ctx(1);
 }
 
-int ss7_link_send_tcap(struct iwf_runtime *rt,
-                       const ss7_sccp_addr_t *called,
-                       const uint8_t *tcap, size_t tcap_len)
+static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
+                           struct osmo_sccp_user *user,
+                           const ss7_sccp_addr_t *called,
+                           const ss7_sccp_addr_t *calling,
+                           const uint8_t *tcap, size_t tcap_len)
 {
-    if (!rt || !rt->map || !rt->map->ss7.opaque) return -1;
-    struct ss7_impl_ctx *ctx = (struct ss7_impl_ctx *)rt->map->ss7.opaque;
-
     struct msgb *msg = msgb_alloc(tcap_len + 64, "iwf-tcap-tx");
     if (!msg) return -1;
     uint8_t *p = msgb_put(msg, tcap_len);
     memcpy(p, tcap, tcap_len);
 
     struct osmo_sccp_addr called_addr = {0};
-    called_addr.presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
-    called_addr.ri = OSMO_SCCP_RI_SSN_PC;
-    called_addr.ssn = called->ssn;
-    called_addr.pc  = called->point_code;
-    if (called->have_gt) {
-        called_addr.presence |= OSMO_SCCP_ADDR_T_GT;
-        called_addr.gt.gti = OSMO_SCCP_GTI_TT_NPL_ENC_NAI;
-        called_addr.gt.tt  = 0;
-        called_addr.gt.npi = OSMO_SCCP_NPI_E164_ISDN;
-        called_addr.gt.nai = OSMO_SCCP_NAI_INTL;
-        memcpy(called_addr.gt.digits, called->gt_bcd, called->gt_bcd_len);
-    }
-
     struct osmo_sccp_addr calling_addr = {0};
-    ss7_sccp_addr_t loc; ss7_link_make_local_addr(rt, &loc);
-    calling_addr.presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
-    calling_addr.ri = OSMO_SCCP_RI_SSN_PC;
-    calling_addr.ssn = loc.ssn;
-    calling_addr.pc  = loc.point_code;
+    bool called_gt = called && called->have_gt;
+    bool calling_gt = calling && calling->have_gt;
+    ss7_to_osmo_addr(called, &called_addr, called_gt);
+    ss7_to_osmo_addr(calling, &calling_addr, calling_gt);
 
-    return osmo_sccp_tx_unitdata_msg(ctx->user, &calling_addr, &called_addr, msg);
+    return osmo_sccp_tx_unitdata_msg(user, &calling_addr, &called_addr, msg);
 }
+
+int ss7_link_send_tcap(struct iwf_runtime *rt,
+                       const ss7_sccp_addr_t *called,
+                       const uint8_t *tcap, size_t tcap_len)
+{
+    if (!rt || !rt->map || !rt->map->ss7.opaque) return -1;
+    struct ss7_impl_ctx *ctx = rt->map->ss7.opaque;
+    ss7_sccp_addr_t loc;
+    ss7_link_make_local_addr(rt, &loc);
+    return ss7_tx_unitdata(ctx, ctx->user, called, &loc, tcap, tcap_len);
+}
+
+#ifdef SMS_IWF_ENABLED
+int ss7_link_send_tcap_ex(struct iwf_runtime *rt,
+                          const ss7_sccp_addr_t *called,
+                          const ss7_sccp_addr_t *calling,
+                          const uint8_t *tcap, size_t tcap_len)
+{
+    if (!rt || !rt->map || !rt->map->ss7.opaque) return -1;
+    struct ss7_impl_ctx *ctx = rt->map->ss7.opaque;
+    ss7_sccp_addr_t loc;
+    const ss7_sccp_addr_t *cp = calling;
+    if (!cp) {
+        ss7_link_make_local_addr(rt, &loc);
+        cp = &loc;
+    }
+    return ss7_tx_unitdata(ctx, ctx->user, called, cp, tcap, tcap_len);
+}
+#endif
 
 void ss7_link_shutdown(struct iwf_runtime *rt)
 {
@@ -414,6 +557,9 @@ void ss7_link_shutdown(struct iwf_runtime *rt)
     struct ss7_impl_ctx *ctx = (struct ss7_impl_ctx *)rt->map->ss7.opaque;
     if (!ctx) return;
     if (ctx->user)  osmo_sccp_user_unbind(ctx->user);
+#ifdef SMS_IWF_ENABLED
+    if (ctx->user_hlr) osmo_sccp_user_unbind(ctx->user_hlr);
+#endif
     if (ctx->sccp)  osmo_sccp_instance_destroy(ctx->sccp);
     if (ctx->ss7)   osmo_ss7_instance_destroy(ctx->ss7);
     if (ctx->tall_ctx) talloc_free(ctx->tall_ctx);
@@ -448,6 +594,28 @@ int  ss7_link_send_tcap(struct iwf_runtime *rt,
     (void)rt; (void)called; (void)tcap; (void)tcap_len;
     return -1;
 }
+
+#ifdef SMS_IWF_ENABLED
+int ss7_link_send_tcap_ex(struct iwf_runtime *rt,
+                          const ss7_sccp_addr_t *called,
+                          const ss7_sccp_addr_t *calling,
+                          const uint8_t *tcap, size_t tcap_len)
+{
+    (void)rt; (void)called; (void)calling; (void)tcap; (void)tcap_len;
+    return -1;
+}
+
+void ss7_link_set_hlr_recv_cb(struct iwf_runtime *rt, ss7_recv_cb_t cb)
+{
+    (void)rt; (void)cb;
+}
+
+int ss7_link_bind_hlr_ssn(struct iwf_runtime *rt, uint8_t ssn)
+{
+    (void)rt; (void)ssn;
+    return -1;
+}
+#endif
 
 void ss7_link_shutdown(struct iwf_runtime *rt) { (void)rt; }
 

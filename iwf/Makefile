@@ -8,6 +8,9 @@
 #                              layer so the binary refuses to enable
 #                              [map_iwf] if it is set in the config.
 #
+#   make MAP_IWF_ENABLED=1 SMS_IWF_ENABLED=1
+#                              Full IWF + MAP SMS interworking (GSUP/SMPP).
+#
 #   make MAP_IWF_ENABLED=1     Full IWF: GTP + MAP-Diameter S6d.  Requires
 #                              libosmocore, libosmo-sccp, libosmo-sigtran
 #                              development headers and libraries.
@@ -41,8 +44,6 @@ LDLIBS  ?=
 SRCS    := main.c gtpv1.c gtpv2.c session.c translate.c config.c logging.c \
            map_iwf.c map_session.c tcap.c map_codec.c diameter.c ss7_link.c \
            test_cmd.c
-OBJS    := $(SRCS:.c=.o)
-DEPS    := $(SRCS:.c=.d)
 HDRS    := iwf.h gtpv1.h gtpv2.h session.h translate.h config.h logging.h \
            runtime.h uthash.h \
            map_iwf.h map_iwf_priv.h map_session.h tcap.h map_codec.h \
@@ -65,6 +66,21 @@ ifeq ($(MAP_IWF_ENABLED),1)
             Install: sudo apt install libosmocore-dev libosmo-sccp-dev libosmo-sigtran-dev)
   endif
 endif
+
+# --- Optional MAP SMS interworking (requires MAP_IWF_ENABLED=1) ------------
+SMS_IWF_ENABLED ?= 0
+ifeq ($(SMS_IWF_ENABLED),1)
+  ifneq ($(MAP_IWF_ENABLED),1)
+    $(error SMS_IWF_ENABLED=1 requires MAP_IWF_ENABLED=1)
+  endif
+  CFLAGS += -DSMS_IWF_ENABLED
+  SRCS   += sms_iwf.c gsup_client.c smpp_server.c
+  HDRS   += sms_iwf.h gsup_client.h smpp_server.h
+endif
+
+# OBJS/DEPS must be derived after optional SRCS append (MAP SMS).
+OBJS    := $(SRCS:.c=.o)
+DEPS    := $(SRCS:.c=.d)
 
 .PHONY: all clean install uninstall
 
