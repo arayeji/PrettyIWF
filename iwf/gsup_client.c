@@ -209,7 +209,17 @@ static void gsup_drain_rx(void)
             if (ipa_len < 2 || off + 2 + ipa_len > g_rx_used) break;
             if (g_rx[off + 2] != GSUP_IPA_STREAM ||
                 g_rx[off + 3] != GSUP_IPA_PROTO_GSUP) {
-                off++;
+                /* IPA CCM on stream 0xFE (proto 0x00): PING(0x00) needs PONG(0x01). */
+                if (ipa_len >= 3 &&
+                    g_rx[off + 2] == GSUP_IPA_STREAM &&
+                    g_rx[off + 3] == 0x00 &&
+                    g_rx[off + 4] == 0x00) {
+                    static const uint8_t pong[] = {
+                        0x00, 0x03, GSUP_IPA_STREAM, 0x00, 0x01
+                    };
+                    (void)write(g_fd, pong, sizeof(pong));
+                }
+                off += 2 + ipa_len;
                 continue;
             }
             gsup_dispatch_msg(g_rx + off + 4, ipa_len - 2, 0);
