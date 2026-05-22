@@ -449,7 +449,8 @@ static void on_hlr_sccp(struct iwf_runtime *rt,
 
 void sms_iwf_on_smpp_srv_readable(void) { smpp_server_on_listen_readable(); }
 void sms_iwf_on_smpp_conn_readable(void) { smpp_server_on_conn_readable(); }
-void sms_iwf_on_gsup_readable(void) { gsup_client_on_readable(); }
+void sms_iwf_on_gsup_readable(void)       { gsup_client_on_readable(); }
+void sms_iwf_on_gsup_keepalive(int fd)    { gsup_client_on_keepalive(fd); }
 
 void sms_iwf_on_timer(int fd)
 {

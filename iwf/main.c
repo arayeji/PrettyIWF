@@ -437,6 +437,9 @@ int main(int argc, char **argv)
             case SMS_EPOLL_ROLE_GSUP_SOCK:
                 sms_iwf_on_gsup_readable();
                 break;
+            case SMS_EPOLL_ROLE_GSUP_TIMER:
+                sms_iwf_on_gsup_keepalive(events[i].data.fd);
+                break;
             case SMS_EPOLL_ROLE_SMS_TIMER:
                 sms_iwf_on_timer(events[i].data.fd);
                 break;
