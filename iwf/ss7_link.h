@@ -80,6 +80,22 @@ typedef void (*ss7_recv_cb_t)(struct iwf_runtime *rt,
 
 void ss7_link_set_recv_cb(struct iwf_runtime *rt, ss7_recv_cb_t cb);
 
+#ifdef SMS_IWF_ENABLED
+/* Second SCCP user (HLR SSN) for inbound MAP SRI-SM (Direction A). */
+void ss7_link_set_hlr_recv_cb(struct iwf_runtime *rt, ss7_recv_cb_t cb);
+int  ss7_link_bind_hlr_ssn(struct iwf_runtime *rt, uint8_t ssn);
+
+/* Outbound MAP with explicit CallingParty (e.g. SMSC GT, SSN 8, RI=GT).
+ * If `calling` is NULL, uses [map_iwf] local address. */
+int  ss7_link_send_tcap_ex(struct iwf_runtime *rt,
+                           const ss7_sccp_addr_t *called,
+                           const ss7_sccp_addr_t *calling,
+                           const uint8_t *tcap, size_t tcap_len);
+#endif
+
+/* Build ss7_sccp_addr_t from E.164 digit string (international 0x91 prefix). */
+void ss7_gt_from_digits(const char *digits, uint8_t ssn, ss7_sccp_addr_t *out);
+
 /* Build a local SCCP address out of [map_iwf] config (local_pc + local_ssn,
  * optional local_gt). */
 void ss7_link_make_local_addr(const struct iwf_runtime *rt,

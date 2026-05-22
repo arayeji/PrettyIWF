@@ -618,6 +618,149 @@ int map_encode_aare(map_app_ctx_t ac, uint8_t *out, size_t out_cap)
     return enc_aaXX(0x61 /* [APPLICATION 1] AARE */, ac, out, out_cap);
 }
 
+/* ====================================================================== */
+/* MAP SMS (sendRoutingInfoForSM / mt-ForwardSM)                          */
+/* ====================================================================== */
+
+int map_decode_sri_sm_arg(const uint8_t *p, size_t n, char *msisdn_out, size_t cap)
+{
+    if (!p || !msisdn_out || cap == 0) return -1;
+    msisdn_out[0] = '\0';
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && (p[0] == 0x30 || (p[0] & 0x20)))
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    const uint8_t *v = NULL;
+    size_t l = 0;
+    if (find_tlv(body, blen, 0x84, &v, &l) < 0) return -1;
+    /* Skip leading 0x91 TON/NPI if present. */
+    size_t off = 0;
+    if (l > 0 && v[0] == 0x91) off = 1;
+    map_bcd_to_str(v + off, l > off ? l - off : 0, msisdn_out, cap);
+    return msisdn_out[0] ? 0 : -1;
+}
+
+int map_decode_sri_sm_res(const uint8_t *p, size_t n,
+                          uint8_t *imsi_bcd, size_t *imsi_bcd_len,
+                          char *vmsc_gt_out, size_t vmsc_cap)
+{
+    if (!p || !imsi_bcd || !imsi_bcd_len) return -1;
+    *imsi_bcd_len = 0;
+    if (vmsc_gt_out && vmsc_cap) vmsc_gt_out[0] = '\0';
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && (p[0] == 0x30 || (p[0] & 0x20)))
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    const uint8_t *v;
+    size_t l;
+    if (find_tlv(body, blen, 0x04, &v, &l) == 0 && l <= 8) {
+        memcpy(imsi_bcd, v, l);
+        *imsi_bcd_len = l;
+    }
+    if (vmsc_gt_out && find_tlv(body, blen, 0x83, &v, &l) == 0) {
+        size_t off = (l > 0 && v[0] == 0x91) ? 1 : 0;
+        map_bcd_to_str(v + off, l > off ? l - off : 0, vmsc_gt_out, vmsc_cap);
+    }
+    return (*imsi_bcd_len > 0) ? 0 : -1;
+}
+
+int map_encode_sri_sm_arg(const char *msisdn_digits,
+                          uint8_t *out, size_t out_cap)
+{
+    if (!msisdn_digits || !out) return -1;
+    uint8_t msisdn[12];
+    msisdn[0] = 0x91;
+    int di = 0;
+    for (size_t i = 0; msisdn_digits[i] && di < 22; i++) {
+        if (msisdn_digits[i] < '0' || msisdn_digits[i] > '9') continue;
+        uint8_t d = (uint8_t)(msisdn_digits[i] - '0');
+        size_t off = 1u + (size_t)(di / 2);
+        if (off >= sizeof(msisdn)) break;
+        if ((di & 1) == 0) msisdn[off] = d;
+        else msisdn[off] = (uint8_t)(msisdn[off] | (d << 4));
+        di++;
+    }
+    if (di & 1) {
+        size_t off = 1u + (size_t)(di / 2);
+        if (off < sizeof(msisdn))
+            msisdn[off] = (uint8_t)((msisdn[off] & 0x0f) | 0xf0);
+    }
+    size_t mlen = 1u + (size_t)((di + 1) / 2);
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x84, msisdn, mlen) < 0) return -1;
+    return (int)off;
+}
+
+int map_encode_sri_sm_res(const char *imsi_digits, const char *msc_gt_digits,
+                          uint8_t *out, size_t out_cap)
+{
+    uint8_t imsi[8];
+    int il = map_str_to_bcd(imsi_digits, imsi, sizeof(imsi));
+    if (il < 0) return -1;
+    uint8_t msc[12];
+    msc[0] = 0x91;
+    int di = 0;
+    for (size_t i = 0; msc_gt_digits && msc_gt_digits[i] && di < 22; i++) {
+        if (msc_gt_digits[i] < '0' || msc_gt_digits[i] > '9') continue;
+        uint8_t d = (uint8_t)(msc_gt_digits[i] - '0');
+        size_t off = 1u + (size_t)(di / 2);
+        if (off >= sizeof(msc)) break;
+        if ((di & 1) == 0) msc[off] = d;
+        else msc[off] = (uint8_t)(msc[off] | (d << 4));
+        di++;
+    }
+    if (di & 1) {
+        size_t off = 1u + (size_t)(di / 2);
+        if (off < sizeof(msc))
+            msc[off] = (uint8_t)((msc[off] & 0x0f) | 0xf0);
+    }
+    size_t mlen = 1u + (size_t)((di + 1) / 2);
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x04, imsi, (size_t)il) < 0) return -1;
+    if (ber_enc_tlv(out, out_cap, &off, 0x83, msc, mlen) < 0) return -1;
+    return (int)off;
+}
+
+int map_encode_mt_fwd_sm_arg(const char *imsi_digits, const char *smsc_gt_digits,
+                             const uint8_t *tpdu, size_t tpdu_len,
+                             uint8_t *out, size_t out_cap)
+{
+    uint8_t imsi[8];
+    int il = map_str_to_bcd(imsi_digits, imsi, sizeof(imsi));
+    if (il < 0 || !tpdu) return -1;
+    uint8_t da_inner[16];
+    size_t dio = 0;
+    if (ber_enc_tlv(da_inner, sizeof(da_inner), &dio, 0x81, imsi, (size_t)il) < 0)
+        return -1;
+    uint8_t smsc[12];
+    smsc[0] = 0x91;
+    int di = 0;
+    for (size_t i = 0; smsc_gt_digits && smsc_gt_digits[i] && di < 22; i++) {
+        if (smsc_gt_digits[i] < '0' || smsc_gt_digits[i] > '9') continue;
+        uint8_t d = (uint8_t)(smsc_gt_digits[i] - '0');
+        size_t off = 1u + (size_t)(di / 2);
+        if (off >= sizeof(smsc)) break;
+        if ((di & 1) == 0) smsc[off] = d;
+        else smsc[off] = (uint8_t)(smsc[off] | (d << 4));
+        di++;
+    }
+    if (di & 1) {
+        size_t off = 1u + (size_t)(di / 2);
+        if (off < sizeof(smsc))
+            smsc[off] = (uint8_t)((smsc[off] & 0x0f) | 0xf0);
+    }
+    size_t slen = 1u + (size_t)((di + 1) / 2);
+    uint8_t oa_inner[16];
+    size_t oio = 0;
+    if (ber_enc_tlv(oa_inner, sizeof(oa_inner), &oio, 0x82, smsc, slen) < 0)
+        return -1;
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x02, da_inner, dio) < 0) return -1;
+    if (ber_enc_tlv(out, out_cap, &off, 0x04, oa_inner, oio) < 0) return -1;
+    if (ber_enc_tlv(out, out_cap, &off, 0x03, tpdu, tpdu_len) < 0) return -1;
+    return (int)off;
+}
+
 int map_decode_aarq_ac(const uint8_t *p, size_t n, map_app_ctx_t *out)
 {
     if (!p || !out) return -1;

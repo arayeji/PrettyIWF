@@ -21,6 +21,9 @@
 #include "translate.h"
 #include "map_iwf.h"
 #include "test_cmd.h"
+#ifdef SMS_IWF_ENABLED
+#  include "sms_iwf.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -356,17 +359,37 @@ int main(int argc, char **argv)
         if (rt.cfg.map_iwf_enabled) return 1;
     }
 
+#ifdef SMS_IWF_ENABLED
+    if (rt.cfg.sms_iwf_enabled && sms_iwf_init(&rt, epfd) < 0) {
+        fprintf(stderr, "sms_iwf_init failed\n");
+        map_iwf_shutdown(&rt);
+        close(epfd);
+        close(tfd);
+        close(rt.v1_sock);
+        return 1;
+    }
+#endif
+
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGUSR1, on_sigusr1);
     signal(SIGPIPE, SIG_IGN);
 
-    LOGI("iwf", "ready: UDP %s:%u (listen_ip=%s) -> S4 SGW-C=%s:%u (F-TEID/GSN %s)%s",
-         bind_ip, rt.cfg.listen_port,
-         rt.cfg.listen_ip,
-         rt.cfg.sgwc_ip, rt.cfg.sgwc_port,
-         inet_ntoa(*(struct in_addr *)&rt.local_ipv4_be),
-         map_iwf_enabled(&rt) ? "; MAP-IWF active" : "");
+    {
+        const char *map_s = map_iwf_enabled(&rt) ? "; MAP-IWF active" : "";
+#ifdef SMS_IWF_ENABLED
+        const char *sms_s = sms_iwf_enabled(&rt) ? "; SMS-IWF active" : "";
+#else
+        const char *sms_s = "";
+#endif
+        LOGI("iwf", "ready: UDP %s:%u (listen_ip=%s) -> S4 SGW-C=%s:%u "
+                    "(F-TEID/GSN %s)%s%s",
+             bind_ip, rt.cfg.listen_port,
+             rt.cfg.listen_ip,
+             rt.cfg.sgwc_ip, rt.cfg.sgwc_port,
+             inet_ntoa(*(struct in_addr *)&rt.local_ipv4_be),
+             map_s, sms_s);
+    }
 
     while (!g_stop) {
         struct epoll_event events[IWF_MAX_EVENTS];
@@ -404,6 +427,20 @@ int main(int argc, char **argv)
             case MAP_EPOLL_ROLE_TEST_CMD:
                 test_cmd_on_readable(&rt);
                 break;
+#ifdef SMS_IWF_ENABLED
+            case SMS_EPOLL_ROLE_SMPP_SRV:
+                sms_iwf_on_smpp_srv_readable();
+                break;
+            case SMS_EPOLL_ROLE_SMPP_CONN:
+                sms_iwf_on_smpp_conn_readable();
+                break;
+            case SMS_EPOLL_ROLE_GSUP_SOCK:
+                sms_iwf_on_gsup_readable();
+                break;
+            case SMS_EPOLL_ROLE_SMS_TIMER:
+                sms_iwf_on_timer(events[i].data.fd);
+                break;
+#endif
             default:
                 LOGW("iwf", "epoll event for unknown role=%lu", (unsigned long)role);
                 break;
@@ -423,6 +460,9 @@ int main(int argc, char **argv)
     }
 
     LOGI("iwf", "shutting down");
+#ifdef SMS_IWF_ENABLED
+    sms_iwf_shutdown(&rt);
+#endif
     map_iwf_shutdown(&rt);
     close(epfd);
     close(tfd);
