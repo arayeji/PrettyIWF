@@ -40,6 +40,8 @@
 #define MAP_OP_CODE_UPDATE_GPRS_LOCATION    23
 #define MAP_OP_CODE_SEND_AUTH_INFO          56
 #define MAP_OP_CODE_PURGE_MS                67
+#define MAP_OP_CODE_SEND_ROUTING_INFO_SM    45
+#define MAP_OP_CODE_MT_FORWARD_SM           46
 
 /* MAP error codes we may receive/send (TS 29.002 §17.6). */
 #define MAP_ERR_UNKNOWN_SUBSCRIBER          1
@@ -48,6 +50,7 @@
 #define MAP_ERR_DATA_MISSING                35
 #define MAP_ERR_UNEXPECTED_DATA_VALUE       36
 #define MAP_ERR_AUTHENTICATION_FAILURE      52
+#define MAP_ERR_DELIVERY_FAILURE            32
 
 /* ----- decoded request views -------------------------------------- */
 
@@ -103,6 +106,19 @@ int map_decode_sai_arg     (const uint8_t *p, size_t n, map_sai_req_t *out);
 int map_decode_ugl_arg     (const uint8_t *p, size_t n, map_ugl_req_t *out);
 int map_decode_cl_arg      (const uint8_t *p, size_t n, map_cl_req_t  *out);
 int map_decode_purge_arg   (const uint8_t *p, size_t n, map_purge_req_t *out);
+
+/* MAP SMS (TS 29.002) — used by sms_iwf when SMS_IWF_ENABLED. */
+int map_decode_sri_sm_arg(const uint8_t *p, size_t n, char *msisdn_out, size_t cap);
+int map_decode_sri_sm_res(const uint8_t *p, size_t n,
+                          uint8_t *imsi_bcd, size_t *imsi_bcd_len,
+                          char *vmsc_gt_out, size_t vmsc_cap);
+int map_encode_sri_sm_arg(const char *msisdn_digits,
+                          uint8_t *out, size_t out_cap);
+int map_encode_sri_sm_res(const char *imsi_digits, const char *msc_gt_digits,
+                          uint8_t *out, size_t out_cap);
+int map_encode_mt_fwd_sm_arg(const char *imsi_digits, const char *smsc_gt_digits,
+                             const uint8_t *tpdu, size_t tpdu_len,
+                             uint8_t *out, size_t out_cap);
 
 /* ----- encoders (for the IWF -> SGSN direction) ------------------- */
 

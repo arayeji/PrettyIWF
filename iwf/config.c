@@ -44,6 +44,23 @@ static void defaults(iwf_config_t *c)
     c->diam_request_timeout_ms = 10000;
     c->diam_vendor_id     = 10415;  /* 3GPP */
     strncpy(c->diam_product_name, "iwf",  sizeof(c->diam_product_name) - 1);
+
+#ifdef SMS_IWF_ENABLED
+    c->sms_iwf_enabled       = 0;
+    c->sms_hlr_ssn           = 6;
+    strncpy(c->sms_local_msc_gt,  "989000002000", sizeof(c->sms_local_msc_gt) - 1);
+    strncpy(c->sms_local_smsc_gt, "989000002006", sizeof(c->sms_local_smsc_gt) - 1);
+    c->sms_gsup_timeout_ms   = 3000;
+    c->sms_sri_sm_timeout_ms = 5000;
+    c->sms_fwdsm_timeout_ms  = 10000;
+    strncpy(c->gsup_remote_ip, "10.234.241.33", sizeof(c->gsup_remote_ip) - 1);
+    c->gsup_remote_port      = 4222;
+    strncpy(c->gsup_client_name, "IWF-SMS", sizeof(c->gsup_client_name) - 1);
+    strncpy(c->smpp_bind_ip, "127.0.0.1", sizeof(c->smpp_bind_ip) - 1);
+    c->smpp_port             = 2777;
+    strncpy(c->smpp_system_id, "iwf", sizeof(c->smpp_system_id) - 1);
+    strncpy(c->smpp_password, "iwfsms", sizeof(c->smpp_password) - 1);
+#endif
 }
 
 static uint8_t parse_rat_type(const char *val)
@@ -81,6 +98,46 @@ static void copy_str(char *dst, size_t dst_sz, const char *src)
     memcpy(dst, src, n);
     dst[n] = '\0';
 }
+
+#ifdef SMS_IWF_ENABLED
+static void sms_partner_split_prefixes(iwf_config_t *out, int idx)
+{
+    char *raw = out->sms_partners[idx].prefixes_raw;
+    out->sms_partners[idx].n_prefixes = 0;
+    if (!raw[0]) return;
+    char buf[256];
+    copy_str(buf, sizeof(buf), raw);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        tok = trim(tok);
+        if (!*tok) continue;
+        int n = out->sms_partners[idx].n_prefixes;
+        if (n >= SMS_MAX_PREFIXES) break;
+        copy_str(out->sms_partners[idx].prefix[n],
+                 sizeof(out->sms_partners[idx].prefix[n]), tok);
+        out->sms_partners[idx].n_prefixes++;
+    }
+}
+
+static int sms_partner_index(iwf_config_t *out, const char *section)
+{
+    if (strncmp(section, "partner.", 8) != 0) return -1;
+    const char *name = section + 8;
+    for (int i = 0; i < out->sms_n_partners; i++) {
+        if (!strcmp(out->sms_partners[i].name, name))
+            return i;
+    }
+    if (out->sms_n_partners >= SMS_MAX_PARTNERS) {
+        LOGW("config", "too many [partner.*] sections (max %d)", SMS_MAX_PARTNERS);
+        return -1;
+    }
+    int idx = out->sms_n_partners++;
+    copy_str(out->sms_partners[idx].name,
+             sizeof(out->sms_partners[idx].name), name);
+    return idx;
+}
+#endif
 
 int iwf_config_load(const char *path, iwf_config_t *out)
 {
@@ -186,12 +243,53 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "watchdog_ms"))   out->diam_watchdog_ms = atoi(val);
             else if (!strcmp(key, "request_timeout_ms")) out->diam_request_timeout_ms = atoi(val);
             else LOGW("config", "unknown key [diameter_s6d].%s", key);
+#ifdef SMS_IWF_ENABLED
+        } else if (!strcmp(section, "sms_iwf")) {
+            if      (!strcmp(key, "enabled"))           out->sms_iwf_enabled = (atoi(val) != 0);
+            else if (!strcmp(key, "hlr_ssn"))          out->sms_hlr_ssn = (uint8_t)atoi(val);
+            else if (!strcmp(key, "local_msc_gt"))     copy_str(out->sms_local_msc_gt, sizeof(out->sms_local_msc_gt), val);
+            else if (!strcmp(key, "local_smsc_gt"))    copy_str(out->sms_local_smsc_gt, sizeof(out->sms_local_smsc_gt), val);
+            else if (!strcmp(key, "gsup_timeout_ms"))  out->sms_gsup_timeout_ms = atoi(val);
+            else if (!strcmp(key, "sri_sm_timeout_ms")) out->sms_sri_sm_timeout_ms = atoi(val);
+            else if (!strcmp(key, "fwdsm_timeout_ms")) out->sms_fwdsm_timeout_ms = atoi(val);
+            else LOGW("config", "unknown key [sms_iwf].%s", key);
+        } else if (!strcmp(section, "gsup_client")) {
+            if      (!strcmp(key, "remote_ip"))    copy_str(out->gsup_remote_ip, sizeof(out->gsup_remote_ip), val);
+            else if (!strcmp(key, "remote_port")) out->gsup_remote_port = (uint16_t)atoi(val);
+            else if (!strcmp(key, "client_name")) copy_str(out->gsup_client_name, sizeof(out->gsup_client_name), val);
+            else LOGW("config", "unknown key [gsup_client].%s", key);
+        } else if (!strcmp(section, "smpp_server")) {
+            if      (!strcmp(key, "bind_ip"))    copy_str(out->smpp_bind_ip, sizeof(out->smpp_bind_ip), val);
+            else if (!strcmp(key, "port"))       out->smpp_port = (uint16_t)atoi(val);
+            else if (!strcmp(key, "system_id"))  copy_str(out->smpp_system_id, sizeof(out->smpp_system_id), val);
+            else if (!strcmp(key, "password"))  copy_str(out->smpp_password, sizeof(out->smpp_password), val);
+            else LOGW("config", "unknown key [smpp_server].%s", key);
+        } else {
+            int pidx = sms_partner_index(out, section);
+            if (pidx >= 0) {
+                if      (!strcmp(key, "hlr_gt"))
+                    copy_str(out->sms_partners[pidx].hlr_gt,
+                             sizeof(out->sms_partners[pidx].hlr_gt), val);
+                else if (!strcmp(key, "msisdn_prefixes"))
+                    copy_str(out->sms_partners[pidx].prefixes_raw,
+                             sizeof(out->sms_partners[pidx].prefixes_raw), val);
+                else LOGW("config", "unknown key [%s].%s", section, key);
+            } else
+                LOGW("config", "%s:%d: key '%s' outside any known section", path, lineno, key);
+        }
+#else
         } else {
             LOGW("config", "%s:%d: key '%s' outside any known section", path, lineno, key);
         }
+#endif
     }
 
     fclose(fp);
+
+#ifdef SMS_IWF_ENABLED
+    for (int i = 0; i < out->sms_n_partners; i++)
+        sms_partner_split_prefixes(out, i);
+#endif
 
     if (out->local_ip[0] == '\0' && strcmp(out->listen_ip, "0.0.0.0") != 0) {
         copy_str(out->local_ip, sizeof(out->local_ip), out->listen_ip);
@@ -245,4 +343,16 @@ void iwf_config_dump(const iwf_config_t *c)
     } else {
         LOGI("config", "map_iwf: disabled (set [map_iwf].enabled = 1 to bring it up)");
     }
+#ifdef SMS_IWF_ENABLED
+    if (c->sms_iwf_enabled) {
+        LOGI("config", "sms_iwf: msc_gt=%s smsc_gt=%s hlr_ssn=%u gsup_timeout=%dms",
+             c->sms_local_msc_gt, c->sms_local_smsc_gt,
+             (unsigned)c->sms_hlr_ssn, c->sms_gsup_timeout_ms);
+        LOGI("config", "sms_iwf: gsup=%s:%u smpp=%s:%u partners=%d",
+             c->gsup_remote_ip, (unsigned)c->gsup_remote_port,
+             c->smpp_bind_ip, (unsigned)c->smpp_port, c->sms_n_partners);
+    } else {
+        LOGI("config", "sms_iwf: disabled (set [sms_iwf].enabled = 1; build SMS_IWF_ENABLED=1)");
+    }
+#endif
 }

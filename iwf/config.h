@@ -70,6 +70,40 @@ typedef struct {
     int         diam_request_timeout_ms;  /* default 10000     */
 
     char        cfg_path[256];    /* set by main after load; for diagnostics only */
+
+#ifdef SMS_IWF_ENABLED
+    /* [sms_iwf] — MAP SMS interworking (requires MAP-IWF + SMS_IWF_ENABLED build). */
+    int         sms_iwf_enabled;
+    uint8_t     sms_hlr_ssn;
+    char        sms_local_msc_gt[24];
+    char        sms_local_smsc_gt[24];
+    int         sms_gsup_timeout_ms;
+    int         sms_sri_sm_timeout_ms;
+    int         sms_fwdsm_timeout_ms;
+
+    /* [gsup_client] */
+    char        gsup_remote_ip[64];
+    uint16_t    gsup_remote_port;
+    char        gsup_client_name[64];
+
+    /* [smpp_server] */
+    char        smpp_bind_ip[64];
+    uint16_t    smpp_port;
+    char        smpp_system_id[32];
+    char        smpp_password[64];
+
+#define SMS_MAX_PARTNERS 8
+#define SMS_MAX_PREFIXES 16
+    struct {
+        char    name[32];
+        char    hlr_gt[24];
+        char    prefixes_raw[256];
+        char    prefix[SMS_MAX_PREFIXES][16];
+        int     n_prefixes;
+    } sms_partners[SMS_MAX_PARTNERS];
+    int         sms_n_partners;
+#endif /* SMS_IWF_ENABLED */
+
 } iwf_config_t;
 
 int  iwf_config_load(const char *path, iwf_config_t *out);
