@@ -31,6 +31,8 @@
  * periodic IPA CCM PING to keep the link alive (role 0x205).
  */
 
+#include <poll.h>
+
 #include "gsup_client.h"
 #include "sms_iwf.h"    /* for SMS_EPOLL_ROLE_GSUP_TIMER */
 #include "logging.h"
@@ -110,6 +112,22 @@ static void gsup_disconnect(void)
     g_rx_used = 0;
 }
 
+/* Block until non-blocking connect() completes (or fails). */
+static int gsup_wait_connected(int fd)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+    if (poll(&pfd, 1, 10000) <= 0)
+        return -1;
+    int so_err = 0;
+    socklen_t el = sizeof(so_err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &el) < 0 || so_err != 0) {
+        if (so_err)
+            LOGE("gsup", "connect: %s", strerror(so_err));
+        return -1;
+    }
+    return 0;
+}
+
 static int gsup_connect_now(void)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -124,14 +142,22 @@ static int gsup_connect_now(void)
         close(fd);
         return -1;
     }
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 &&
-        errno != EINPROGRESS) {
-        close(fd);
-        return -1;
+    int cr = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (cr < 0) {
+        if (errno == EINPROGRESS) {
+            if (gsup_wait_connected(fd) < 0) {
+                close(fd);
+                return -1;
+            }
+        } else {
+            close(fd);
+            return -1;
+        }
     }
     g_fd = fd;
+    /* EPOLLOUT on a connected TCP socket is always ready and busy-loops epoll. */
     if (g_epfd >= 0) {
-        struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT,
+        struct epoll_event ev = { .events = EPOLLIN,
                                   .data = { .u64 = SMS_EPOLL_ROLE_GSUP_SOCK } };
         epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_fd, &ev);
     }
@@ -460,11 +486,13 @@ void gsup_client_on_readable(void)
 }
 
 /* Called when the keepalive timerfd fires (SMS_EPOLL_ROLE_GSUP_TIMER). */
-void gsup_client_on_keepalive(int fd)
+void gsup_client_on_keepalive(void)
 {
-    /* Drain the timerfd to re-arm it */
+    if (g_timer_fd < 0)
+        return;
+    /* Drain the timerfd to re-arm it (epoll data is role tag, not fd). */
     uint64_t expirations;
-    (void)read(fd, &expirations, sizeof(expirations));
+    (void)read(g_timer_fd, &expirations, sizeof(expirations));
 
     if (g_fd >= 0) {
         send_ccm_ping();
