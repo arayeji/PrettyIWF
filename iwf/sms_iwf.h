@@ -22,7 +22,7 @@ bool sms_iwf_enabled(const struct iwf_runtime *rt);
 void sms_iwf_on_smpp_srv_readable(void);
 void sms_iwf_on_smpp_conn_readable(void);
 void sms_iwf_on_gsup_readable(void);
-void sms_iwf_on_gsup_keepalive(int fd);
-void sms_iwf_on_timer(int fd);
+void sms_iwf_on_gsup_keepalive(void);
+void sms_iwf_on_timer(void);
 
 #endif /* IWF_SMS_IWF_H */

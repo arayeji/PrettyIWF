@@ -438,10 +438,10 @@ int main(int argc, char **argv)
                 sms_iwf_on_gsup_readable();
                 break;
             case SMS_EPOLL_ROLE_GSUP_TIMER:
-                sms_iwf_on_gsup_keepalive(events[i].data.fd);
+                sms_iwf_on_gsup_keepalive();
                 break;
             case SMS_EPOLL_ROLE_SMS_TIMER:
-                sms_iwf_on_timer(events[i].data.fd);
+                sms_iwf_on_timer();
                 break;
 #endif
             default:
