@@ -49,6 +49,7 @@
 #include <netinet/tcp.h>
 #include <sys/timerfd.h>
 #include <sys/epoll.h>
+#include <poll.h>
 
 /* ====================================================================== */
 /* Wire helpers                                                           */
@@ -646,36 +647,44 @@ static void try_flush_tx(diameter_state_t *d)
     }
 }
 
-/* During async connect we need EPOLLOUT to learn that the handshake has
- * completed; once we transition out of CONNECTING we MOD it to EPOLLIN only,
- * so a level-triggered always-writable TCP socket doesn't busy-loop. */
-static void diameter_epoll_attach(struct iwf_runtime *rt, int fd,
-                                  bool want_out)
+/* EPOLLOUT on a connected TCP socket is always ready and busy-loops epoll. */
+static void diameter_epoll_attach(struct iwf_runtime *rt, int fd)
 {
     if (fd < 0 || rt->map->epoll_fd < 0) return;
     struct epoll_event ev = {
-        .events   = EPOLLIN | EPOLLRDHUP | (want_out ? EPOLLOUT : 0),
+        .events   = EPOLLIN | EPOLLRDHUP,
         .data.u64 = MAP_EPOLL_ROLE_DIAMETER,
     };
     if (epoll_ctl(rt->map->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
         LOGW("diameter", "epoll_ctl ADD fd=%d: %s", fd, strerror(errno));
 }
 
-static void diameter_epoll_drop_out(struct iwf_runtime *rt)
+static int diameter_wait_connected(int fd)
 {
-    diameter_state_t *d = &rt->map->diam;
-    if (d->fd < 0 || rt->map->epoll_fd < 0) return;
-    struct epoll_event ev = {
-        .events   = EPOLLIN | EPOLLRDHUP,
-        .data.u64 = MAP_EPOLL_ROLE_DIAMETER,
-    };
-    epoll_ctl(rt->map->epoll_fd, EPOLL_CTL_MOD, d->fd, &ev);
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+    if (poll(&pfd, 1, 10000) <= 0)
+        return -1;
+    int so_err = 0;
+    socklen_t el = sizeof(so_err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &el) < 0 || so_err != 0) {
+        if (so_err)
+            LOGE("diameter", "connect: %s", strerror(so_err));
+        return -1;
+    }
+    return 0;
 }
 
 static int connect_peer(struct iwf_runtime *rt)
 {
     diameter_state_t *d = &rt->map->diam;
     const iwf_config_t *c = &rt->cfg;
+
+    if (d->fd >= 0) {
+        if (rt->map->epoll_fd >= 0)
+            epoll_ctl(rt->map->epoll_fd, EPOLL_CTL_DEL, d->fd, NULL);
+        close(d->fd);
+        d->fd = -1;
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { LOGE("diameter", "socket: %s", strerror(errno)); return -1; }
@@ -692,24 +701,25 @@ static int connect_peer(struct iwf_runtime *rt)
     }
 
     int rc = connect(fd, (struct sockaddr*)&d->peer, sizeof(d->peer));
-    if (rc == 0) {
-        d->fd = fd; d->state = DIAM_CONN_CER_SENT;
-        LOGI("diameter", "TCP connected to %s:%u (synchronous)",
-             c->diam_peer_ip, c->diam_peer_port);
-        diameter_epoll_attach(rt, fd, /*want_out=*/false);
-        return diameter_send_cer(rt);
+    if (rc < 0) {
+        if (errno == EINPROGRESS) {
+            if (diameter_wait_connected(fd) < 0) {
+                close(fd);
+                return -1;
+            }
+        } else {
+            LOGE("diameter", "connect %s:%u: %s",
+                 c->diam_peer_ip, c->diam_peer_port, strerror(errno));
+            close(fd);
+            return -1;
+        }
     }
-    if (errno == EINPROGRESS) {
-        d->fd = fd; d->state = DIAM_CONN_CONNECTING;
-        LOGI("diameter", "TCP connecting to %s:%u (async)",
-             c->diam_peer_ip, c->diam_peer_port);
-        diameter_epoll_attach(rt, fd, /*want_out=*/true);
-        return 0;
-    }
-    LOGE("diameter", "connect %s:%u: %s",
-         c->diam_peer_ip, c->diam_peer_port, strerror(errno));
-    close(fd);
-    return -1;
+    d->fd = fd;
+    d->state = DIAM_CONN_CER_SENT;
+    LOGI("diameter", "TCP connected to %s:%u",
+         c->diam_peer_ip, c->diam_peer_port);
+    diameter_epoll_attach(rt, fd);
+    return diameter_send_cer(rt);
 }
 
 static void schedule_reconnect(struct iwf_runtime *rt)
@@ -828,25 +838,6 @@ void diameter_on_readable(struct iwf_runtime *rt)
 {
     diameter_state_t *d = &rt->map->diam;
     if (d->fd < 0) return;
-
-    if (d->state == DIAM_CONN_CONNECTING) {
-        int err = 0; socklen_t sl = sizeof(err);
-        if (getsockopt(d->fd, SOL_SOCKET, SO_ERROR, &err, &sl) == 0 && err == 0) {
-            LOGI("diameter", "TCP connect ready, sending CER");
-            d->state = DIAM_CONN_CER_SENT;
-            diameter_epoll_drop_out(rt);
-            if (diameter_send_cer(rt) < 0) {
-                close(d->fd); d->fd = -1; d->state = DIAM_CONN_CLOSED;
-                schedule_reconnect(rt);
-                return;
-            }
-        } else {
-            LOGE("diameter", "async connect failed: %s", strerror(err));
-            close(d->fd); d->fd = -1; d->state = DIAM_CONN_CLOSED;
-            schedule_reconnect(rt);
-            return;
-        }
-    }
 
     for (;;) {
         if (d->rx_used >= sizeof(d->rx)) {
