@@ -190,7 +190,8 @@ static void send_ccm_ping(void)
 {
     if (g_fd < 0) return;
     static const uint8_t ping[] = { 0x00, 0x01, IPA_PROTO_CCM, CCM_PING };
-    (void)write(g_fd, ping, sizeof(ping));
+    ssize_t wr = write(g_fd, ping, sizeof(ping));
+    (void)wr;
     LOGD("gsup", "CCM: sent PING");
 }
 
@@ -198,7 +199,8 @@ static void send_ccm_pong(void)
 {
     if (g_fd < 0) return;
     static const uint8_t pong[] = { 0x00, 0x01, IPA_PROTO_CCM, CCM_PONG };
-    (void)write(g_fd, pong, sizeof(pong));
+    ssize_t wr = write(g_fd, pong, sizeof(pong));
+    (void)wr;
     LOGD("gsup", "CCM: sent PONG");
 }
 
@@ -253,7 +255,8 @@ static void send_id_resp(void)
     buf[i++] = CCM_ID_RESP;
     memcpy(buf + i, tags, tpos); i += tpos;
 
-    (void)write(g_fd, buf, i);
+    ssize_t wr = write(g_fd, buf, i);
+    (void)wr;
     LOGI("gsup", "CCM: sent ID_RESP UNIT=0/0/0 UNITNAME=%s", g_client_name);
 }
 
@@ -492,7 +495,8 @@ void gsup_client_on_keepalive(void)
         return;
     /* Drain the timerfd to re-arm it (epoll data is role tag, not fd). */
     uint64_t expirations;
-    (void)read(g_timer_fd, &expirations, sizeof(expirations));
+    ssize_t rd = read(g_timer_fd, &expirations, sizeof(expirations));
+    (void)rd;
 
     if (g_fd >= 0) {
         send_ccm_ping();

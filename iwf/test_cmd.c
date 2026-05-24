@@ -188,8 +188,7 @@ int test_cmd_init(struct iwf_runtime *rt, int epfd)
     }
 
     struct sockaddr_un sun = { .sun_family = AF_UNIX };
-    strncpy(sun.sun_path, path, sizeof(sun.sun_path) - 1);
-    sun.sun_path[sizeof(sun.sun_path) - 1] = '\0';
+    snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", path);
 
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
