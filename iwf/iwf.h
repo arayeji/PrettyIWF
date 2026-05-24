@@ -114,6 +114,7 @@
 #define GTPV2_IE_ULI                       86
 #define GTPV2_IE_FTEID                     87
 #define GTPV2_IE_BEARER_CONTEXT            93
+#define GTPV2_IE_CHARGING_ID               94
 #define GTPV2_IE_CHARGING_CHARACTERISTICS  95
 #define GTPV2_IE_PDN_TYPE                  99
 #define GTPV2_IE_UE_TIME_ZONE              114

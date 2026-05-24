@@ -72,6 +72,11 @@ typedef struct sess_s {
     /* UE assigned address */
     uint32_t    ue_ipv4;
 
+    /* Charging ID returned by SMF (GTPv2 IE 94 in Bearer Context). 0 means SMF
+     * did not include one and we fall back to iwf_ctrl_teid. CDR correlation
+     * across SGW/PGW relies on this matching what SMF sees. */
+    uint32_t    charging_id;
+
     /* Outstanding transaction (Gn-side seq we'll answer with on SGW response) */
     uint32_t    gtpv2_seq;            /* sequence used toward SGW-C */
 
