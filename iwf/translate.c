@@ -1736,11 +1736,35 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
     }
 
     /* Bearer Context — pick SGW user-plane F-TEID (S4=16, S1-U=1), not PGW S5-U (5). */
+    iwf_ie_t bc_inner[IWF_MAX_IES];
+    size_t   bc_n_inner = 0;
     if ((ie = gtpv2_find_ie(v2, GTPV2_IE_BEARER_CONTEXT, 0))) {
-        iwf_ie_t inner[IWF_MAX_IES];
-        size_t n_inner = 0;
-        if (gtpv2_parse_grouped(ie, inner, IWF_MAX_IES, &n_inner) == 0)
-            bearer_pick_sgwu_fteid(inner, n_inner, &s->sgwu_teid, &s->sgwu_addr_ipv4);
+        if (gtpv2_parse_grouped(ie, bc_inner, IWF_MAX_IES, &bc_n_inner) == 0)
+            bearer_pick_sgwu_fteid(bc_inner, bc_n_inner, &s->sgwu_teid, &s->sgwu_addr_ipv4);
+    }
+
+    /* PCO (TS 29.274 §8.13) — copy verbatim from CSResp. EPS PCO uses the same
+     * container-TLV layout as GTPv1 IE 132 (TS 29.060 §7.7.31), so the bytes
+     * are interchangeable. SMF may place PCO at message level or inside the
+     * Bearer Context; check both. Without this the SGSN delivers the UE
+     * empty DNS / MTU / P-CSCF / IPCP and data plane is broken. */
+    s->pco_len = 0;
+    const iwf_ie_t *pco_ie = gtpv2_find_ie(v2, GTPV2_IE_PCO, 0);
+    if (!pco_ie) {
+        for (size_t i = 0; i < bc_n_inner; i++) {
+            if (bc_inner[i].type == GTPV2_IE_PCO) {
+                pco_ie = &bc_inner[i];
+                break;
+            }
+        }
+    }
+    if (pco_ie && pco_ie->length > 0 && pco_ie->length <= sizeof(s->pco_blob)) {
+        memcpy(s->pco_blob, pco_ie->value, pco_ie->length);
+        s->pco_len = pco_ie->length;
+    } else if (pco_ie && pco_ie->length > sizeof(s->pco_blob)) {
+        LOGW("translate",
+             "CSResp imsi=%s PCO too large (%u) — dropping; UE will see empty DNS/MTU",
+             s->key.imsi, (unsigned)pco_ie->length);
     }
 
     if (gtpv2_cause == GTPV2_CAUSE_REQUEST_ACCEPTED && !s->sgwu_addr_ipv4) {
@@ -1782,6 +1806,13 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
 
         /* End User Address = UE IPv4. */
         if (s->ue_ipv4) gtpv1_enc_eua_ipv4(&e, s->ue_ipv4);
+
+        /* PCO (TS 29.060 §7.3.1 ordering: after EUA, before TEIDs). EPS PCO
+         * bytes from GTPv2 IE 78 are wire-compatible with GTPv1 IE 132 — copy
+         * verbatim so DNS, IPv4 Link MTU, IM CN SS Flag, IPCP etc. survive
+         * the translation. Without this the UE gets DNS=0.0.0.0 / MTU=0. */
+        if (s->pco_len)
+            gtpv1_enc_tlv(&e, GTPV1_IE_PCO, s->pco_blob, (uint16_t)s->pco_len);
 
         /* TEID Data I = SGW-U TEID (Direct Tunnel target). */
         if (s->sgwu_teid)

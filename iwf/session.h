@@ -86,6 +86,14 @@ typedef struct sess_s {
     uint8_t     qos_blob[64];
     size_t      qos_len;
 
+    /* Protocol Configuration Options captured from CSResp (GTPv2 IE 78) and
+     * forwarded verbatim as GTPv1 IE 132 in Create PDP Response. EPS PCO wire
+     * format is identical between TS 29.060 §7.7.31 and TS 29.274 §8.13:
+     * Ext|CfgProto byte + container TLVs (DNS=0x000D, MTU=0x0010, IMCN=0x0008,
+     * BCM=0x0005, IPCP=0x8021), so a verbatim copy is correct. */
+    uint8_t     pco_blob[252];
+    size_t      pco_len;
+
     /* User Location Information cached from Create PDP, replayed in MBReq.
      * uli_kind: 0 = none, 1 = real RAI (uli_rai6 holds the 6 octets),
      *           2 = synthetic from IMSI PLMN (uli_mcc/uli_mnc used). */
