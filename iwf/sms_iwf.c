@@ -263,7 +263,7 @@ static void handle_inbound_begin(const ss7_sccp_addr_t *calling,
     s->peer_invoke_id = cmp->invoke_id;
     s->ret_addr = *calling;
     s->timer_fd = -1;
-    strncpy(s->msisdn, msisdn, sizeof(s->msisdn) - 1);
+    snprintf(s->msisdn, sizeof(s->msisdn), "%s", msisdn);
     HASH_ADD(hh, g_sessions, otid, sizeof(s->otid), s);
     sms_arm_timer(s, g_rt->cfg.sms_gsup_timeout_ms);
 
@@ -374,12 +374,11 @@ static void on_smpp_submit(uint32_t seq,
     s->smpp_seq = seq;
     s->partner_idx = pidx;
     s->timer_fd = -1;
-    strncpy(s->msisdn, dst, sizeof(s->msisdn) - 1);
-    strncpy(s->src_addr, src ? src : "", sizeof(s->src_addr) - 1);
+    snprintf(s->msisdn, sizeof(s->msisdn), "%s", dst);
+    snprintf(s->src_addr, sizeof(s->src_addr), "%s", src ? src : "");
     s->data_coding = data_coding;
     s->esm_class = esm_class;
-    if (ud_len > sizeof(s->user_data))
-        ud_len = (uint8_t)sizeof(s->user_data);
+    /* ud_len is uint8_t (<=255) and user_data is 256 bytes, so it always fits. */
     memcpy(s->user_data, ud, ud_len);
     s->user_data_len = ud_len;
     HASH_ADD(hh, g_sessions, otid, sizeof(s->otid), s);
@@ -414,7 +413,7 @@ static void handle_outbound_tcap(const tcap_msg_t *tmsg)
                 return;
             }
             map_bcd_to_str(imsi_bcd, ilen, s->imsi, sizeof(s->imsi));
-            strncpy(s->partner_vmsc_gt, vmsc, sizeof(s->partner_vmsc_gt) - 1);
+            snprintf(s->partner_vmsc_gt, sizeof(s->partner_vmsc_gt), "%s", vmsc);
             start_outbound_fwdsm(s);
             return;
         }
