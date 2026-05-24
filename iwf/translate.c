@@ -610,6 +610,26 @@ static uint8_t map_gtpu_v2_cause_to_v1_basic(uint8_t c)
     return GTPV1_CAUSE_SYSTEM_FAILURE;
 }
 
+/* Map a GTPv2 cause (TS 29.274 §8.4) to a GTPv1 cause (TS 29.060 §7.7.1)
+ * for Create / Modify / Update / Delete PDP Context Responses. We have only
+ * a handful of GTPv1 causes available, so this is a many-to-few mapping; we
+ * default to "No resources available" (199) which is what osmo-sgsn already
+ * surfaces as a generic attach failure. */
+static uint8_t map_gtpv2_cause_to_v1_pdp_resp(uint8_t c)
+{
+    switch (c) {
+    case 16:  return GTPV1_CAUSE_REQUEST_ACCEPTED;   /* Request accepted    */
+    case 64:  return GTPV1_CAUSE_NON_EXISTENT;       /* Context Not Found   */
+    case 65:                                          /* Invalid Message Fmt */
+    case 67:                                          /* Invalid length      */
+    case 69:                                          /* Mandatory IE incorr.*/
+    case 70:                                          /* Mandatory IE missing*/
+    case 103: return GTPV1_CAUSE_INVALID_MESSAGE;    /* Conditional IE miss.*/
+    case 72:  return GTPV1_CAUSE_SYSTEM_FAILURE;     /* System failure      */
+    default:  return GTPV1_CAUSE_NO_RESOURCES;
+    }
+}
+
 static int sin_addr_matches_cfg(const struct sockaddr_in *peer,
                                 const struct sockaddr_in *expect)
 {
@@ -1735,12 +1755,40 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
         if (!gtpv2_decode_paa_ipv4(ie, &pt, &ip)) s->ue_ipv4 = ip;
     }
 
-    /* Bearer Context — pick SGW user-plane F-TEID (S4=16, S1-U=1), not PGW S5-U (5). */
+    /* Bearer Context — pick SGW user-plane F-TEID (S4=16, S1-U=1), not PGW S5-U (5),
+     * and harvest the SMF-allocated Charging ID (IE 94) for CDR correlation. */
     iwf_ie_t bc_inner[IWF_MAX_IES];
     size_t   bc_n_inner = 0;
+    s->charging_id = 0;
     if ((ie = gtpv2_find_ie(v2, GTPV2_IE_BEARER_CONTEXT, 0))) {
-        if (gtpv2_parse_grouped(ie, bc_inner, IWF_MAX_IES, &bc_n_inner) == 0)
+        if (gtpv2_parse_grouped(ie, bc_inner, IWF_MAX_IES, &bc_n_inner) == 0) {
             bearer_pick_sgwu_fteid(bc_inner, bc_n_inner, &s->sgwu_teid, &s->sgwu_addr_ipv4);
+            for (size_t i = 0; i < bc_n_inner; i++) {
+                if (bc_inner[i].type == GTPV2_IE_CHARGING_ID &&
+                    bc_inner[i].length >= 4) {
+                    s->charging_id = iwf_be32(bc_inner[i].value);
+                    break;
+                }
+            }
+        }
+    }
+
+    /* PAA fallback: some implementations nest PAA in PDN Connection (109)
+     * for handover/relocation flows. Top-level wins; only consult the nested
+     * copy when message-level PAA was absent. */
+    if (!s->ue_ipv4 && (ie = gtpv2_find_ie(v2, GTPV2_IE_PDN_CONNECTION, 0))) {
+        iwf_ie_t pdn_inner[IWF_MAX_IES];
+        size_t   pdn_n = 0;
+        if (gtpv2_parse_grouped(ie, pdn_inner, IWF_MAX_IES, &pdn_n) == 0) {
+            for (size_t i = 0; i < pdn_n; i++) {
+                if (pdn_inner[i].type == GTPV2_IE_PAA) {
+                    uint8_t pt; uint32_t ip;
+                    if (!gtpv2_decode_paa_ipv4(&pdn_inner[i], &pt, &ip))
+                        s->ue_ipv4 = ip;
+                    break;
+                }
+            }
+        }
     }
 
     /* PCO (TS 29.274 §8.13) — copy verbatim from CSResp. EPS PCO uses the same
@@ -1782,9 +1830,7 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
     gtpv1_enc_begin(&e, GTPV1_CREATE_PDP_CONTEXT_RESPONSE,
                     s->sgsn_ctrl_teid, s->sgsn_seq);
 
-    uint8_t v1_cause = (gtpv2_cause == GTPV2_CAUSE_REQUEST_ACCEPTED)
-                       ? GTPV1_CAUSE_REQUEST_ACCEPTED
-                       : GTPV1_CAUSE_NO_RESOURCES;
+    uint8_t v1_cause = map_gtpv2_cause_to_v1_pdp_resp(gtpv2_cause);
 
     iwf_endpoint_t resp_ep    = s->sgsn_ep;
     uint16_t       resp_seq   = s->sgsn_seq;
@@ -1802,7 +1848,11 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
          * Mandatory in Create PDP Context Response per TS 29.060 §7.3.2. */
         gtpv1_enc_tv_u8(&e, 8, 0xfe);
 
-        gtpv1_enc_tv_u32(&e, GTPV1_IE_CHARGING_ID, (uint32_t)s->iwf_ctrl_teid);
+        /* Charging ID — prefer the SMF-allocated value (GTPv2 IE 94) so SGSN
+         * and PGW agree on the CDR correlator. Fall back to iwf_ctrl_teid
+         * only when SMF didn't include one. */
+        gtpv1_enc_tv_u32(&e, GTPV1_IE_CHARGING_ID,
+                         s->charging_id ? s->charging_id : s->iwf_ctrl_teid);
 
         /* End User Address = UE IPv4. */
         if (s->ue_ipv4) gtpv1_enc_eua_ipv4(&e, s->ue_ipv4);
@@ -1964,9 +2014,7 @@ static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
     gtpv1_enc_begin(&e, GTPV1_UPDATE_PDP_CONTEXT_RESPONSE,
                     s->sgsn_ctrl_teid, s->sgsn_seq);
 
-    uint8_t v1_cause = (cause == GTPV2_CAUSE_REQUEST_ACCEPTED)
-                       ? GTPV1_CAUSE_REQUEST_ACCEPTED
-                       : GTPV1_CAUSE_NO_RESOURCES;
+    uint8_t v1_cause = map_gtpv2_cause_to_v1_pdp_resp(cause);
     gtpv1_enc_cause(&e, v1_cause);
 
     if (v1_cause == GTPV1_CAUSE_REQUEST_ACCEPTED) {
