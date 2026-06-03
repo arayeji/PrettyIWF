@@ -362,6 +362,8 @@ static int decode_apn_from_labels(const uint8_t *buf, uint8_t apn_len,
             return -1;
         apn[ai] = '\0';
     }
+    if (ai > 0)
+        iwf_apn_normalize(apn);
     return ai > 0 ? 0 : -1;
 }
 
@@ -1304,8 +1306,30 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
      * PDN per (IMSI, DNN) and silently `OLD Session Will Release`s the prior
      * one when a second CSReq for the same pair arrives — the first PDP keeps
      * its IP and TEIDs in the SGSN/UE but goes black-hole on the user plane.
-     * Reject the second Create-PDP locally with cause 199 (No Resources) so
-     * the SGSN doesn't activate it; the first PDP keeps working. */
+     * Reject the second Create-PDP locally so the SGSN doesn't activate it;
+     * the first PDP keeps working.
+     *
+     * Choosing the reject cause matters because osmo-sgsn translates GTPv1
+     * cause to SM cause (gtp2sm_cause_map in sgsn_libgtp.c), and a UE's
+     * reaction to the SM cause decides whether the *primary* PDP survives:
+     *
+     *   GTPv1 199 (No Resources)        -> SM 26 (Insufficient resources):
+     *       Most modern UEs (Android/iOS) treat this as "network overload"
+     *       and tear down the entire PDN — including the working primary —
+     *       then re-attach. Empirically observed on Iranian MCI 432-12 UEs.
+     *
+     *   GTPv1 220 (Unknown PDP addr/type) -> SM 28 (Unknown PDP address or
+     *       PDP type): Per TS 24.008 §6.1.3.1.5, when received in response
+     *       to a *secondary* Activate-PDP for the complementary IP version
+     *       (the IPv4v6 fallback procedure), the MS "stops the second
+     *       activation procedure" and the first PDP context remains active.
+     *
+     * We therefore use 220 whenever the request looks like an IPv4v6
+     * fallback — i.e. the existing session and the new request together
+     * include IPv4v6 and one of the single-stack types, OR are the
+     * single-stack pair (IPv4 + IPv6). All other duplicate-NSAPI cases (the
+     * uncommon "same APN, same PDP type, different NSAPI" — usually a UE
+     * software bug) keep cause 199. */
     {
         char apn_peek[IWF_APN_MAX] = {0};
         const iwf_ie_t *apn_ie = gtpv1_find_ie(v1, GTPV1_IE_ACCESS_POINT_NAME);
@@ -1315,10 +1339,42 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             sess_t *dup = sess_find_active_by_imsi_apn_other_nsapi(
                 imsi, apn_peek, nsapi);
             if (dup) {
+                /* Decode the PDP type number from the new Create-PDP's EUA.
+                 * IE 128 may legitimately be missing (UE asks the network to
+                 * pick a type) — treat that as "unknown" (0). */
+                uint8_t new_org = 0, new_pdp = 0;
+                uint32_t new_ipv4_unused = 0;
+                const iwf_ie_t *eua_ie =
+                    gtpv1_find_ie(v1, GTPV1_IE_END_USER_ADDRESS);
+                if (eua_ie)
+                    (void)gtpv1_decode_eua(eua_ie, &new_org, &new_pdp,
+                                           &new_ipv4_unused);
+
+                /* IPv4v6-fallback heuristic: dual-stack involved on either
+                 * side, OR the single-stack pair (v4 + v6). 0 = unknown PDP
+                 * type IE; treat as fallback-eligible because it almost
+                 * always means the UE asked for v4v6 and the IE was elided
+                 * for the second activation. */
+                int is_fallback = 0;
+                uint8_t old_pdp = dup->pdp_type;
+                uint8_t a = old_pdp, b = new_pdp;
+                if (a == GTPV1_PDP_TYPE_IPV4V6 ||
+                    b == GTPV1_PDP_TYPE_IPV4V6 ||
+                    (a == GTPV1_PDP_TYPE_IPV4 && b == GTPV1_PDP_TYPE_IPV6) ||
+                    (a == GTPV1_PDP_TYPE_IPV6 && b == GTPV1_PDP_TYPE_IPV4) ||
+                    a == 0 || b == 0)
+                    is_fallback = 1;
+
+                uint8_t cause = is_fallback
+                    ? GTPV1_CAUSE_UNKNOWN_PDP_ADDR_TYPE
+                    : GTPV1_CAUSE_NO_RESOURCES;
+
                 LOGW("translate",
-                     "duplicate (IMSI=%s APN=%s) NSAPI %u while NSAPI %u is %s — rejecting (cause 199) to keep first PDP alive",
-                     imsi, apn_peek, (unsigned)nsapi,
-                     (unsigned)dup->key.nsapi, sess_state_str(dup->state));
+                     "duplicate (IMSI=%s APN=%s) NSAPI %u (PDP type 0x%02x) while NSAPI %u is %s (PDP type 0x%02x) — rejecting cause %u (%s) to keep first PDP alive",
+                     imsi, apn_peek, (unsigned)nsapi, (unsigned)new_pdp,
+                     (unsigned)dup->key.nsapi, sess_state_str(dup->state),
+                     (unsigned)old_pdp, (unsigned)cause,
+                     is_fallback ? "v4v6 fallback" : "no resources");
 
                 uint32_t sgsn_ctrl_teid = 0;
                 const iwf_ie_t *t_ie = gtpv1_find_ie(v1, GTPV1_IE_TEID_CTRL_PLANE);
@@ -1329,7 +1385,7 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
                 gtpv1_enc_init(&e, outbuf, sizeof(outbuf));
                 gtpv1_enc_begin(&e, GTPV1_CREATE_PDP_CONTEXT_RESPONSE,
                                 sgsn_ctrl_teid, (uint16_t)v1->seq);
-                gtpv1_enc_cause(&e, GTPV1_CAUSE_NO_RESOURCES);
+                gtpv1_enc_cause(&e, cause);
                 int total = gtpv1_enc_finish(&e);
                 if (total > 0)
                     (void)iwf_send_v1(rt, from, outbuf, (size_t)total);
@@ -1355,6 +1411,18 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         gtpv1_decode_msisdn(ie, s->msisdn, sizeof(s->msisdn));
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_ACCESS_POINT_NAME)))
         gtpv1_decode_apn(ie, s->apn, sizeof(s->apn));
+
+    /* Cache the UE-requested PDP type from the End User Address IE so a
+     * later "same (IMSI, APN), different NSAPI" Create-PDP can be
+     * classified as IPv4v6 fallback (cause 220) vs duplicate-of-same-type
+     * (cause 199). EUA may be absent — UE then asks the network to pick;
+     * we leave pdp_type = 0 ("unknown"). */
+    if ((ie = gtpv1_find_ie(v1, GTPV1_IE_END_USER_ADDRESS))) {
+        uint8_t org = 0, type = 0;
+        uint32_t ipv4_ignored = 0;
+        if (gtpv1_decode_eua(ie, &org, &type, &ipv4_ignored) == 0)
+            s->pdp_type = type;
+    }
 
     /* TEIDs SGSN advertises to us: control plane = where to send responses;
      * data = the SGSN/RNC user-plane TEID (initially the SGSN's own; replaced

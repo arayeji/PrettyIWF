@@ -21,6 +21,9 @@
 #include "translate.h"
 #include "map_iwf.h"
 #include "test_cmd.h"
+#ifdef GSUP_PROXY_ENABLED
+#  include "gsup_server.h"
+#endif
 #ifdef SMS_IWF_ENABLED
 #  include "sms_iwf.h"
 #endif
@@ -359,6 +362,17 @@ int main(int argc, char **argv)
         if (rt.cfg.map_iwf_enabled) return 1;
     }
 
+#ifdef GSUP_PROXY_ENABLED
+    if (rt.cfg.gsup_server_enabled && gsup_server_init(&rt, epfd) < 0) {
+        LOGE("iwf", "GSUP server init failed; check [gsup_server] config");
+        map_iwf_shutdown(&rt);
+        close(epfd);
+        close(tfd);
+        close(rt.v1_sock);
+        return 1;
+    }
+#endif
+
 #ifdef SMS_IWF_ENABLED
     if (rt.cfg.sms_iwf_enabled && sms_iwf_init(&rt, epfd) < 0) {
         fprintf(stderr, "sms_iwf_init failed\n");
@@ -377,18 +391,23 @@ int main(int argc, char **argv)
 
     {
         const char *map_s = map_iwf_enabled(&rt) ? "; MAP-IWF active" : "";
+#ifdef GSUP_PROXY_ENABLED
+        const char *gsup_s = gsup_server_enabled() ? "; GSUP-proxy active" : "";
+#else
+        const char *gsup_s = "";
+#endif
 #ifdef SMS_IWF_ENABLED
         const char *sms_s = sms_iwf_enabled(&rt) ? "; SMS-IWF active" : "";
 #else
         const char *sms_s = "";
 #endif
         LOGI("iwf", "ready: UDP %s:%u (listen_ip=%s) -> S4 SGW-C=%s:%u "
-                    "(F-TEID/GSN %s)%s%s",
+                    "(F-TEID/GSN %s)%s%s%s",
              bind_ip, rt.cfg.listen_port,
              rt.cfg.listen_ip,
              rt.cfg.sgwc_ip, rt.cfg.sgwc_port,
              inet_ntoa(*(struct in_addr *)&rt.local_ipv4_be),
-             map_s, sms_s);
+             map_s, gsup_s, sms_s);
     }
 
     while (!g_stop) {
@@ -401,6 +420,18 @@ int main(int argc, char **argv)
         }
         for (int i = 0; i < n; i++) {
             uint64_t role = events[i].data.u64;
+#ifdef GSUP_PROXY_ENABLED
+            /* GSUP roles pack (conn_idx << 32) | base_role into the tag.
+             * Extract the base role for the switch so conn_idx > 0 still hits
+             * the right case. The full tag is forwarded to gsup_server_on_epoll
+             * so it can retrieve the connection index. */
+            uint32_t base_role = GSUP_EPOLL_ROLE(role);
+            if (base_role == GSUP_EPOLL_ROLE_LISTEN ||
+                base_role == GSUP_EPOLL_ROLE_CONN) {
+                gsup_server_on_epoll(&rt, role);
+                continue;
+            }
+#endif
             switch (role) {
             case SOCK_GTP:
                 drain_gtp_socket(&rt);
@@ -427,6 +458,12 @@ int main(int argc, char **argv)
             case MAP_EPOLL_ROLE_TEST_CMD:
                 test_cmd_on_readable(&rt);
                 break;
+#ifdef GSUP_PROXY_ENABLED
+            case GSUP_EPOLL_ROLE_LISTEN:
+            case GSUP_EPOLL_ROLE_CONN:
+                gsup_server_on_epoll(&rt, role);
+                break;
+#endif
 #ifdef SMS_IWF_ENABLED
             case SMS_EPOLL_ROLE_SMPP_SRV:
                 sms_iwf_on_smpp_srv_readable();
@@ -465,6 +502,9 @@ int main(int argc, char **argv)
     LOGI("iwf", "shutting down");
 #ifdef SMS_IWF_ENABLED
     sms_iwf_shutdown(&rt);
+#endif
+#ifdef GSUP_PROXY_ENABLED
+    gsup_server_shutdown();
 #endif
     map_iwf_shutdown(&rt);
     close(epfd);

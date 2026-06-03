@@ -504,8 +504,10 @@ arriving on the shared TCP connection can be routed back in O(1).
 | Diameter `Subscription-Data`           | MAP `InsertSubscriberData` Invoke argument |
 |----------------------------------------|--------------------------------------------|
 | `MSISDN` AVP (701)                     | `msisdn` (ISDN-AddressString)              |
-| `APN-Configuration.Service-Selection`  | `apn-Configuration-Profile.APN`            |
-| `APN-Configuration.AMBR`               | `apn-Configuration.AMBR` (kbps, /1000)     |
+| `APN-Configuration-Profile` (all 1430) | `gprsSubscriptionData [16]` / `gprsDataList` — one `PDP-Context` per APN |
+| `Service-Selection` (493) per APN      | `PDP-Context.apn [20]` (DNS labels, lowercase) |
+| `PDN-Type` (1456) per APN              | `PDP-Context.pdp-Type [16]`                |
+| `Context-Identifier` (1423) per APN    | `PDP-Context.pdp-ContextId`                |
 
 ### Error handling
 
