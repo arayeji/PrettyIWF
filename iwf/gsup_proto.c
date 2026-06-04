@@ -263,34 +263,36 @@ static int gsup_enc_msisdn_ie(uint8_t *out, size_t cap, size_t *off,
                               const char *msisdn)
 {
     if (!msisdn || !msisdn[0]) return 0;
-    /* TS 04.08 LV for OsmoMSC gsm48_decode_bcd_number2(..., h_len=0):
-     * [len][0x91 international][TBCD digits].  First octet is NOT 0x91. */
+    /* OsmoMSC gsm48_decode_bcd_number2(..., h_len=0): [len][TBCD digits only]. */
     uint8_t lv[16];
-    const size_t h_len = 1;
-    lv[1] = 0x91;
+    size_t in_len = 0;
+    for (size_t k = 0; msisdn[k]; k++) {
+        if (msisdn[k] >= '0' && msisdn[k] <= '9')
+            in_len++;
+    }
+    if (in_len == 0) return 0;
 
+    lv[0] = (uint8_t)(in_len / 2);
+    if (in_len & 1)
+        lv[0]++;
+
+    uint8_t *bcd_cur = lv + 1;
     size_t di = 0;
     for (size_t k = 0; msisdn[k]; k++) {
         if (msisdn[k] < '0' || msisdn[k] > '9') continue;
         uint8_t d = (uint8_t)(msisdn[k] - '0');
-        size_t boff = 1 + h_len + di / 2;
-        if (boff >= sizeof(lv)) return -1;
         if ((di & 1) == 0)
-            lv[boff] = d;
+            *bcd_cur = d;
         else
-            lv[boff] = (uint8_t)(lv[boff] | (d << 4));
+            *bcd_cur++ |= (uint8_t)(d << 4);
         di++;
     }
-    if (di == 0) return 0;
+    if (di & 1)
+        *bcd_cur++ |= 0xf0;
 
-    lv[0] = (uint8_t)(di / 2 + h_len + (di & 1));
-    if (lv[0] >= sizeof(lv)) return -1;
-    if (di & 1) {
-        size_t boff = 1 + h_len + di / 2;
-        lv[boff] = (uint8_t)((lv[boff] & 0x0f) | 0xf0);
-    }
-
-    return gsup_put_ie(out, cap, off, GSUP_IE_MSISDN, lv, (size_t)lv[0] + 1);
+    size_t total = (size_t)(bcd_cur - lv);
+    if (total > sizeof(lv)) return -1;
+    return gsup_put_ie(out, cap, off, GSUP_IE_MSISDN, lv, total);
 }
 
 static int gsup_enc_apn_wire(const char *apn, uint8_t *out, size_t cap)

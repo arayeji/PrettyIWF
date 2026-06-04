@@ -1,8 +1,19 @@
-# Build outputs
+# Build
 iwf/iwf
 iwf/*.o
 iwf/*.d
 
-# IDE
+# IDE / editor
 .vs/
+.vscode/
+iwf/v17/
+iwf/FileContentIndex/
 *.user
+*.vsidx
+*.wsuo
+
+# Local config overrides (keep iwf/iwf.conf as the shipped example)
+/etc/iwf/
+
+# Logs
+*.log

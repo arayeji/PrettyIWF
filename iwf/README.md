@@ -1,5 +1,7 @@
 # iwf — GTP-C and MAP↔Diameter Interworking Function
 
+> Example addresses in this file use the `10.0.0.0/24` lab range. Edit `iwf.conf` for your network.
+
 Two cooperating IWF modules in one binary:
 
 1. **GTPv1-C ⇄ GTPv2-C** (always-on, dependency-free):
@@ -98,7 +100,7 @@ Edit `iwf.conf` (the install target also drops a sample at
 [iwf]
 listen_ip   = 0.0.0.0
 listen_port = 2123
-local_ip    = 10.0.0.5     ; advertised in F-TEID / GSN Address
+local_ip    = 10.0.0.10     ; advertised in F-TEID / GSN Address
 ; synthetic_uli_no_rai = 1      ; optional lab: ULI from IMSI if Gn omits RAI
 
 [sgsn]
@@ -154,7 +156,7 @@ instead of a real GGSN:
 
 ```vty
 sgsn
- ggsn 0 remote-ip 10.0.0.5   ! IWF listen_ip
+ ggsn 0 remote-ip 10.0.0.10   ! IWF listen_ip
  ggsn 0 gtp-version 1
  apn internet ggsn 0
 ```
@@ -238,7 +240,7 @@ osmo-sgsn → IWF       GTPv1 Create PDP Context Request seq=42
                        TEID-C=0xa0 TEID-D=0xb0 GSN=10.0.0.20
 IWF      → SGW-C      GTPv2 Create Session Request    seq=1 TEID=0
                        IMSI MSISDN ULI ServingNet RAT=UTRAN
-                       F-TEID(S4-SGSN-C)=0x10000002@10.0.0.5
+                       F-TEID(S4-SGSN-C)=0x10000002@10.0.0.10
                        F-TEID(S5/S8-PGW-C)=<smf>@<smf-ip>
                        APN=internet PDN=IPv4 PAA=0.0.0.0 AMBR=1G/1G
                        BearerCtx{EBI=5 QoS{QCI=9} F-TEID(S4-SGSN-U)}
@@ -250,7 +252,7 @@ SGW-C    → IWF        GTPv2 Create Session Response   seq=1 cause=16
 IWF      → osmo-sgsn  GTPv1 Create PDP Context Response seq=42 cause=128
                        Reordering=0xfe ChargingId TEID-D=0xa1
                        TEID-C(IWF)=0x10000001 EUA=10.45.0.2
-                       GSN(C)=10.0.0.5 GSN(U)=10.0.0.40
+                       GSN(C)=10.0.0.10 GSN(U)=10.0.0.40
                        (TS 29.060: two IE 133 in this order — user plane is SGW-U)
 osmo-sgsn → RNC       RAB Assignment (uses TEID-D=0xa1 @ 10.0.0.40)
 RNC      → UPG-VPP    GTPv1-U packets directly to 10.0.0.40 / 0xa1
@@ -371,7 +373,7 @@ See the three new sections appended to `iwf.conf`:
 ```ini
 [map_iwf]
 enabled       = 1
-local_gt      = 1234567890      ; your network E.164 Global Title
+local_gt      = 1234567890       ; your network E.164 Global Title
 local_pc      = 1.2.3            ; ITU 3-8-3 point code
 local_ssn     = 149              ; SGSN SSN
 t_dialogue_ms = 10000
@@ -533,4 +535,4 @@ arriving on the shared TCP connection can be routed back in O(1).
 
 ## License
 
-Provided as-is for production integration work. Bring your own license.
+See the repository root [LICENSE](../LICENSE) (MIT-style permissive terms).
