@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>      /* strcasecmp */
 #include <unistd.h>
 #include <time.h>
 
@@ -108,6 +109,36 @@ sess_t *sess_find_pending_create_by_imsi_gnseq(const char *imsi, uint16_t gn_seq
             continue;
         if (s->sgsn_seq == gn_seq)
             return s;
+    }
+    return NULL;
+}
+
+sess_t *sess_find_active_by_imsi_apn_other_nsapi(const char *imsi,
+                                                 const char *apn,
+                                                 uint8_t exclude_nsapi)
+{
+    if (!imsi || !apn || !apn[0])
+        return NULL;
+    sess_t *s, *tmp;
+    HASH_ITER(hh, g_by_key, s, tmp) {
+        if (s->key.nsapi == exclude_nsapi)
+            continue;
+        if (strcmp(s->key.imsi, imsi) != 0)
+            continue;
+        if (!s->apn[0] || strcasecmp(s->apn, apn) != 0)
+            continue;
+        /* Only steady / mid-flight sessions count: a session in DELETING /
+         * WAIT_DS_RESP is going away; one in CREATING / WAIT_CS_RESP hasn't
+         * reached SMF yet so no `OLD Session` collision is possible. */
+        switch (s->state) {
+        case SESS_ACTIVE:
+        case SESS_MODIFYING:
+        case SESS_WAIT_MB_RESP:
+        case SESS_WAIT_MB_RESP_INIT:
+            return s;
+        default:
+            break;
+        }
     }
     return NULL;
 }

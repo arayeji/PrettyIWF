@@ -125,6 +125,15 @@ sess_t *sess_find_by_iwf_s4_c_teid(uint32_t teid);
 sess_t *sess_find_by_pending_v2_seq(uint32_t seq24, sess_state_t expect_state);
 /* Retransmitted Create PDP may omit NSAPI IE — match only IMSI + GTPv1 seq. */
 sess_t *sess_find_pending_create_by_imsi_gnseq(const char *imsi, uint16_t gn_seq);
+/* Open5GS SMF enforces one PDN session per (IMSI, APN); a second Create-Session
+ * for the same pair triggers `OLD Session Will Release` and silently kills the
+ * first PDN. Returns the *active* session (ACTIVE / WAIT_MB_RESP / MODIFYING /
+ * WAIT_MB_RESP_INIT) for an IMSI on the given APN at a *different* NSAPI, so
+ * the caller can reject the duplicate before sending CSReq. APN compare is
+ * case-insensitive (TS 23.003 says APN labels are case-insensitive). */
+sess_t *sess_find_active_by_imsi_apn_other_nsapi(const char *imsi,
+                                                 const char *apn,
+                                                 uint8_t exclude_nsapi);
 sess_t *sess_create(const char *imsi, uint8_t nsapi);
 void    sess_remove(sess_t *s);
 
