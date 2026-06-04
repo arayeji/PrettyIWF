@@ -1300,6 +1300,44 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         }
     }
 
+    /* Duplicate (IMSI, APN) at a different NSAPI: Open5GS SMF enforces one
+     * PDN per (IMSI, DNN) and silently `OLD Session Will Release`s the prior
+     * one when a second CSReq for the same pair arrives — the first PDP keeps
+     * its IP and TEIDs in the SGSN/UE but goes black-hole on the user plane.
+     * Reject the second Create-PDP locally with cause 199 (No Resources) so
+     * the SGSN doesn't activate it; the first PDP keeps working. */
+    {
+        char apn_peek[IWF_APN_MAX] = {0};
+        const iwf_ie_t *apn_ie = gtpv1_find_ie(v1, GTPV1_IE_ACCESS_POINT_NAME);
+        if (apn_ie)
+            gtpv1_decode_apn(apn_ie, apn_peek, sizeof(apn_peek));
+        if (apn_peek[0]) {
+            sess_t *dup = sess_find_active_by_imsi_apn_other_nsapi(
+                imsi, apn_peek, nsapi);
+            if (dup) {
+                LOGW("translate",
+                     "duplicate (IMSI=%s APN=%s) NSAPI %u while NSAPI %u is %s — rejecting (cause 199) to keep first PDP alive",
+                     imsi, apn_peek, (unsigned)nsapi,
+                     (unsigned)dup->key.nsapi, sess_state_str(dup->state));
+
+                uint32_t sgsn_ctrl_teid = 0;
+                const iwf_ie_t *t_ie = gtpv1_find_ie(v1, GTPV1_IE_TEID_CTRL_PLANE);
+                if (t_ie) gtpv1_decode_teid(t_ie, &sgsn_ctrl_teid);
+
+                uint8_t outbuf[IWF_MAX_PKT];
+                gtpv1_enc_t e;
+                gtpv1_enc_init(&e, outbuf, sizeof(outbuf));
+                gtpv1_enc_begin(&e, GTPV1_CREATE_PDP_CONTEXT_RESPONSE,
+                                sgsn_ctrl_teid, (uint16_t)v1->seq);
+                gtpv1_enc_cause(&e, GTPV1_CAUSE_NO_RESOURCES);
+                int total = gtpv1_enc_finish(&e);
+                if (total > 0)
+                    (void)iwf_send_v1(rt, from, outbuf, (size_t)total);
+                return 0;
+            }
+        }
+    }
+
     sess_t *s = sess_create(imsi, nsapi);
     if (!s) {
         LOGE("translate", "out of memory creating session imsi=%s", imsi);
@@ -1361,6 +1399,16 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
 
     gtpv2_enc_imsi_bcd(&e, imsi);
     if (s->msisdn[0]) gtpv2_enc_msisdn_bcd(&e, s->msisdn);
+
+    /* Forward IMEISV (Gn IE 154, TS 29.060 §7.7.53) to MEI (S4 IE 75, TS
+     * 29.274 §8.10). Both carry the same 8-octet TBCD encoding (TS 23.003).
+     * Without this, Open5GS SMF logs `S5C: no ME Identity IE in Create
+     * Session Request` for every CSReq and CDRs lack IMEISV. */
+    {
+        const iwf_ie_t *imei_ie = gtpv1_find_ie(v1, GTPV1_IE_IMEISV);
+        if (imei_ie && imei_ie->length > 0 && imei_ie->length <= 16)
+            gtpv2_enc_tlv(&e, GTPV2_IE_MEI, 0, imei_ie->value, imei_ie->length);
+    }
 
     uint16_t mcc_sn = 0, mnc_sn = 0;
     int      have_sn = 0;
