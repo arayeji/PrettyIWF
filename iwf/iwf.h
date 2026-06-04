@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <netinet/in.h>
 #include <time.h>
 
@@ -67,12 +68,28 @@
 #define GTPV1_IE_IMEISV                    154
 #define GTPV1_IE_PRIVATE_EXTENSION         255
 
-/* GTPv1 cause values */
+/* GTPv1 cause values (TS 29.060 §7.7.1) */
 #define GTPV1_CAUSE_REQUEST_ACCEPTED       128
 #define GTPV1_CAUSE_NON_EXISTENT           192
 #define GTPV1_CAUSE_INVALID_MESSAGE        193
 #define GTPV1_CAUSE_NO_RESOURCES           199
+#define GTPV1_CAUSE_SERVICE_NOT_SUPPORTED  200
 #define GTPV1_CAUSE_SYSTEM_FAILURE         204
+/* "Unknown PDP address or PDP type" — osmo-sgsn maps this to SM cause 28
+ * (gtp2sm_cause_map in sgsn_libgtp.c). Per TS 24.008 §6.1.3.1.5, an MS that
+ * receives SM cause 28 in response to a *secondary* Activate-PDP for the
+ * complementary IP version stops the second activation but keeps the primary
+ * PDP alive — exactly the behaviour we need when rejecting the IPv4v6
+ * fallback request that Open5GS SMF cannot honour today (one PDN per
+ * (IMSI, APN)). Sending cause 199 (No Resources) instead maps to SM cause 26
+ * which UEs interpret as overload and detach. */
+#define GTPV1_CAUSE_UNKNOWN_PDP_ADDR_TYPE  220
+
+/* PDP Type Number (TS 29.060 §7.7.27 / TS 24.008 §10.5.6.4); only the
+ * "IETF allocated" organization (1) is used by 3GPP networks. */
+#define GTPV1_PDP_TYPE_IPV4                0x21
+#define GTPV1_PDP_TYPE_IPV6                0x57
+#define GTPV1_PDP_TYPE_IPV4V6              0x8d
 
 /* ------------------------------------------------------------------- */
 /* GTPv2-C message types (TS 29.274 §7.1.1)                            */
@@ -211,6 +228,17 @@ static inline void iwf_put_be24(uint8_t *p, uint32_t v) {
 static inline void iwf_put_be32(uint8_t *p, uint32_t v) {
     p[0] = (v >> 24) & 0xff; p[1] = (v >> 16) & 0xff;
     p[2] = (v >> 8)  & 0xff; p[3] =  v        & 0xff;
+}
+
+/* TS 23.003: APN/DNN labels are case-insensitive. Canonicalize to lowercase
+ * on decode so internal lookups and S4 Create-Session always use one form
+ * (matches Open5GS smf.yaml / PFCP subnet dnn and avoids UPF mismatches). */
+static inline void iwf_apn_normalize(char *apn)
+{
+    if (!apn)
+        return;
+    for (char *p = apn; *p; p++)
+        *p = (char)tolower((unsigned char)*p);
 }
 
 #endif /* IWF_H */

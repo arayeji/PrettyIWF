@@ -72,6 +72,14 @@ typedef struct sess_s {
     /* UE assigned address */
     uint32_t    ue_ipv4;
 
+    /* PDP Type Number requested by the UE in the original Create-PDP-Req's
+     * End User Address IE (TS 29.060 §7.7.27). 0x21 = IPv4, 0x57 = IPv6,
+     * 0x8d = IPv4v6, 0 = unknown / not yet decoded. Used by the duplicate
+     * (IMSI, APN, different NSAPI) rejection logic to choose between cause
+     * 220 (Unknown PDP type → SM cause 28, UE keeps primary) and cause 199
+     * (SM cause 26, UE detaches) — see translate_create_pdp_context(). */
+    uint8_t     pdp_type;
+
     /* Charging ID returned by SMF (GTPv2 IE 94 in Bearer Context). 0 means SMF
      * did not include one and we fall back to iwf_ctrl_teid. CDR correlation
      * across SGW/PGW relies on this matching what SMF sees. */
@@ -129,8 +137,8 @@ sess_t *sess_find_pending_create_by_imsi_gnseq(const char *imsi, uint16_t gn_seq
  * for the same pair triggers `OLD Session Will Release` and silently kills the
  * first PDN. Returns the *active* session (ACTIVE / WAIT_MB_RESP / MODIFYING /
  * WAIT_MB_RESP_INIT) for an IMSI on the given APN at a *different* NSAPI, so
- * the caller can reject the duplicate before sending CSReq. APN compare is
- * case-insensitive (TS 23.003 says APN labels are case-insensitive). */
+ * the caller can reject the duplicate before sending CSReq. Stored APNs are
+ * lowercase (iwf_apn_normalize on decode); compare uses strcasecmp. */
 sess_t *sess_find_active_by_imsi_apn_other_nsapi(const char *imsi,
                                                  const char *apn,
                                                  uint8_t exclude_nsapi);

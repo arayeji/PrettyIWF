@@ -179,6 +179,8 @@ int gtpv1_decode_apn(const iwf_ie_t *ie, char *out, size_t cap)
         }
     }
     out[k] = '\0';
+    if (k > 0)
+        iwf_apn_normalize(out);
     return (int)k;
 }
 

@@ -35,6 +35,7 @@
 #include "map_session.h"
 #include "map_iwf.h"
 #include "map_iwf_priv.h"
+#include "gsup_proto.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -186,6 +187,25 @@ int diameter_avp_find(const uint8_t *buf, size_t len,
     }
 }
 
+int diameter_avp_find_recursive(const uint8_t *buf, size_t len,
+                                uint32_t code, uint32_t vendor_id,
+                                diameter_avp_t *out)
+{
+    diameter_avp_t it;
+    if (diameter_avp_first(buf, len, &it) < 0) return -1;
+    for (;;) {
+        if (it.code == code && it.vendor_id == vendor_id) {
+            *out = it;
+            return 0;
+        }
+        if (it.data_len >= 8 &&
+            diameter_avp_find_recursive(it.data, it.data_len,
+                                      code, vendor_id, out) == 0)
+            return 0;
+        if (diameter_avp_next(buf, len, &it) < 0) return -1;
+    }
+}
+
 int diameter_get_result_code(const uint8_t *body, size_t len, uint32_t *out_rc)
 {
     diameter_avp_t a;
@@ -217,6 +237,28 @@ int diameter_get_session_id(const uint8_t *body, size_t len,
     if (n + 1 > out_cap) n = out_cap - 1;
     memcpy(out, a.data, n);
     out[n] = '\0';
+    return 0;
+}
+
+int diameter_get_user_name(const uint8_t *body, size_t len,
+                           char *out, size_t out_cap)
+{
+    diameter_avp_t a;
+    if (diameter_avp_find(body, len, AVP_USER_NAME, 0, &a) < 0) return -1;
+    if (a.data_len == 0 || a.data_len >= out_cap) return -1;
+    memcpy(out, a.data, a.data_len);
+    out[a.data_len] = '\0';
+    return 0;
+}
+
+int diameter_get_uint32_avp(const uint8_t *body, size_t len,
+                            uint32_t code, uint32_t vendor_id,
+                            uint32_t *out_val)
+{
+    diameter_avp_t a;
+    if (diameter_avp_find(body, len, code, vendor_id, &a) < 0) return -1;
+    if (a.data_len != 4) return -1;
+    *out_val = get_be32(a.data);
     return 0;
 }
 
@@ -271,15 +313,9 @@ static int build_s6d_route_avps(struct iwf_runtime *rt,
     const iwf_config_t *c = &rt->cfg;
     if (avp_put_str(avps, cap, off, AVP_SESSION_ID,
                     DIAM_AVP_FLAG_MANDATORY, 0, session_id) < 0) return -1;
-
-    /* Vendor-Specific-Application-Id (grouped) - identifies S6d. */
-    uint8_t vsai[32]; size_t vo = 0;
-    avp_put_u32(vsai, sizeof(vsai), &vo, AVP_VENDOR_ID,
-                DIAM_AVP_FLAG_MANDATORY, 0, DIAMETER_VENDOR_3GPP);
-    avp_put_u32(vsai, sizeof(vsai), &vo, AVP_AUTH_APPLICATION_ID,
-                DIAM_AVP_FLAG_MANDATORY, 0, DIAMETER_APP_S6D);
-    if (avp_put_grouped(avps, cap, off, AVP_VENDOR_SPECIFIC_APP_ID,
-                        DIAM_AVP_FLAG_MANDATORY, 0, vsai, vo) < 0) return -1;
+    if (avp_put_u32(avps, cap, off, AVP_AUTH_APPLICATION_ID,
+                    DIAM_AVP_FLAG_MANDATORY, 0, DIAMETER_APP_S6D) < 0)
+        return -1;
 
     if (avp_put_u32(avps, cap, off, AVP_AUTH_SESSION_STATE,
                     DIAM_AVP_FLAG_MANDATORY, 0, 1 /* NO_STATE_MAINTAINED */) < 0)
@@ -462,6 +498,40 @@ static int build_s6d_request_header(struct iwf_runtime *rt, map_session_t *s,
                         s->diameter_end_to_end);
 }
 
+static int diameter_body_valid(const uint8_t *body, size_t len)
+{
+    diameter_avp_t it;
+    if (diameter_avp_first(body, len, &it) < 0)
+        return -1;
+    for (;;) {
+        if (diameter_avp_next(body, len, &it) < 0)
+            break;
+    }
+    return 0;
+}
+
+static int put_req_auth_info_group(uint8_t *pkt, size_t cap, size_t *off,
+                                   uint8_t num_vectors)
+{
+    /* Use 1408 (E-UTRAN) not 1441 (UTRAN/GERAN): Open5GS DRA loads S6a dict
+     * and rejects 1441 with "Bad message". PyHSS returns usable vectors either way. */
+    uint8_t inner[64];
+    size_t io = 0;
+    uint32_t nv = num_vectors > 0 ? num_vectors : 3;
+    if (nv > 5) nv = 5;
+    if (avp_put_u32(inner, sizeof(inner), &io, AVP_3GPP_NUM_REQ_VECTORS,
+                    DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
+                    DIAMETER_VENDOR_3GPP, nv) < 0)
+        return -1;
+    if (avp_put_u32(inner, sizeof(inner), &io, AVP_3GPP_IMMEDIATE_RESPONSE_PREFERRED,
+                    DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
+                    DIAMETER_VENDOR_3GPP, 1) < 0)
+        return -1;
+    return avp_put_grouped(pkt, cap, off, AVP_3GPP_REQ_EUTRAN_AUTH_INFO,
+                           DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
+                           DIAMETER_VENDOR_3GPP, inner, io);
+}
+
 int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
 {
     if (!diameter_is_open(rt)) {
@@ -488,27 +558,23 @@ int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
                 DIAMETER_VENDOR_3GPP, s->visited_plmn_bcd, 3);
     }
 
-    /* Requested-UTRAN-GERAN-Authentication-Info grouped. */
+    /* Requested-E-UTRAN-Authentication-Info (1408) grouped AVP. */
     {
-        uint8_t inner[64]; size_t io = 0;
-        avp_put_u32(inner, sizeof(inner), &io, AVP_3GPP_NUM_REQ_VECTORS,
-                    DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
-                    DIAMETER_VENDOR_3GPP, 5);
-        avp_put_u32(inner, sizeof(inner), &io, AVP_3GPP_IMMEDIATE_RESPONSE_PREFERRED,
-                    DIAM_AVP_FLAG_VENDOR,
-                    DIAMETER_VENDOR_3GPP, 1);
-        avp_put_grouped(pkt, sizeof(pkt), &off,
-                        AVP_3GPP_REQ_UTRAN_GERAN_AUTH_INFO,
-                        DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
-                        DIAMETER_VENDOR_3GPP, inner, io);
+        uint8_t nv = s->gsup_num_vectors > 0 ? s->gsup_num_vectors : 3;
+        if (put_req_auth_info_group(pkt, sizeof(pkt), &off, nv) < 0)
+            return -1;
     }
 
-    /* RAT-Type = GPRS (1001 per project spec). */
+    /* RAT-Type = UTRAN (1000) for osmo-sgsn 3G; GPRS (1001) yields HSS rc=5014. */
     avp_put_u32(pkt, sizeof(pkt), &off, AVP_3GPP_RAT_TYPE,
                 DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
-                DIAMETER_VENDOR_3GPP, DIAM_RAT_TYPE_GPRS);
+                DIAMETER_VENDOR_3GPP, DIAM_RAT_TYPE_UTRAN);
 
     finalize_length(pkt, off);
+    if (diameter_body_valid(pkt + (size_t)hl, off - (size_t)hl) < 0) {
+        LOGE("diameter", "AIR imsi=%s: encoded AVP layout invalid", s->imsi_str);
+        return -1;
+    }
     LOGI("diameter", "TX AIR imsi=%s sid=%s len=%zu",
          s->imsi_str, s->diameter_session_id, off);
     int rc = diameter_tx(d, pkt, off);
@@ -536,19 +602,29 @@ int diameter_send_ulr(struct iwf_runtime *rt, map_session_t *s)
                 DIAMETER_VENDOR_3GPP, s->visited_plmn_bcd, 3);
     }
 
-    /* ULR-Flags: S6d-Indicator + Skip-Subscriber-Data (per spec). */
+    /* GSUP CS (MSC/VLR): S6a ULR — clear S6d-Indicator so Open5GS HSS returns
+     * Subscription-Data with MSISDN.  GSUP PS (SGSN): S6d + GPRS-Sub-Req. */
+    uint32_t ulr_flags = 0;
+    uint32_t rat_type  = DIAM_RAT_TYPE_UTRAN;
+    if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS) {
+        ulr_flags = 0;
+        rat_type  = DIAM_RAT_TYPE_UTRAN;
+    } else {
+        ulr_flags = ULR_FLAG_S6A_S6D_INDICATOR | ULR_FLAG_GPRS_SUBSCRIPTION_REQ;
+    }
     avp_put_u32(pkt, sizeof(pkt), &off, AVP_3GPP_ULR_FLAGS,
                 DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
-                DIAMETER_VENDOR_3GPP,
-                ULR_FLAG_S6A_S6D_INDICATOR | ULR_FLAG_GPRS_SUBSCRIPTION_REQ);
+                DIAMETER_VENDOR_3GPP, ulr_flags);
 
     avp_put_u32(pkt, sizeof(pkt), &off, AVP_3GPP_RAT_TYPE,
                 DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
-                DIAMETER_VENDOR_3GPP, DIAM_RAT_TYPE_GPRS);
+                DIAMETER_VENDOR_3GPP, rat_type);
 
     finalize_length(pkt, off);
-    LOGI("diameter", "TX ULR imsi=%s sid=%s len=%zu",
-         s->imsi_str, s->diameter_session_id, off);
+    LOGI("diameter", "TX ULR imsi=%s cn=%s flags=0x%x sid=%s len=%zu",
+         s->imsi_str,
+         s->gsup_cn_domain == GSUP_CN_DOMAIN_CS ? "CS/S6a" : "PS/S6d",
+         (unsigned)ulr_flags, s->diameter_session_id, off);
     int rc = diameter_tx(d, pkt, off);
     if (rc == 0) rt->map->stat_diam_tx++;
     return rc;
@@ -574,6 +650,47 @@ int diameter_send_clr(struct iwf_runtime *rt, map_session_t *s)
 
     finalize_length(pkt, off);
     LOGI("diameter", "TX CLR imsi=%s sid=%s", s->imsi_str, s->diameter_session_id);
+    int rc = diameter_tx(d, pkt, off);
+    if (rc == 0) rt->map->stat_diam_tx++;
+    return rc;
+}
+
+int diameter_send_cla_answer(struct iwf_runtime *rt,
+                             uint32_t hop_by_hop, uint32_t end_to_end,
+                             const char *session_id, uint32_t result_code)
+{
+    if (!diameter_is_open(rt)) return -1;
+    diameter_state_t *d = &rt->map->diam;
+    const iwf_config_t *c = &rt->cfg;
+    uint8_t pkt[512];
+    int hl = build_header(pkt, sizeof(pkt),
+                          0 /* answer */, DIAMETER_CMD_CLR,
+                          DIAMETER_APP_S6D,
+                          hop_by_hop, end_to_end);
+    if (hl < 0) return -1;
+    size_t off = (size_t)hl;
+
+    if (session_id && session_id[0]) {
+        if (avp_put_str(pkt, sizeof(pkt), &off, AVP_SESSION_ID,
+                        DIAM_AVP_FLAG_MANDATORY, 0, session_id) < 0)
+            return -1;
+    }
+    if (avp_put_u32(pkt, sizeof(pkt), &off, AVP_RESULT_CODE,
+                    DIAM_AVP_FLAG_MANDATORY, 0, result_code) < 0)
+        return -1;
+    if (avp_put_str(pkt, sizeof(pkt), &off, AVP_ORIGIN_HOST,
+                    DIAM_AVP_FLAG_MANDATORY, 0, c->diam_origin_host) < 0)
+        return -1;
+    if (avp_put_str(pkt, sizeof(pkt), &off, AVP_ORIGIN_REALM,
+                    DIAM_AVP_FLAG_MANDATORY, 0, c->diam_origin_realm) < 0)
+        return -1;
+    if (avp_put_u32(pkt, sizeof(pkt), &off, AVP_AUTH_SESSION_STATE,
+                    DIAM_AVP_FLAG_MANDATORY, 0, 1) < 0)
+        return -1;
+
+    finalize_length(pkt, off);
+    LOGI("diameter", "TX CLA rc=%u sid=%s",
+         (unsigned)result_code, session_id ? session_id : "");
     int rc = diameter_tx(d, pkt, off);
     if (rc == 0) rt->map->stat_diam_tx++;
     return rc;
@@ -674,23 +791,75 @@ static int diameter_wait_connected(int fd)
     return 0;
 }
 
-static int connect_peer(struct iwf_runtime *rt)
+static void schedule_reconnect(struct iwf_runtime *rt)
 {
     diameter_state_t *d = &rt->map->diam;
-    const iwf_config_t *c = &rt->cfg;
+    if (d->reconnect_backoff_s == 0) d->reconnect_backoff_s = 1;
+    else if (d->reconnect_backoff_s < 60) d->reconnect_backoff_s *= 2;
+    d->reconnect_not_before = time(NULL) + (time_t)d->reconnect_backoff_s;
+    LOGW("diameter", "reconnect in %us (peer %s:%u)",
+         d->reconnect_backoff_s,
+         rt->cfg.diam_peer_ip,
+         (unsigned)rt->cfg.diam_peer_port);
+}
 
+static const char *diam_bind_ip(const iwf_config_t *c)
+{
+    if (c->diam_local_ip[0]) return c->diam_local_ip;
+    if (c->local_ip[0])      return c->local_ip;
+    return NULL;
+}
+
+static int bind_local_ip(int fd, const char *ip)
+{
+    if (!ip || !ip[0]) return 0;
+    struct sockaddr_in la;
+    memset(&la, 0, sizeof(la));
+    la.sin_family = AF_INET;
+    la.sin_port   = 0;
+    if (inet_pton(AF_INET, ip, &la.sin_addr) != 1) {
+        LOGE("diameter", "bad local bind ip %s", ip);
+        return -1;
+    }
+    if (bind(fd, (struct sockaddr *)&la, sizeof(la)) < 0) {
+        LOGE("diameter", "bind %s: %s", ip, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void drop_peer(struct iwf_runtime *rt)
+{
+    diameter_state_t *d = &rt->map->diam;
     if (d->fd >= 0) {
         if (rt->map->epoll_fd >= 0)
             epoll_ctl(rt->map->epoll_fd, EPOLL_CTL_DEL, d->fd, NULL);
         close(d->fd);
         d->fd = -1;
     }
+    d->state = DIAM_CONN_CLOSED;
+    d->rx_used = 0;
+    d->tx_used = 0;
+}
+
+static int connect_peer(struct iwf_runtime *rt)
+{
+    diameter_state_t *d = &rt->map->diam;
+    const iwf_config_t *c = &rt->cfg;
+
+    drop_peer(rt);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { LOGE("diameter", "socket: %s", strerror(errno)); return -1; }
     set_nonblock(fd);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    const char *bind_ip = diam_bind_ip(c);
+    if (bind_local_ip(fd, bind_ip) < 0) {
+        close(fd);
+        return -1;
+    }
 
     memset(&d->peer, 0, sizeof(d->peer));
     d->peer.sin_family = AF_INET;
@@ -704,6 +873,9 @@ static int connect_peer(struct iwf_runtime *rt)
     if (rc < 0) {
         if (errno == EINPROGRESS) {
             if (diameter_wait_connected(fd) < 0) {
+                LOGE("diameter", "TCP connect to %s:%u failed (local=%s)",
+                     c->diam_peer_ip, (unsigned)c->diam_peer_port,
+                     bind_ip ? bind_ip : "any");
                 close(fd);
                 return -1;
             }
@@ -716,21 +888,19 @@ static int connect_peer(struct iwf_runtime *rt)
     }
     d->fd = fd;
     d->state = DIAM_CONN_CER_SENT;
-    LOGI("diameter", "TCP connected to %s:%u",
-         c->diam_peer_ip, c->diam_peer_port);
+    d->cer_sent_at = time(NULL);
+    LOGI("diameter", "TCP connected to %s:%u (local=%s)",
+         c->diam_peer_ip, c->diam_peer_port,
+         bind_ip ? bind_ip : "any");
     diameter_epoll_attach(rt, fd);
-    return diameter_send_cer(rt);
+    if (diameter_send_cer(rt) < 0) {
+        LOGE("diameter", "CER send failed");
+        drop_peer(rt);
+        return -1;
+    }
+    return 0;
 }
 
-static void schedule_reconnect(struct iwf_runtime *rt)
-{
-    diameter_state_t *d = &rt->map->diam;
-    if (d->reconnect_backoff_s == 0) d->reconnect_backoff_s = 1;
-    else if (d->reconnect_backoff_s < 60) d->reconnect_backoff_s *= 2;
-    LOGW("diameter", "scheduling reconnect in %us", d->reconnect_backoff_s);
-}
-
-/* ====================================================================== */
 /* RX dispatch                                                            */
 /* ====================================================================== */
 
@@ -740,11 +910,13 @@ static void on_cea(struct iwf_runtime *rt, const uint8_t *body, size_t len)
     if (diameter_get_result_code(body, len, &rc) == 0 && rc == DIAM_RC_SUCCESS) {
         rt->map->diam.state = DIAM_CONN_OPEN;
         rt->map->diam.reconnect_backoff_s = 0;
-        LOGI("diameter", "peer up: CEA Result-Code=2001 (S6d ready)");
+        rt->map->diam.reconnect_not_before = 0;
+        LOGI("diameter", "peer up: CEA Result-Code=2001 (S6d ready) origin=%s",
+             rt->cfg.diam_origin_host);
     } else {
-        LOGE("diameter", "CEA Result-Code=%u, closing peer", (unsigned)rc);
-        close(rt->map->diam.fd); rt->map->diam.fd = -1;
-        rt->map->diam.state = DIAM_CONN_CLOSED;
+        LOGE("diameter", "CEA rejected Result-Code=%u (check origin/dest on DRA)",
+             (unsigned)rc);
+        drop_peer(rt);
         schedule_reconnect(rt);
     }
 }
@@ -806,12 +978,15 @@ static void dispatch_message(struct iwf_runtime *rt,
         }
         if (cmd_code == DIAMETER_CMD_DPR) {
             LOGI("diameter", "RX DPR from peer; closing");
-            close(rt->map->diam.fd); rt->map->diam.fd = -1;
-            rt->map->diam.state = DIAM_CONN_CLOSED;
+            drop_peer(rt);
             schedule_reconnect(rt);
             return;
         }
-        /* CER and S6d requests from the peer to us: not expected for a client. */
+        if (cmd_code == DIAMETER_CMD_CLR && app_id == DIAMETER_APP_S6D) {
+            map_iwf_on_clr(rt, body, body_len, hbh, e2e);
+            return;
+        }
+        /* Other S6d requests from the peer: not expected for a client. */
         LOGW("diameter", "unexpected request cmd=%u app=%u (peer initiated)",
              (unsigned)cmd_code, (unsigned)app_id);
         return;
@@ -851,14 +1026,14 @@ void diameter_on_readable(struct iwf_runtime *rt)
             d->rx_used += (size_t)r;
         } else if (r == 0) {
             LOGW("diameter", "peer closed TCP connection");
-            close(d->fd); d->fd = -1; d->state = DIAM_CONN_CLOSED;
+            drop_peer(rt);
             schedule_reconnect(rt);
             return;
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EINTR) continue;
             LOGE("diameter", "recv: %s", strerror(errno));
-            close(d->fd); d->fd = -1; d->state = DIAM_CONN_CLOSED;
+            drop_peer(rt);
             schedule_reconnect(rt);
             return;
         }
@@ -941,19 +1116,28 @@ void diameter_on_dwa_tick(struct iwf_runtime *rt)
     ssize_t r = read(d->watchdog_timerfd, &exp, sizeof(exp));
     (void)r;
 
+    time_t now = time(NULL);
+
+    if (d->state == DIAM_CONN_CER_SENT && d->cer_sent_at > 0 &&
+        now - d->cer_sent_at >= 10) {
+        LOGW("diameter", "CEA timeout (10s) from %s:%u",
+             rt->cfg.diam_peer_ip, (unsigned)rt->cfg.diam_peer_port);
+        drop_peer(rt);
+        schedule_reconnect(rt);
+        return;
+    }
+
     if (d->state == DIAM_CONN_OPEN) {
         diameter_send_dwr(rt);
         return;
     }
-    /* If closed/connecting and backoff elapsed, retry. */
-    if (d->state == DIAM_CONN_CLOSED && d->reconnect_backoff_s > 0) {
-        time_t now = time(NULL);
-        if (now - d->last_rx_at >= (time_t)d->reconnect_backoff_s) {
-            LOGI("diameter", "attempting reconnect (backoff=%us)",
-                 d->reconnect_backoff_s);
-            d->last_rx_at = now;
-            connect_peer(rt);
-        }
+
+    if (d->state == DIAM_CONN_CLOSED &&
+        d->reconnect_not_before > 0 && now >= d->reconnect_not_before) {
+        LOGI("diameter", "attempting reconnect to %s:%u",
+             rt->cfg.diam_peer_ip, (unsigned)rt->cfg.diam_peer_port);
+        if (connect_peer(rt) < 0)
+            schedule_reconnect(rt);
     }
 }
 
