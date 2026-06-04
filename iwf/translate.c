@@ -1447,6 +1447,14 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     /* PAA - request 0.0.0.0 (dynamic allocation). */
     gtpv2_enc_paa_ipv4(&e, 0);
 
+    /* Forward the MS's Protocol Configuration Options verbatim (GTPv1 IE 132 ->
+     * GTPv2 IE 78). EPS PCO container layout is identical between TS 29.060
+     * §7.7.31 and TS 29.274 §8.13. Open5GS SMF only adds DNS / IPCP DNS
+     * containers to the response when the MS asked for them in the request,
+     * so without this the UE never gets DNS even if smf.yaml has dns: set. */
+    if ((ie = gtpv1_find_ie(v1, GTPV1_IE_PCO)) && ie->length > 0)
+        gtpv2_enc_tlv(&e, GTPV2_IE_PCO, 0, ie->value, ie->length);
+
     /* APN-AMBR (1 Gbps best-effort cap). */
     gtpv2_enc_ambr(&e, 1000000, 1000000);
 
