@@ -38,8 +38,7 @@ static void defaults(iwf_config_t *c)
     c->map_t_dialogue_ms  = 10000;
     strncpy(c->stp_ip,   "127.0.0.1", sizeof(c->stp_ip)   - 1);
     c->stp_port           = 2905;
-    /* Default 4 matches osmo-stp as-iwf routing-key 4 on THR1 (override in iwf.conf). */
-    c->stp_routing_context = 4u;
+    c->stp_routing_context = 1u;
     c->diam_peer_port     = 3868;
     c->diam_watchdog_ms   = 30000;
     c->diam_request_timeout_ms = 10000;
@@ -54,18 +53,18 @@ static void defaults(iwf_config_t *c)
 #ifdef SMS_IWF_ENABLED
     c->sms_iwf_enabled       = 0;
     c->sms_hlr_ssn           = 6;
-    strncpy(c->sms_local_msc_gt,  "989000002000", sizeof(c->sms_local_msc_gt) - 1);
-    strncpy(c->sms_local_smsc_gt, "989000002006", sizeof(c->sms_local_smsc_gt) - 1);
+    strncpy(c->sms_local_msc_gt,  "1234567890000", sizeof(c->sms_local_msc_gt) - 1);
+    strncpy(c->sms_local_smsc_gt, "1234567890006", sizeof(c->sms_local_smsc_gt) - 1);
     c->sms_gsup_timeout_ms   = 3000;
     c->sms_sri_sm_timeout_ms = 5000;
     c->sms_fwdsm_timeout_ms  = 10000;
-    strncpy(c->gsup_remote_ip, "10.234.241.33", sizeof(c->gsup_remote_ip) - 1);
+    strncpy(c->gsup_remote_ip, "127.0.0.1", sizeof(c->gsup_remote_ip) - 1);
     c->gsup_remote_port      = 4222;
     strncpy(c->gsup_client_name, "IWF-SMS", sizeof(c->gsup_client_name) - 1);
     strncpy(c->smpp_bind_ip, "127.0.0.1", sizeof(c->smpp_bind_ip) - 1);
     c->smpp_port             = 2777;
     strncpy(c->smpp_system_id, "iwf", sizeof(c->smpp_system_id) - 1);
-    strncpy(c->smpp_password, "iwfsms", sizeof(c->smpp_password) - 1);
+    strncpy(c->smpp_password, "changeme", sizeof(c->smpp_password) - 1);
 #endif
 }
 

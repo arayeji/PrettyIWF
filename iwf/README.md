@@ -1,5 +1,7 @@
 # iwf — GTP-C and MAP↔Diameter Interworking Function
 
+> Example addresses in this file use the `10.0.0.0/24` lab range. Edit `iwf.conf` for your network.
+
 Two cooperating IWF modules in one binary:
 
 1. **GTPv1-C ⇄ GTPv2-C** (always-on, dependency-free):
@@ -98,20 +100,20 @@ Edit `iwf.conf` (the install target also drops a sample at
 [iwf]
 listen_ip   = 0.0.0.0
 listen_port = 2123
-local_ip    = 10.234.241.10     ; advertised in F-TEID / GSN Address
+local_ip    = 10.0.0.10     ; advertised in F-TEID / GSN Address
 ; synthetic_uli_no_rai = 1      ; optional lab: ULI from IMSI if Gn omits RAI
 
 [sgsn]
-ip          = 10.234.241.20     ; informational only
+ip          = 10.0.0.20     ; informational only
 
 [sgwc]
-ip          = 10.234.241.30
+ip          = 10.0.0.30
 port        = 2123
 
 [smf]
 # SMF / PGW-C S5/S8 GTP-C — F-TEID instance 1 in Create Session Request (required by Open5GS SGWC).
 # teid MUST be 0 for an initial Create Session (the SMF allocates its TEID in the response).
-ip          = 10.234.241.9
+ip          = 10.0.0.9
 teid        = 0
 
 [logging]
@@ -144,7 +146,7 @@ session can be followed end-to-end:
   teid=0x10000002 seq=1 imsi=001010000000001 apn=internet ies=6
 2026-01-01T12:00:00.141 [INFO ] [translate] TX-Gn Create-PDP-Resp
   imsi=001010000000001 seq=42 cause=128
-  sgwu=10.234.241.40 teid=0x000000a1 ue_ip=10.45.0.2
+  sgwu=10.0.0.40 teid=0x000000a1 ue_ip=10.45.0.2
 ```
 
 ## Integration with osmo-sgsn
@@ -154,7 +156,7 @@ instead of a real GGSN:
 
 ```vty
 sgsn
- ggsn 0 remote-ip 10.234.241.10   ! IWF listen_ip
+ ggsn 0 remote-ip 10.0.0.10   ! IWF listen_ip
  ggsn 0 gtp-version 1
  apn internet ggsn 0
 ```
@@ -173,13 +175,13 @@ as that SGSN. In `sgwc.yaml`:
 sgwc:
   gtpc:
     server:
-      - address: 10.234.241.30   # SGW-C listens here
+      - address: 10.0.0.30   # SGW-C listens here
   pfcp:
     server:
-      - address: 10.234.241.30
+      - address: 10.0.0.30
     client:
       sgwu:
-        - address: 10.234.241.40  # UPG-VPP PFCP address
+        - address: 10.0.0.40  # UPG-VPP PFCP address
 ```
 
 No explicit per-SGSN peer config is needed — Open5GS accepts S4 by
@@ -217,13 +219,13 @@ sudo tcpdump -ni any -s0 udp port 8805 -vv
 Sniff Gn (osmo-sgsn ⇄ iwf):
 
 ```bash
-sudo tcpdump -ni any -s0 udp port 2123 and host 10.234.241.20 -vv
+sudo tcpdump -ni any -s0 udp port 2123 and host 10.0.0.20 -vv
 ```
 
 Sniff S4 (iwf ⇄ SGW-C):
 
 ```bash
-sudo tcpdump -ni any -s0 udp port 2123 and host 10.234.241.30 -vv
+sudo tcpdump -ni any -s0 udp port 2123 and host 10.0.0.30 -vv
 ```
 
 Or open Wireshark with the `gtp` and `gtpv2` dissectors enabled. The
@@ -235,25 +237,25 @@ IWF emits TRACE-level hex dumps of every message it transmits when
 ```
 osmo-sgsn → IWF       GTPv1 Create PDP Context Request seq=42
                        IMSI=001010000000001 NSAPI=5 APN=internet
-                       TEID-C=0xa0 TEID-D=0xb0 GSN=10.234.241.20
+                       TEID-C=0xa0 TEID-D=0xb0 GSN=10.0.0.20
 IWF      → SGW-C      GTPv2 Create Session Request    seq=1 TEID=0
                        IMSI MSISDN ULI ServingNet RAT=UTRAN
-                       F-TEID(S4-SGSN-C)=0x10000002@10.234.241.10
+                       F-TEID(S4-SGSN-C)=0x10000002@10.0.0.10
                        F-TEID(S5/S8-PGW-C)=<smf>@<smf-ip>
                        APN=internet PDN=IPv4 PAA=0.0.0.0 AMBR=1G/1G
                        BearerCtx{EBI=5 QoS{QCI=9} F-TEID(S4-SGSN-U)}
 SGW-C    → IWF        GTPv2 Create Session Response   seq=1 cause=16
-                       F-TEID(S5/S8-SGW-C)=0x20000001@10.234.241.30
+                       F-TEID(S5/S8-SGW-C)=0x20000001@10.0.0.30
                        PAA=10.45.0.2
                        BearerCtx{EBI=5 cause=16
-                         F-TEID(S1U-SGW-U)=0xa1@10.234.241.40}
+                         F-TEID(S1U-SGW-U)=0xa1@10.0.0.40}
 IWF      → osmo-sgsn  GTPv1 Create PDP Context Response seq=42 cause=128
                        Reordering=0xfe ChargingId TEID-D=0xa1
                        TEID-C(IWF)=0x10000001 EUA=10.45.0.2
-                       GSN(C)=10.234.241.10 GSN(U)=10.234.241.40
+                       GSN(C)=10.0.0.10 GSN(U)=10.0.0.40
                        (TS 29.060: two IE 133 in this order — user plane is SGW-U)
-osmo-sgsn → RNC       RAB Assignment (uses TEID-D=0xa1 @ 10.234.241.40)
-RNC      → UPG-VPP    GTPv1-U packets directly to 10.234.241.40 / 0xa1
+osmo-sgsn → RNC       RAB Assignment (uses TEID-D=0xa1 @ 10.0.0.40)
+RNC      → UPG-VPP    GTPv1-U packets directly to 10.0.0.40 / 0xa1
 ```
 
 `Update PDP Context` (the RNC's TEID, learned after RAB establishment)
@@ -371,7 +373,7 @@ See the three new sections appended to `iwf.conf`:
 ```ini
 [map_iwf]
 enabled       = 1
-local_gt      = 98921000000      ; your network E.164 Global Title
+local_gt      = 1234567890       ; your network E.164 Global Title
 local_pc      = 1.2.3            ; ITU 3-8-3 point code
 local_ssn     = 149              ; SGSN SSN
 t_dialogue_ms = 10000
@@ -384,7 +386,7 @@ remote_pc     = 1.2.1
 ; routing_context = 1   ; M3UA RKM RCTX — default 1; 0 = omit (SG allocates). Avoid 3 if osmo-sgsn uses RCTX 3.
 
 [diameter_s6d]
-peer_ip       = 10.234.241.50    ; PyHSS Diameter IP
+peer_ip       = 10.0.0.50    ; PyHSS Diameter IP
 peer_port     = 3868
 origin_host   = iwf.mnc012.mcc432.3gppnetwork.org
 origin_realm  = mnc012.mcc432.3gppnetwork.org
@@ -533,4 +535,4 @@ arriving on the shared TCP connection can be routed back in O(1).
 
 ## License
 
-Provided as-is for production integration work. Bring your own license.
+See the repository root [LICENSE](../LICENSE) (MIT-style permissive terms).

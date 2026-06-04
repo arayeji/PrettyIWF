@@ -180,7 +180,7 @@ echo "==> Step 4/5: Write configuration $CONFIG_PATH"
 if [[ -z "$IWF_LOCAL_IP" ]]; then
   if [[ "$IWF_LISTEN_IP" == "0.0.0.0" ]]; then
     echo "ERROR: When listen_ip is 0.0.0.0 you must set IWF_LOCAL_IP (your Gn/S4 IP)." >&2
-    echo "Example: sudo IWF_LOCAL_IP=10.234.241.10 IWF_SGWC_IP=10.234.241.30 $0 --install" >&2
+    echo "Example: sudo IWF_LOCAL_IP=10.0.0.5 IWF_SGWC_IP=10.0.0.30 $0 --install" >&2
     exit 1
   fi
   IWF_LOCAL_IP="$IWF_LISTEN_IP"
