@@ -449,8 +449,15 @@ int ss7_link_init(struct iwf_runtime *rt)
             }
             struct osmo_ss7_asp *asp =
                 osmo_ss7_asp_find_by_proto(as, OSMO_SS7_ASP_PROT_M3UA);
-            if (asp)
-                osmo_ss7_asp_restart(asp);
+            /* osmo_sccp_simple_client() may already have brought the ASP up;
+             * a second restart while ACTIVE causes duplicate ASPAC/ACK on STP. */
+            if (asp) {
+                if (osmo_ss7_asp_active(asp))
+                    LOGI("ss7", "M3UA ASP already ACTIVE; skip asp_restart (RCTX=%u)",
+                         (unsigned)rt->cfg.stp_routing_context);
+                else
+                    osmo_ss7_asp_restart(asp);
+            }
         } else {
             LOGW("ss7", "could not find M3UA AS for RKM");
         }
@@ -533,7 +540,6 @@ int ss7_link_send_tcap(struct iwf_runtime *rt,
     return ss7_tx_unitdata(ctx, ctx->user, called, &loc, tcap, tcap_len);
 }
 
-#ifdef SMS_IWF_ENABLED
 int ss7_link_send_tcap_ex(struct iwf_runtime *rt,
                           const ss7_sccp_addr_t *called,
                           const ss7_sccp_addr_t *calling,
@@ -549,7 +555,6 @@ int ss7_link_send_tcap_ex(struct iwf_runtime *rt,
     }
     return ss7_tx_unitdata(ctx, ctx->user, called, cp, tcap, tcap_len);
 }
-#endif
 
 void ss7_link_shutdown(struct iwf_runtime *rt)
 {
@@ -595,7 +600,6 @@ int  ss7_link_send_tcap(struct iwf_runtime *rt,
     return -1;
 }
 
-#ifdef SMS_IWF_ENABLED
 int ss7_link_send_tcap_ex(struct iwf_runtime *rt,
                           const ss7_sccp_addr_t *called,
                           const ss7_sccp_addr_t *calling,
@@ -605,6 +609,7 @@ int ss7_link_send_tcap_ex(struct iwf_runtime *rt,
     return -1;
 }
 
+#ifdef SMS_IWF_ENABLED
 void ss7_link_set_hlr_recv_cb(struct iwf_runtime *rt, ss7_recv_cb_t cb)
 {
     (void)rt; (void)cb;

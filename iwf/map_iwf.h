@@ -99,4 +99,9 @@ void map_iwf_on_pua(struct iwf_runtime *rt, struct map_session *s,
 void map_iwf_diameter_error(struct iwf_runtime *rt, struct map_session *s,
                             uint32_t diameter_result_code);
 
+/* Inbound HSS-initiated Cancel-Location-Request (Diameter CLR). */
+void map_iwf_on_clr(struct iwf_runtime *rt,
+                    const uint8_t *body, size_t body_len,
+                    uint32_t hop_by_hop, uint32_t end_to_end);
+
 #endif /* IWF_MAP_IWF_H */

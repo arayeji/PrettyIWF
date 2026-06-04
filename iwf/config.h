@@ -60,6 +60,7 @@ typedef struct {
     /* [diameter_s6d] */
     char        diam_peer_ip[64];
     uint16_t    diam_peer_port;
+    char        diam_local_ip[64];  /* optional TCP bind before connect (DRA ACL) */
     char        diam_origin_host[128];
     char        diam_origin_realm[128];
     char        diam_dest_host[128];
@@ -70,6 +71,30 @@ typedef struct {
     int         diam_request_timeout_ms;  /* default 10000     */
 
     char        cfg_path[256];    /* set by main after load; for diagnostics only */
+
+    /* [gsup_server] GSUP proxy/router toward osmo-sgsn/osmo-msc (TCP/4222).
+     * Requires MAP-IWF build (make MAP_IWF_ENABLED=1) and [map_iwf].enabled=1
+     * for Diameter + SS7 backends.  When gsup_server.enabled=0 (default) the
+     * GTP and inbound MAP-IWF paths are unchanged. */
+    int         gsup_server_enabled;
+    uint16_t    gsup_listen_port;
+#define GSUP_MAX_LISTEN_IPS 8
+    char        gsup_listen_ips[GSUP_MAX_LISTEN_IPS][64];
+    int         gsup_n_listen_ips;
+    char        gsup_local_mnc[4];        /* home PLMN MNC digits, default 012 */
+    int         gsup_timeout_ms;
+
+    /* [roaming_hlr] per-partner MAP route (foreign HLR GT + optional src IP/GT). */
+#define GSUP_MAX_ROAM_ROUTES 8
+    struct {
+        char    mnc[4];           /* three-digit MNC string e.g. "035" */
+        char    hlr_gt[24];
+        uint8_t hlr_ssn;            /* default 6 (HLR) or 149 per partner */
+        char    src_ip[64];         /* optional SCTP/source hint for this route */
+        char    src_gt[24];         /* optional SCCP CallingParty GT override */
+        int     is_local;           /* 1 = PyHSS/Diameter path (no foreign GT) */
+    } gsup_roam_routes[GSUP_MAX_ROAM_ROUTES];
+    int         gsup_n_roam_routes;
 
 #ifdef SMS_IWF_ENABLED
     /* [sms_iwf] — MAP SMS interworking (requires MAP-IWF + SMS_IWF_ENABLED build). */
