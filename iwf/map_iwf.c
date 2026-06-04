@@ -57,6 +57,10 @@
 #include "runtime.h"
 #include "logging.h"
 #include "test_cmd.h"
+#ifdef GSUP_PROXY_ENABLED
+#include "gsup_map_proxy.h"
+#include "gsup_proto.h"
+#endif
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -118,7 +122,14 @@ static void cmd_test_abort(map_session_t *s, const char *reason)
 static void map_sess_timeout_hook_cmd(map_session_t *s, void *hook_ctx)
 {
     (void)hook_ctx;
-    if (!s || !s->cmd_test) return;
+    if (!s || !s->cmd_test) {
+#ifdef GSUP_PROXY_ENABLED
+        if (s && s->gsup_originated && hook_ctx) {
+            gsup_map_proxy_on_timeout((struct iwf_runtime *)hook_ctx, s);
+        }
+#endif
+        return;
+    }
     if (s->cmd_test_reply_fd >= 0) {
         test_cmd_reply_err(s->cmd_test_reply_fd, "timeout");
         close(s->cmd_test_reply_fd);
@@ -157,11 +168,8 @@ static void handle_begin_sai(struct iwf_runtime *rt,
     /* Visited PLMN: derive from the IMSI MCC+MNC (TS 24.008).  This is a
      * fallback - a future patch can prefer the SCCP CallingParty GT's
      * country code if it differs (roaming-from-home detection). */
-    if (req.imsi_bcd_len >= 2) {
-        uint8_t plmn[3] = { req.imsi_bcd[0], req.imsi_bcd[1], req.imsi_bcd[2] };
-        memcpy(s->visited_plmn_bcd, plmn, 3);
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
-    }
 
     LOGI("map", "RX BEGIN SAI imsi=%s tid=0x%08x peer_otid=0x%08x vec_req=%u",
          s->imsi_str, s->tcap_dialogue_id, s->peer_tcap_dialogue_id,
@@ -195,12 +203,8 @@ static void handle_begin_ugl(struct iwf_runtime *rt,
     memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
     s->imsi_bcd_len = req.imsi_bcd_len;
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
-    if (req.imsi_bcd_len >= 3) {
-        s->visited_plmn_bcd[0] = req.imsi_bcd[0];
-        s->visited_plmn_bcd[1] = req.imsi_bcd[1];
-        s->visited_plmn_bcd[2] = req.imsi_bcd[2];
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
-    }
 
     LOGI("map", "RX BEGIN UGL imsi=%s tid=0x%08x peer_otid=0x%08x",
          s->imsi_str, s->tcap_dialogue_id, s->peer_tcap_dialogue_id);
@@ -230,12 +234,8 @@ static void handle_begin_purge(struct iwf_runtime *rt,
     memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
     s->imsi_bcd_len = req.imsi_bcd_len;
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
-    if (req.imsi_bcd_len >= 3) {
-        s->visited_plmn_bcd[0] = req.imsi_bcd[0];
-        s->visited_plmn_bcd[1] = req.imsi_bcd[1];
-        s->visited_plmn_bcd[2] = req.imsi_bcd[2];
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
-    }
     LOGI("map", "RX BEGIN PurgeMS imsi=%s tid=0x%08x",
          s->imsi_str, s->tcap_dialogue_id);
     if (diameter_send_pur(rt, s) < 0) {
@@ -348,10 +348,18 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
     }
 
     if (tmsg.type == TCAP_MSG_CONTINUE || tmsg.type == TCAP_MSG_END) {
+#ifdef GSUP_PROXY_ENABLED
+        if (gsup_map_proxy_on_tcap(rt, calling, &tmsg))
+            return;
+#endif
         handle_continue_or_end(rt, &tmsg);
         return;
     }
     if (tmsg.type == TCAP_MSG_ABORT) {
+#ifdef GSUP_PROXY_ENABLED
+        if (gsup_map_proxy_on_tcap(rt, calling, &tmsg))
+            return;
+#endif
         handle_abort(rt, &tmsg);
         return;
     }
@@ -506,6 +514,12 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
             cmd_test_abort(s, "no_authentication_info_avp");
             return;
         }
+        if (s->gsup_originated) {
+#ifdef GSUP_PROXY_ENABLED
+            gsup_map_proxy_diameter_error(rt, s, 0);
+#endif
+            return;
+        }
         send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
         return;
     }
@@ -548,7 +562,19 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
     }
 
     if (s->n_av == 0) {
+        if (s->gsup_originated) {
+#ifdef GSUP_PROXY_ENABLED
+            gsup_map_proxy_diameter_error(rt, s, 0);
+#endif
+            return;
+        }
         send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
+        return;
+    }
+    if (s->gsup_originated) {
+#ifdef GSUP_PROXY_ENABLED
+        gsup_map_proxy_finish_sai(rt, s);
+#endif
         return;
     }
     uint8_t params[1600];
@@ -563,83 +589,187 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
 }
 
 /* Extract subscription data from ULA (MSISDN, APN config, AMBR). */
+static int ula_add_apn_entry(map_session_t *s, const diameter_avp_t *apnc)
+{
+    if (!s || !apnc || s->n_ula_apns >= MAP_MAX_ULA_APN)
+        return -1;
+
+    diameter_avp_t ss;
+    if (diameter_avp_find(apnc->data, apnc->data_len,
+                          AVP_3GPP_SERVICE_SELECTION, 0, &ss) != 0)
+        return -1;
+
+    map_ula_apn_entry_t *e = &s->ula_apns[s->n_ula_apns];
+    memset(e, 0, sizeof(*e));
+
+    size_t n = ss.data_len > sizeof(e->apn) - 1
+                   ? sizeof(e->apn) - 1 : ss.data_len;
+    memcpy(e->apn, ss.data, n);
+    e->apn[n] = '\0';
+    iwf_apn_normalize(e->apn);
+    if (!e->apn[0])
+        return -1;
+
+    diameter_avp_t ctx;
+    if (diameter_avp_find(apnc->data, apnc->data_len,
+                          AVP_3GPP_CONTEXT_IDENTIFIER,
+                          DIAMETER_VENDOR_3GPP, &ctx) == 0 &&
+        ctx.data_len >= 4) {
+        e->context_id = (uint8_t)iwf_be32(ctx.data);
+    } else {
+        e->context_id = (uint8_t)(s->n_ula_apns + 1);
+    }
+
+    /* PyHSS ip_version: 0=IPv4, 1=IPv6, 2=IPv4v6 → TS 29.060 PDP type numbers. */
+    diameter_avp_t pdn;
+    if (diameter_avp_find(apnc->data, apnc->data_len,
+                          AVP_3GPP_PDN_TYPE, DIAMETER_VENDOR_3GPP, &pdn) == 0 &&
+        pdn.data_len >= 4) {
+        uint32_t iv = iwf_be32(pdn.data);
+        if (iv == 1)
+            e->pdn_type_nr = GTPV1_PDP_TYPE_IPV6;
+        else if (iv == 2)
+            e->pdn_type_nr = GTPV1_PDP_TYPE_IPV4V6;
+        else
+            e->pdn_type_nr = GTPV1_PDP_TYPE_IPV4;
+    } else {
+        e->pdn_type_nr = GTPV1_PDP_TYPE_IPV4;
+    }
+
+    diameter_avp_t ambr;
+    if (diameter_avp_find(apnc->data, apnc->data_len,
+                          AVP_3GPP_AMBR, DIAMETER_VENDOR_3GPP, &ambr) == 0) {
+        diameter_avp_t ul, dl;
+        if (diameter_avp_find(ambr.data, ambr.data_len,
+                              AVP_3GPP_MAX_REQUESTED_BANDWIDTH_UL,
+                              DIAMETER_VENDOR_3GPP, &ul) == 0 &&
+            ul.data_len == 4)
+            e->ambr_ul_kbps = iwf_be32(ul.data);
+        if (diameter_avp_find(ambr.data, ambr.data_len,
+                              AVP_3GPP_MAX_REQUESTED_BANDWIDTH_DL,
+                              DIAMETER_VENDOR_3GPP, &dl) == 0 &&
+            dl.data_len == 4)
+            e->ambr_dl_kbps = iwf_be32(dl.data);
+    }
+
+    s->n_ula_apns++;
+    return 0;
+}
+
+static void decode_ula_msisdn(const uint8_t *data, size_t n, char *out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!data || n == 0) return;
+
+    size_t o = 0;
+    for (size_t i = 0; i < n && o + 1 < cap; i++) {
+        uint8_t lo = data[i] & 0x0f;
+        uint8_t hi = (data[i] >> 4) & 0x0f;
+        if (lo <= 9) out[o++] = (char)('0' + lo);
+        if (hi <= 9 && o + 1 < cap) out[o++] = (char)('0' + hi);
+    }
+    out[o] = '\0';
+}
+
 static void extract_ula_subdata(map_session_t *s,
                                 const uint8_t *body, size_t body_len)
 {
+    s->n_ula_apns = 0;
+    s->ula_default_context_id = 0;
+    s->ula_apn[0] = '\0';
+    s->ula_ambr_ul_bps = 0;
+    s->ula_ambr_dl_bps = 0;
+    s->msisdn_str[0] = '\0';
+
+    diameter_avp_t msisdn_avp;
+    if (diameter_avp_find_recursive(body, body_len, AVP_3GPP_MSISDN,
+                                    DIAMETER_VENDOR_3GPP, &msisdn_avp) == 0)
+        decode_ula_msisdn(msisdn_avp.data, msisdn_avp.data_len,
+                          s->msisdn_str, sizeof(s->msisdn_str));
+
     diameter_avp_t sd;
     if (diameter_avp_find(body, body_len, AVP_3GPP_SUBSCRIPTION_DATA,
                           DIAMETER_VENDOR_3GPP, &sd) < 0) {
-        LOGD("map", "ULA imsi=%s: no Subscription-Data (Skip-Subscriber-Data path)",
-             s->imsi_str);
+        if (s->msisdn_str[0]) {
+            s->have_ula_subdata = true;
+            LOGI("map", "ULA imsi=%s msisdn=%s (no Subscription-Data AVP)",
+                 s->imsi_str, s->msisdn_str);
+        } else {
+            LOGW("map", "ULA imsi=%s: no Subscription-Data and no MSISDN "
+                 "(check Open5GS subscriber msisdn[] in MongoDB)",
+                 s->imsi_str);
+        }
         return;
     }
-    diameter_avp_t a;
-    if (diameter_avp_find(sd.data, sd.data_len, AVP_3GPP_MSISDN,
-                          DIAMETER_VENDOR_3GPP, &a) == 0) {
-        size_t n = a.data_len > sizeof(s->msisdn_str) - 1
-                       ? sizeof(s->msisdn_str) - 1 : a.data_len;
-        /* MSISDN AVP is TBCD; convert to digits. */
-        char tmp[24];
-        size_t o = 0;
-        for (size_t i = 0; i < n && o + 2 < sizeof(tmp); i++) {
-            uint8_t lo = a.data[i] & 0x0f;
-            uint8_t hi = (a.data[i] >> 4) & 0x0f;
-            if (lo <= 9) tmp[o++] = (char)('0' + lo);
-            if (hi <= 9) tmp[o++] = (char)('0' + hi);
-        }
-        tmp[o] = '\0';
-        memcpy(s->msisdn_str, tmp, sizeof(s->msisdn_str));
-        s->msisdn_str[sizeof(s->msisdn_str) - 1] = '\0';
-    }
 
-    /* APN-Configuration-Profile -> APN-Configuration[0] -> Service-Selection + AMBR. */
+    s->have_ula_subdata = true;
+
+    /* CS GSUP: MSISDN only toward MSC; skip GPRS APN walk. */
+    const bool want_apn =
+        !(s->gsup_originated && s->gsup_cn_domain == GSUP_CN_DOMAIN_CS);
+
+    /* APN-Configuration-Profile → all APN-Configuration (1430) children. */
     diameter_avp_t apnp;
-    if (diameter_avp_find(sd.data, sd.data_len,
+    if (want_apn &&
+        diameter_avp_find(sd.data, sd.data_len,
                           AVP_3GPP_APN_CONFIGURATION_PROFILE,
                           DIAMETER_VENDOR_3GPP, &apnp) == 0) {
-        diameter_avp_t apnc;
-        if (diameter_avp_find(apnp.data, apnp.data_len,
-                              AVP_3GPP_APN_CONFIGURATION,
-                              DIAMETER_VENDOR_3GPP, &apnc) == 0) {
-            diameter_avp_t ss;
-            if (diameter_avp_find(apnc.data, apnc.data_len,
-                                  AVP_3GPP_SERVICE_SELECTION, 0, &ss) == 0) {
-                size_t n = ss.data_len > sizeof(s->ula_apn) - 1
-                               ? sizeof(s->ula_apn) - 1 : ss.data_len;
-                memcpy(s->ula_apn, ss.data, n);
-                s->ula_apn[n] = '\0';
-            }
-            diameter_avp_t ambr;
-            if (diameter_avp_find(apnc.data, apnc.data_len,
-                                  AVP_3GPP_AMBR,
-                                  DIAMETER_VENDOR_3GPP, &ambr) == 0) {
-                diameter_avp_t ul, dl;
-                if (diameter_avp_find(ambr.data, ambr.data_len,
-                                      AVP_3GPP_MAX_REQUESTED_BANDWIDTH_UL,
-                                      DIAMETER_VENDOR_3GPP, &ul) == 0 &&
-                    ul.data_len == 4) {
-                    s->ula_ambr_ul_bps =
-                        ((uint64_t)ul.data[0] << 24) | ((uint64_t)ul.data[1] << 16) |
-                        ((uint64_t)ul.data[2] << 8)  |  (uint64_t)ul.data[3];
+        diameter_avp_t it;
+        if (diameter_avp_first(apnp.data, apnp.data_len, &it) == 0) {
+            for (;;) {
+                if (it.code == AVP_3GPP_CONTEXT_IDENTIFIER &&
+                    it.vendor_id == DIAMETER_VENDOR_3GPP &&
+                    it.data_len >= 4 && !s->ula_default_context_id) {
+                    s->ula_default_context_id = (uint8_t)iwf_be32(it.data);
+                } else if (it.code == AVP_3GPP_APN_CONFIGURATION &&
+                           it.vendor_id == DIAMETER_VENDOR_3GPP) {
+                    (void)ula_add_apn_entry(s, &it);
                 }
-                if (diameter_avp_find(ambr.data, ambr.data_len,
-                                      AVP_3GPP_MAX_REQUESTED_BANDWIDTH_DL,
-                                      DIAMETER_VENDOR_3GPP, &dl) == 0 &&
-                    dl.data_len == 4) {
-                    s->ula_ambr_dl_bps =
-                        ((uint64_t)dl.data[0] << 24) | ((uint64_t)dl.data[1] << 16) |
-                        ((uint64_t)dl.data[2] << 8)  |  (uint64_t)dl.data[3];
-                }
+                if (diameter_avp_next(apnp.data, apnp.data_len, &it) < 0)
+                    break;
             }
         }
     }
-    s->have_ula_subdata = true;
-    LOGI("map", "ULA imsi=%s msisdn=%s apn=%s ambr=%lu/%lu bps",
-         s->imsi_str,
-         s->msisdn_str[0] ? s->msisdn_str : "(none)",
-         s->ula_apn[0]   ? s->ula_apn   : "(none)",
-         (unsigned long)s->ula_ambr_ul_bps,
-         (unsigned long)s->ula_ambr_dl_bps);
+
+    if (s->n_ula_apns > 0) {
+        map_ula_apn_entry_t *def = &s->ula_apns[0];
+        if (s->ula_default_context_id) {
+            for (uint8_t i = 0; i < s->n_ula_apns; i++) {
+                if (s->ula_apns[i].context_id == s->ula_default_context_id) {
+                    def = &s->ula_apns[i];
+                    break;
+                }
+            }
+        }
+        snprintf(s->ula_apn, sizeof(s->ula_apn), "%s", def->apn);
+        s->ula_ambr_ul_bps = (uint64_t)def->ambr_ul_kbps * 1000ull;
+        s->ula_ambr_dl_bps = (uint64_t)def->ambr_dl_kbps * 1000ull;
+    }
+
+    if (s->n_ula_apns <= 1) {
+        LOGI("map", "ULA imsi=%s msisdn=%s apn=%s ambr=%lu/%lu bps",
+             s->imsi_str,
+             s->msisdn_str[0] ? s->msisdn_str : "(none)",
+             s->ula_apn[0]   ? s->ula_apn   : "(none)",
+             (unsigned long)s->ula_ambr_ul_bps,
+             (unsigned long)s->ula_ambr_dl_bps);
+    } else {
+        LOGI("map", "ULA imsi=%s msisdn=%s apns=%u default_ctx=%u ambr=%lu/%lu bps",
+             s->imsi_str,
+             s->msisdn_str[0] ? s->msisdn_str : "(none)",
+             (unsigned)s->n_ula_apns,
+             (unsigned)s->ula_default_context_id,
+             (unsigned long)s->ula_ambr_ul_bps,
+             (unsigned long)s->ula_ambr_dl_bps);
+        for (uint8_t i = 0; i < s->n_ula_apns; i++) {
+            LOGI("map", "  ULA APN[%u] ctx=%u apn=%s pdp=0x%02x",
+                 (unsigned)i,
+                 (unsigned)s->ula_apns[i].context_id,
+                 s->ula_apns[i].apn,
+                 (unsigned)s->ula_apns[i].pdn_type_nr);
+        }
+    }
 }
 
 /* For UGL we send an ISD invoke FIRST (separate TCAP dialogue), then once
@@ -656,11 +786,28 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent);
 void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
                     const uint8_t *body, size_t body_len)
 {
+    if (s->gsup_originated) {
+#ifdef GSUP_PROXY_ENABLED
+        extract_ula_subdata(s, body, body_len);
+        bool need_isd = false;
+        if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS)
+            need_isd = s->msisdn_str[0] != '\0';
+        else
+            need_isd = s->msisdn_str[0] != '\0' || s->n_ula_apns > 0;
+        if (s->have_ula_subdata && need_isd) {
+            if (gsup_map_proxy_send_isd(rt, s) < 0)
+                gsup_map_proxy_finish_ugl(rt, s);
+        } else {
+            gsup_map_proxy_finish_ugl(rt, s);
+        }
+#endif
+        return;
+    }
     extract_ula_subdata(s, body, body_len);
 
     /* If we have any subscription data, push ISD first (then UGL Resp on
      * its ack).  Otherwise send the UGL ReturnResult immediately. */
-    if (s->have_ula_subdata && (s->msisdn_str[0] || s->ula_apn[0])) {
+    if (s->have_ula_subdata && (s->msisdn_str[0] || s->n_ula_apns > 0)) {
         send_isd_invoke(rt, s);
         return;
     }
@@ -694,9 +841,9 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
     uint8_t arg[1024];
     int an = map_encode_isd_arg(parent->imsi_str,
                                 parent->msisdn_str,
-                                parent->ula_apn,
-                                parent->ula_ambr_ul_bps,
-                                parent->ula_ambr_dl_bps,
+                                parent->ula_apns,
+                                parent->n_ula_apns,
+                                parent->ula_default_context_id,
                                 arg, sizeof(arg));
     if (an < 0) { map_sess_remove(isd); return; }
 
@@ -728,8 +875,9 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
         return;
     }
     rt->map->stat_map_tx++;
-    LOGI("map", "TX BEGIN ISD imsi=%s tid=0x%08x (UGL parent tid=0x%08x)",
-         parent->imsi_str, isd->tcap_dialogue_id, parent->tcap_dialogue_id);
+    LOGI("map", "TX BEGIN ISD imsi=%s tid=0x%08x apns=%u (UGL parent tid=0x%08x)",
+         parent->imsi_str, isd->tcap_dialogue_id,
+         (unsigned)parent->n_ula_apns, parent->tcap_dialogue_id);
 
     /* Now also send the UGL ReturnResult on the parent dialogue. */
     static const uint8_t fake_hlr[1] = { 0x00 };
@@ -742,6 +890,89 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
     send_tcap_end_with_result(rt, parent, 1,
                               MAP_OP_CODE_UPDATE_GPRS_LOCATION,
                               params, (size_t)pn);
+}
+
+static int send_map_cl_begin(struct iwf_runtime *rt, const char *imsi,
+                             uint8_t cancellation_type)
+{
+    if (!ss7_link_is_active(rt)) return -1;
+
+    uint8_t imsi_bcd[MAP_IMSI_BCD_MAX];
+    int bl = map_str_to_bcd(imsi, imsi_bcd, sizeof(imsi_bcd));
+    if (bl < 0) return -1;
+
+    uint8_t arg[64];
+    int an = map_encode_cl_arg(imsi_bcd, (size_t)bl, cancellation_type,
+                               arg, sizeof(arg));
+    if (an < 0) return -1;
+
+    uint32_t tid = map_sess_new_tid();
+    uint8_t cmp[512];
+    size_t co = 0;
+    if (tcap_enc_invoke(cmp, sizeof(cmp), &co, 1,
+                        MAP_OP_CODE_CANCEL_LOCATION, arg, (size_t)an) < 0)
+        return -1;
+
+    uint8_t dlg[128];
+    int dn = map_encode_aarq(MAP_AC_GPRS_LOCATION_CANCEL_V3, dlg, sizeof(dlg));
+    if (dn < 0) return -1;
+
+    uint8_t out[1024];
+    int n = tcap_encode_message(TCAP_MSG_BEGIN, tid, true,
+                                0, false,
+                                dlg, (size_t)dn,
+                                cmp, co,
+                                out, sizeof(out));
+    if (n < 0) return -1;
+
+    ss7_sccp_addr_t called = {0};
+    called.ssn = SS7_SSN_SGSN;
+    if (ss7_link_send_tcap(rt, &called, out, (size_t)n) < 0)
+        return -1;
+
+    rt->map->stat_map_tx++;
+    LOGI("map", "TX BEGIN CL imsi=%s tid=0x%08x type=%u (HSS CLR)",
+         imsi, tid, (unsigned)cancellation_type);
+    return 0;
+}
+
+void map_iwf_on_clr(struct iwf_runtime *rt,
+                    const uint8_t *body, size_t body_len,
+                    uint32_t hop_by_hop, uint32_t end_to_end)
+{
+    char sid[DIAMETER_SESSION_ID_MAX];
+    char imsi[MAP_IMSI_STR_MAX];
+    uint32_t cancel_type = 0;
+    bool forwarded = false;
+
+    sid[0] = '\0';
+    (void)diameter_get_session_id(body, body_len, sid, sizeof(sid));
+
+    if (diameter_get_user_name(body, body_len, imsi, sizeof(imsi)) < 0) {
+        LOGW("map", "CLR: missing User-Name");
+        (void)diameter_send_cla_answer(rt, hop_by_hop, end_to_end, sid,
+                                       DIAM_RC_UNABLE_TO_DELIVER);
+        return;
+    }
+
+    (void)diameter_get_uint32_avp(body, body_len, AVP_3GPP_CANCELLATION_TYPE,
+                                  DIAMETER_VENDOR_3GPP, &cancel_type);
+
+    LOGI("map", "RX CLR imsi=%s cancel_type=%u sid=%s",
+         imsi, (unsigned)cancel_type, sid[0] ? sid : "-");
+
+#ifdef GSUP_PROXY_ENABLED
+    if (gsup_map_proxy_hss_clr(rt, imsi, (uint8_t)cancel_type))
+        forwarded = true;
+#endif
+    if (!forwarded && send_map_cl_begin(rt, imsi, (uint8_t)cancel_type) == 0)
+        forwarded = true;
+
+    if (!forwarded)
+        LOGW("map", "CLR: no GSUP/MAP downstream for imsi=%s", imsi);
+
+    (void)diameter_send_cla_answer(rt, hop_by_hop, end_to_end, sid,
+                                   DIAM_RC_SUCCESS);
 }
 
 void map_iwf_on_cla(struct iwf_runtime *rt, map_session_t *s,
@@ -772,6 +1003,12 @@ void map_iwf_on_pua(struct iwf_runtime *rt, map_session_t *s,
 void map_iwf_diameter_error(struct iwf_runtime *rt, map_session_t *s,
                             uint32_t rc)
 {
+    if (s->gsup_originated) {
+#ifdef GSUP_PROXY_ENABLED
+        gsup_map_proxy_diameter_error(rt, s, rc);
+#endif
+        return;
+    }
     LOGW("map", "Diameter error rc=%u imsi=%s op=%s; sending MAP SystemFailure",
          (unsigned)rc, s->imsi_str, map_op_str(s->map_op));
     if (s->cmd_test) {
@@ -814,8 +1051,11 @@ void map_iwf_on_ttimer_tick(struct iwf_runtime *rt)
     uint64_t exp;
     ssize_t r = read(rt->map->t_timer_fd, &exp, sizeof(exp));
     (void)r;
-    int killed = map_sess_sweep(time(NULL), map_sess_timeout_hook_cmd, NULL);
+    int killed = map_sess_sweep(time(NULL), map_sess_timeout_hook_cmd, rt);
     if (killed) rt->map->stat_timeouts += (uint64_t)killed;
+#ifdef GSUP_PROXY_ENABLED
+    gsup_map_proxy_sweep(rt, time(NULL));
+#endif
 }
 
 int map_iwf_init(struct iwf_runtime *rt, int epfd)
@@ -977,10 +1217,8 @@ int map_iwf_cmd_test_sai(struct iwf_runtime *rt,
     strncpy(s->imsi_str, imsi_digits, sizeof(s->imsi_str) - 1);
     s->imsi_str[sizeof(s->imsi_str) - 1] = '\0';
 
-    if (s->imsi_bcd_len >= 3) {
-        memcpy(s->visited_plmn_bcd, s->imsi_bcd, 3);
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
-    }
 
     s->cmd_test = true;
     s->cmd_test_reply_fd = reply_unix_fd;

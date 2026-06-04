@@ -51,7 +51,17 @@ typedef enum {
 #define MAP_MSISDN_STR_MAX      24
 #define DIAMETER_SESSION_ID_MAX 128
 #define MAP_APN_MAX             64
+#define MAP_MAX_ULA_APN         8      /* PyHSS apn_list practical max */
 #define MAP_AUTH_VECTOR_MAX     5      /* TS 29.272 max for AIA */
+
+/* One subscribed APN extracted from ULA Subscription-Data. */
+typedef struct {
+    char        apn[MAP_APN_MAX];
+    uint8_t     context_id;             /* 1..255, matches PyHSS context-Id */
+    uint8_t     pdn_type_nr;            /* 0x21 v4, 0x57 v6, 0x8d v4v6; 0=default v4 */
+    uint32_t    ambr_ul_kbps;
+    uint32_t    ambr_dl_kbps;
+} map_ula_apn_entry_t;
 
 /* One authentication vector parsed out of AIA, kept verbatim for repacking
  * into the MAP SAI response. Sizes are fixed by 3GPP. */
@@ -102,8 +112,11 @@ typedef struct map_session {
 
     /* For UGL: subscription data extracted from ULA - copied into the
      * subsequent MAP InsertSubscriberData invoke toward the SGSN. */
-    char                ula_apn[MAP_APN_MAX];
-    uint64_t            ula_ambr_ul_bps;
+    map_ula_apn_entry_t ula_apns[MAP_MAX_ULA_APN];
+    uint8_t             n_ula_apns;
+    uint8_t             ula_default_context_id; /* profile defaultContext */
+    char                ula_apn[MAP_APN_MAX];   /* default/first APN (logs) */
+    uint64_t            ula_ambr_ul_bps;        /* default APN AMBR (logs) */
     uint64_t            ula_ambr_dl_bps;
     bool                have_ula_subdata;
 
@@ -120,6 +133,13 @@ typedef struct map_session {
     bool                cmd_test;
     int                 cmd_test_reply_fd;
 
+    /* GSUP proxy: osmo-sgsn/msc originated auth/UL via TCP GSUP (not MAP). */
+    bool                gsup_originated;
+    int                 gsup_conn_id;           /* gsup_server connection slot  */
+    uint8_t             gsup_req_type;          /* original GSUP message type   */
+    uint8_t             gsup_cn_domain;         /* GSUP_CN_DOMAIN_PS or _CS      */
+    uint8_t             gsup_num_vectors;       /* SAI: vectors requested       */
+
     UT_hash_handle      hh_tid;                 /* indexed by tcap_dialogue_id */
     UT_hash_handle      hh_sid;                 /* indexed by diameter_session_id */
 } map_session_t;
@@ -132,6 +152,9 @@ void            map_sess_remove(map_session_t *s);
 
 map_session_t  *map_sess_find_by_tid(uint32_t tid);
 map_session_t  *map_sess_find_by_diameter_sid(const char *sid);
+
+/* GSUP proxy: pending UL/SAI session awaiting SGSN ISD ack (by IMSI). */
+map_session_t  *map_sess_find_gsup_pending(const char *imsi, map_op_t op);
 
 /* Insert into the Session-Id index. Caller must populate
  * s->diameter_session_id (NUL-terminated) before invoking. */

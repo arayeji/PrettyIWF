@@ -41,6 +41,8 @@ typedef struct {
     int                  watchdog_timerfd;         /* periodic DWR              */
     time_t               last_rx_at;
     time_t               last_dwr_at;
+    time_t               cer_sent_at;            /* CER sent, awaiting CEA       */
+    time_t               reconnect_not_before;   /* earliest retry after failure */
 
     /* Per-process identifiers (RFC 6733 §5.3 / §6.6). */
     uint32_t             origin_state_id;

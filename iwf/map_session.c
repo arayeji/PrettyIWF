@@ -110,6 +110,19 @@ map_session_t *map_sess_find_by_diameter_sid(const char *sid)
     return NULL;
 }
 
+map_session_t *map_sess_find_gsup_pending(const char *imsi, map_op_t op)
+{
+    if (!imsi || !imsi[0]) return NULL;
+    map_session_t *s, *tmp;
+    HASH_ITER(hh_tid, g_by_tid, s, tmp) {
+        if (s->gsup_originated && s->map_op == op &&
+            s->state == MAP_SESS_WAIT_MAP_ACK &&
+            strcmp(s->imsi_str, imsi) == 0)
+            return s;
+    }
+    return NULL;
+}
+
 void map_sess_index_by_sid(map_session_t *s)
 {
     if (!s || !s->diameter_session_id[0]) return;

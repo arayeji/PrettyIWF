@@ -91,6 +91,7 @@ static uint8_t  g_rx[GSUP_RX_CAP];
 static size_t   g_rx_used    = 0;
 static unsigned g_backoff_s  = 1;
 static void   (*g_cb)(uint32_t, int, const char *) = NULL;
+static void   (*g_auth_relay_cb)(const uint8_t *gsup, size_t len) = NULL;
 
 /* ------------------------------------------------------------------ */
 
@@ -276,10 +277,26 @@ static int gsup_enc_ie(uint8_t *buf, size_t cap, size_t *off,
     return 0;
 }
 
+/* Auth-relay message types (from osmocom GSUP spec) */
+#define GSUP_MSG_SAI_RES  0x0a
+#define GSUP_MSG_SAI_ERR  0x09
+#define GSUP_MSG_UL_RES   0x06
+#define GSUP_MSG_UL_ERR   0x05
+
 static void gsup_dispatch_msg(const uint8_t *body, size_t blen, uint32_t corr_id)
 {
-    if (!g_cb || blen < 1) return;
+    if (blen < 1) return;
     uint8_t mtype = body[0];
+
+    /* Auth relay: forward ALL non-SMS GSUP messages from PyHSS to SGSN/MSC.
+     * This covers SAI_RES, UL_RES, ISD_REQ and any other GSUP flow. */
+    if (g_auth_relay_cb &&
+        mtype != GSUP_MSG_SRI_SM_REQ && mtype != GSUP_MSG_SRI_SM_RES && mtype != GSUP_MSG_SRI_SM_ERR) {
+        g_auth_relay_cb(body, blen);
+        return;
+    }
+
+    if (!g_cb) return;
     if (mtype == GSUP_MSG_SRI_SM_ERR) {
         g_cb(corr_id, -1, NULL);
         return;
@@ -434,6 +451,30 @@ int gsup_client_send_sri_sm_req(const char *msisdn, uint32_t corr_id)
     }
     LOGD("gsup", "sent SRI-SM-REQ msisdn=%s", msisdn);
     return 0;
+}
+
+int gsup_client_send_raw(const uint8_t *gsup, size_t len)
+{
+    if (g_fd < 0 || !gsup || !len) return -1;
+    uint8_t frame[2048];
+    uint16_t ipa_len = (uint16_t)(1 + len);
+    frame[0] = (uint8_t)(ipa_len >> 8);
+    frame[1] = (uint8_t)(ipa_len & 0xff);
+    frame[2] = IPA_PROTO_OSMO;
+    frame[3] = IPA_EXT_GSUP;
+    if (len > sizeof(frame) - 4) return -1;
+    memcpy(frame + 4, gsup, len);
+    ssize_t w = write(g_fd, frame, 4 + len);
+    if (w < 0) {
+        LOGE("gsup", "gsup_client_send_raw: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+void gsup_client_set_auth_relay_cb(void (*cb)(const uint8_t *gsup, size_t len))
+{
+    g_auth_relay_cb = cb;
 }
 
 int gsup_client_init(const char *remote_ip, uint16_t remote_port,

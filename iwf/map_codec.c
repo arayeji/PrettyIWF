@@ -99,6 +99,12 @@ int map_plmn_pack(uint16_t mcc, uint16_t mnc, uint8_t out[3])
     return 0;
 }
 
+int map_plmn_pack_home(const char *mnc_digits, uint8_t out[3])
+{
+    if (!mnc_digits || !out) return -1;
+    return map_plmn_pack(432, (uint16_t)atoi(mnc_digits), out);
+}
+
 int map_plmn_unpack(const uint8_t in[3], uint16_t *mcc, uint16_t *mnc)
 {
     uint8_t mcc1 =  in[0]       & 0x0f;
@@ -288,6 +294,185 @@ int map_decode_purge_arg(const uint8_t *p, size_t n, map_purge_req_t *out)
     return out->imsi_bcd_len ? 0 : -1;
 }
 
+int map_encode_sai_arg(const char *imsi_str, uint8_t num_vectors,
+                       uint8_t *out, size_t out_cap)
+{
+    if (!imsi_str || !out) return -1;
+    uint8_t imsi_bcd[8];
+    int bl = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
+    if (bl < 0) return -1;
+    if (num_vectors < 1) num_vectors = 3;
+    if (num_vectors > 5) num_vectors = 5;
+
+    uint8_t inner[64];
+    size_t io = 0;
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x80, imsi_bcd, (size_t)bl) < 0)
+        return -1;
+    uint8_t nv[1] = { num_vectors };
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x82, nv, 1) < 0) return -1;
+    /* requestingNodeType = sgsn (1) */
+    uint8_t rnt[1] = { 1 };
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x85, rnt, 1) < 0) return -1;
+
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x30, inner, io) < 0) return -1;
+    return (int)off;
+}
+
+static int dec_quintuplet(const uint8_t *p, size_t n, map_auth_vector_t *v)
+{
+    if (!p || !v) return -1;
+    memset(v, 0, sizeof(*v));
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && p[0] == 0x30) {
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    }
+    size_t off = 0;
+    int idx = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *val;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &val, &l) < 0) return -1;
+        if (tag != 0x04) continue;
+        if (idx == 0 && l >= 16) {
+            memcpy(v->rand, val, 16);
+        } else if (idx == 1 && l >= 4) {
+            size_t n = l > 16 ? 16 : l;
+            memcpy(v->xres, val, n);
+            v->xres_len = (uint8_t)n;
+        } else if (idx == 2 && l >= 16) {
+            memcpy(v->ck, val, 16);
+        } else if (idx == 3 && l >= 16) {
+            memcpy(v->ik, val, 16);
+        } else if (idx == 4 && l >= 16) {
+            memcpy(v->autn, val, 16);
+            v->have_quintuplet = true;
+        }
+        idx++;
+    }
+    return v->have_quintuplet ? 0 : -1;
+}
+
+static int dec_triplet(const uint8_t *p, size_t n, map_auth_vector_t *v)
+{
+    if (!p || !v) return -1;
+    memset(v, 0, sizeof(*v));
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && p[0] == 0x30) {
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    }
+    size_t off = 0;
+    int idx = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *val;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &val, &l) < 0) return -1;
+        if (tag != 0x04) continue;
+        if (idx == 0 && l >= 16) memcpy(v->rand, val, 16);
+        else if (idx == 1 && l >= 4) memcpy(v->sres, val, 4);
+        else if (idx == 2 && l >= 8) {
+            memcpy(v->kc, val, 8);
+            v->have_triplet = true;
+        }
+        idx++;
+    }
+    return v->have_triplet ? 0 : -1;
+}
+
+int map_decode_sai_res(const uint8_t *p, size_t n,
+                       map_auth_vector_t *vec, size_t vec_cap, size_t *n_vec)
+{
+    if (!p || !vec || !n_vec) return -1;
+    *n_vec = 0;
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && p[0] == 0x30) {
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    }
+    const uint8_t *list = NULL;
+    size_t list_len = 0;
+    size_t off = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *v;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &v, &l) < 0) break;
+        if (tag == 0xA0 || tag == 0xA1) {
+            list = v;
+            list_len = l;
+            break;
+        }
+    }
+    if (!list || !list_len) return -1;
+
+    off = 0;
+    while (off < list_len && *n_vec < vec_cap) {
+        uint8_t tag;
+        const uint8_t *val;
+        size_t l;
+        if (ber_dec_tlv(list, list_len, &off, &tag, &val, &l) < 0) break;
+        if (tag != 0x30) continue;
+        map_auth_vector_t *v = &vec[*n_vec];
+        if (dec_quintuplet(val, l, v) == 0 ||
+            dec_triplet(val, l, v) == 0) {
+            (*n_vec)++;
+        }
+    }
+    return *n_vec > 0 ? 0 : -1;
+}
+
+int map_encode_ugl_arg(const char *imsi_str,
+                       const uint8_t *sgsn_number_bcd, size_t sgsn_num_len,
+                       const uint8_t *sgsn_addr, size_t sgsn_addr_len,
+                       uint8_t *out, size_t out_cap)
+{
+    if (!imsi_str || !out) return -1;
+    uint8_t imsi_bcd[8];
+    int bl = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
+    if (bl < 0) return -1;
+
+    uint8_t inner[128];
+    size_t io = 0;
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x04, imsi_bcd, (size_t)bl) < 0)
+        return -1;
+    if (sgsn_number_bcd && sgsn_num_len)
+        if (ber_enc_tlv(inner, sizeof(inner), &io, 0x04,
+                        sgsn_number_bcd, sgsn_num_len) < 0) return -1;
+    if (sgsn_addr && sgsn_addr_len)
+        if (ber_enc_tlv(inner, sizeof(inner), &io, 0x04,
+                        sgsn_addr, sgsn_addr_len) < 0) return -1;
+
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x30, inner, io) < 0) return -1;
+    return (int)off;
+}
+
+int map_decode_ugl_res(const uint8_t *p, size_t n,
+                       uint8_t *hlr_bcd, size_t hlr_cap, size_t *hlr_len)
+{
+    if (!p || !hlr_len) return -1;
+    *hlr_len = 0;
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && p[0] == 0x30) {
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    }
+    const uint8_t *v;
+    size_t l;
+    if (find_tlv(body, blen, 0x04, &v, &l) != 0)
+        return 0; /* empty hlr-Number is acceptable */
+    if (hlr_bcd && hlr_cap) {
+        if (l > hlr_cap) l = hlr_cap;
+        memcpy(hlr_bcd, v, l);
+        *hlr_len = l;
+    }
+    return 0;
+}
+
 /* ====================================================================== */
 /* Encoders                                                               */
 /* ====================================================================== */
@@ -384,21 +569,22 @@ int map_encode_ugl_res(const uint8_t *hlr_number_bcd, size_t hlr_len,
 
 int map_encode_isd_arg(const char *imsi_str,
                        const char *msisdn_str,
-                       const char *apn,
-                       uint64_t ambr_ul_bps,
-                       uint64_t ambr_dl_bps,
+                       const map_ula_apn_entry_t *apns,
+                       size_t n_apns,
+                       uint8_t default_context_id,
                        uint8_t *out, size_t out_cap)
 {
     /* InsertSubscriberDataArg ::= SEQUENCE {
      *   imsi                       IMSI                     OPTIONAL,
      *   msisdn                     ISDN-AddressString       OPTIONAL,
      *   ...
-     *   apn-Configuration-Profile  [9] APN-Configuration-Profile OPTIONAL,
+     *   gprsSubscriptionData       [16] GPRSSubscriptionData OPTIONAL,
      *   ... }
      *
-     * We construct just IMSI + MSISDN + a single APN entry with AMBR.  This
-     * matches what the SGSN expects to populate the PDP context.            */
-    uint8_t inner[1024];
+     * GPRSSubscriptionData carries a gprsDataList of PDP-Context entries
+     * (one per subscribed APN).  This is what osmo-sgsn expects on Gr for
+     * Activate-PDP APN authorization (TS 29.002 §17.7.1).                */
+    uint8_t inner[4096];
     size_t io = 0;
 
     if (imsi_str && *imsi_str) {
@@ -409,8 +595,6 @@ int map_encode_isd_arg(const char *imsi_str,
                 return -1;
     }
     if (msisdn_str && *msisdn_str) {
-        /* ISDN-AddressString = octet[0]: NoA (0x91 = international, ISDN/E.164),
-         * followed by BCD digits. */
         uint8_t buf[12];
         buf[0] = 0x91;
         int n = map_str_to_bcd(msisdn_str, buf + 1, sizeof(buf) - 1);
@@ -418,45 +602,91 @@ int map_encode_isd_arg(const char *imsi_str,
             if (ber_enc_tlv(inner, sizeof(inner), &io, 0x04, buf, (size_t)(n + 1)) < 0)
                 return -1;
     }
-    /* APN configuration (we encode at most one). Tagged [9] IMPLICIT. */
-    if (apn && *apn) {
-        uint8_t apn_seq[256];
-        size_t ao = 0;
-        /* context-Id [0] INTEGER */
-        if (ber_enc_integer_u32(apn_seq, sizeof(apn_seq), &ao, 0x80, 1) < 0) return -1;
-        /* PDN-Type [1] INTEGER (0=IPv4) */
-        if (ber_enc_integer_u32(apn_seq, sizeof(apn_seq), &ao, 0x81, 0) < 0) return -1;
-        /* APN [2] OCTET STRING - DNS-labels form (length-prefixed segments). */
-        uint8_t apn_dns[68];
-        size_t adns = 0;
-        const char *seg = apn;
-        while (*seg) {
-            const char *dot = strchr(seg, '.');
-            size_t segl = dot ? (size_t)(dot - seg) : strlen(seg);
-            if (adns + 1 + segl > sizeof(apn_dns)) break;
-            apn_dns[adns++] = (uint8_t)segl;
-            memcpy(apn_dns + adns, seg, segl);
-            adns += segl;
-            if (!dot) break;
-            seg = dot + 1;
-        }
-        if (ber_enc_tlv(apn_seq, sizeof(apn_seq), &ao, 0x82, apn_dns, adns) < 0)
-            return -1;
-        /* AMBR [3] SEQUENCE { ul, dl } */
-        if (ambr_ul_bps || ambr_dl_bps) {
-            uint8_t ambr[32];
-            size_t mo = 0;
-            uint32_t ul_kbps = (uint32_t)(ambr_ul_bps / 1000);
-            uint32_t dl_kbps = (uint32_t)(ambr_dl_bps / 1000);
-            if (ber_enc_integer_u32(ambr, sizeof(ambr), &mo, 0x80, ul_kbps) < 0) return -1;
-            if (ber_enc_integer_u32(ambr, sizeof(ambr), &mo, 0x81, dl_kbps) < 0) return -1;
-            if (ber_enc_tlv(apn_seq, sizeof(apn_seq), &ao, 0xA3, ambr, mo) < 0)
+
+    if (apns && n_apns > 0) {
+        /* Rel-99 QoS-Subscribed default (osmocom-compatible). */
+        static const uint8_t default_qos[] = {
+            0x57, 0x59, 0x96, 0x6C, 0x62, 0x76, 0x86, 0x60,
+            0x40, 0x80, 0x00, 0x00, 0x60, 0x40, 0x80, 0x00, 0x00,
+        };
+        uint8_t gprs_list[3072];
+        size_t gl = 0;
+
+        for (size_t i = 0; i < n_apns; i++) {
+            const map_ula_apn_entry_t *e = &apns[i];
+            if (!e->apn[0])
+                continue;
+
+            uint8_t pdp[384];
+            size_t po = 0;
+            uint8_t ctx = e->context_id ? e->context_id : (uint8_t)(i + 1);
+
+            if (ber_enc_integer_u32(pdp, sizeof(pdp), &po, 0x02, ctx) < 0)
+                return -1;
+
+            uint8_t pdp_type[2] = { 0xF1, 0x21 };
+            if (e->pdn_type_nr == 0x57)
+                pdp_type[1] = 0x57;
+            else if (e->pdn_type_nr == 0x8d)
+                pdp_type[1] = 0x8d;
+            if (ber_enc_tlv(pdp, sizeof(pdp), &po, 0xB0 /* [16] pdp-Type */,
+                            pdp_type, sizeof(pdp_type)) < 0)
+                return -1;
+
+            if (ber_enc_tlv(pdp, sizeof(pdp), &po, 0x92 /* [18] qos-Subscribed */,
+                            default_qos, sizeof(default_qos)) < 0)
+                return -1;
+
+            uint8_t apn_wire[68];
+            size_t awi = 0;
+            const char *seg = e->apn;
+            while (*seg && awi + 2 < sizeof(apn_wire)) {
+                const char *dot = strchr(seg, '.');
+                size_t lab = dot ? (size_t)(dot - seg) : strlen(seg);
+                if (lab == 0 || lab > 63 || awi + 1 + lab > sizeof(apn_wire))
+                    break;
+                apn_wire[awi++] = (uint8_t)lab;
+                memcpy(apn_wire + awi, seg, lab);
+                awi += lab;
+                if (!dot)
+                    break;
+                seg = dot + 1;
+            }
+            if (awi < 2)
+                continue;
+            if (ber_enc_tlv(pdp, sizeof(pdp), &po, 0x94 /* [20] apn */,
+                            apn_wire, awi) < 0)
+                return -1;
+
+            if (ber_enc_tlv(gprs_list, sizeof(gprs_list), &gl,
+                            0x30 /* PDP-Context */, pdp, po) < 0)
                 return -1;
         }
-        if (ber_enc_tlv(inner, sizeof(inner), &io, 0xA9 /* [9] */, apn_seq, ao) < 0)
+
+        if (gl == 0)
+            goto done;
+
+        uint8_t gprs_sub[3200];
+        size_t gs = 0;
+
+        /* completeDataListIncluded [0] NULL — replace full PDP list. */
+        if (ber_enc_tlv(gprs_sub, sizeof(gprs_sub), &gs, 0x80, NULL, 0) < 0)
+            return -1;
+
+        /* gprsDataList [1] IMPLICIT SEQUENCE OF PDP-Context */
+        if (ber_enc_tlv(gprs_sub, sizeof(gprs_sub), &gs, 0xA1,
+                        gprs_list, gl) < 0)
+            return -1;
+
+        (void)default_context_id;
+
+        /* gprsSubscriptionData [16] IMPLICIT GPRSSubscriptionData */
+        if (ber_enc_tlv(inner, sizeof(inner), &io, 0xB0,
+                        gprs_sub, gs) < 0)
             return -1;
     }
 
+done:
     size_t off = 0;
     if (ber_enc_tlv(out, out_cap, &off, 0x30, inner, io) < 0) return -1;
     return (int)off;
