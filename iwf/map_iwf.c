@@ -662,8 +662,13 @@ static void decode_ula_msisdn(const uint8_t *data, size_t n, char *out, size_t c
     out[0] = '\0';
     if (!data || n == 0) return;
 
+    /* TS 29.329 MSISDN AVP: optional leading TON/NPI (e.g. 0x91), not digits. */
+    size_t start = 0;
+    if (n > 0 && (data[0] & 0x0f) == 0x01) /* ISDN numbering plan */
+        start = 1;
+
     size_t o = 0;
-    for (size_t i = 0; i < n && o + 1 < cap; i++) {
+    for (size_t i = start; i < n && o + 1 < cap; i++) {
         uint8_t lo = data[i] & 0x0f;
         uint8_t hi = (data[i] >> 4) & 0x0f;
         if (lo <= 9) out[o++] = (char)('0' + lo);
