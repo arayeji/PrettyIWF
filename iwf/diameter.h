@@ -100,6 +100,9 @@ struct map_session;
 #define AVP_3GPP_MSISDN                          701
 #define AVP_3GPP_APN_CONFIGURATION_PROFILE      1429
 #define AVP_3GPP_APN_CONFIGURATION              1430
+#define AVP_3GPP_CONTEXT_IDENTIFIER             1423
+#define AVP_3GPP_ALL_APN_CONFIGS_INCLUDED       1428
+#define AVP_3GPP_PDN_TYPE                       1456
 #define AVP_3GPP_SERVICE_SELECTION              493
 #define AVP_3GPP_AMBR                           1435
 #define AVP_3GPP_MAX_REQUESTED_BANDWIDTH_UL     516
@@ -177,6 +180,9 @@ int  diameter_avp_next (const uint8_t *buf, size_t len, diameter_avp_t *it);
 int  diameter_avp_find (const uint8_t *buf, size_t len,
                         uint32_t code, uint32_t vendor_id,
                         diameter_avp_t *out);
+int  diameter_avp_find_recursive(const uint8_t *buf, size_t len,
+                                 uint32_t code, uint32_t vendor_id,
+                                 diameter_avp_t *out);
 
 /* Convenience: extract Result-Code (or Experimental-Result-Code if present)
  * and the textual Session-Id from an answer body. */
@@ -184,5 +190,15 @@ int  diameter_get_result_code  (const uint8_t *body, size_t len,
                                 uint32_t *out_rc);
 int  diameter_get_session_id   (const uint8_t *body, size_t len,
                                 char *out, size_t out_cap);
+int  diameter_get_user_name    (const uint8_t *body, size_t len,
+                                char *out, size_t out_cap);
+int  diameter_get_uint32_avp   (const uint8_t *body, size_t len,
+                                uint32_t code, uint32_t vendor_id,
+                                uint32_t *out_val);
+
+/* Answer an inbound Cancel-Location-Request (HSS -> IWF). */
+int  diameter_send_cla_answer  (struct iwf_runtime *rt,
+                                uint32_t hop_by_hop, uint32_t end_to_end,
+                                const char *session_id, uint32_t result_code);
 
 #endif /* IWF_DIAMETER_H */

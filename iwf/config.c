@@ -38,12 +38,18 @@ static void defaults(iwf_config_t *c)
     c->map_t_dialogue_ms  = 10000;
     strncpy(c->stp_ip,   "127.0.0.1", sizeof(c->stp_ip)   - 1);
     c->stp_port           = 2905;
-    c->stp_routing_context = 1u;
+    /* Default 4 matches osmo-stp as-iwf routing-key 4 on THR1 (override in iwf.conf). */
+    c->stp_routing_context = 4u;
     c->diam_peer_port     = 3868;
     c->diam_watchdog_ms   = 30000;
     c->diam_request_timeout_ms = 10000;
     c->diam_vendor_id     = 10415;  /* 3GPP */
     strncpy(c->diam_product_name, "iwf",  sizeof(c->diam_product_name) - 1);
+
+    c->gsup_server_enabled = 0;
+    c->gsup_listen_port      = 4222;
+    strncpy(c->gsup_local_mnc, "012", sizeof(c->gsup_local_mnc) - 1);
+    c->gsup_timeout_ms       = 10000;
 
 #ifdef SMS_IWF_ENABLED
     c->sms_iwf_enabled       = 0;
@@ -138,6 +144,89 @@ static int sms_partner_index(iwf_config_t *out, const char *section)
     return idx;
 }
 #endif
+
+static void gsup_listen_ip_add(iwf_config_t *out, const char *ip)
+{
+    if (!ip || !*ip) return;
+    for (int i = 0; i < out->gsup_n_listen_ips; i++) {
+        if (!strcmp(out->gsup_listen_ips[i], ip))
+            return;
+    }
+    if (out->gsup_n_listen_ips >= GSUP_MAX_LISTEN_IPS) {
+        LOGW("config", "too many GSUP listen IPs (max %d)", GSUP_MAX_LISTEN_IPS);
+        return;
+    }
+    copy_str(out->gsup_listen_ips[out->gsup_n_listen_ips],
+             sizeof(out->gsup_listen_ips[0]), ip);
+    out->gsup_n_listen_ips++;
+}
+
+static void gsup_listen_ips_split(iwf_config_t *out, const char *csv)
+{
+    if (!csv || !*csv) return;
+    char buf[512];
+    copy_str(buf, sizeof(buf), csv);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        tok = trim(tok);
+        if (*tok) gsup_listen_ip_add(out, tok);
+    }
+}
+
+static int gsup_roam_route_index(iwf_config_t *out, const char *mnc, int is_local)
+{
+    for (int i = 0; i < out->gsup_n_roam_routes; i++) {
+        if (!strcmp(out->gsup_roam_routes[i].mnc, mnc))
+            return i;
+    }
+    if (out->gsup_n_roam_routes >= GSUP_MAX_ROAM_ROUTES) {
+        LOGW("config", "too many [roaming_hlr] routes (max %d)", GSUP_MAX_ROAM_ROUTES);
+        return -1;
+    }
+    int idx = out->gsup_n_roam_routes++;
+    memset(&out->gsup_roam_routes[idx], 0, sizeof(out->gsup_roam_routes[idx]));
+    copy_str(out->gsup_roam_routes[idx].mnc,
+             sizeof(out->gsup_roam_routes[idx].mnc), mnc);
+    out->gsup_roam_routes[idx].hlr_ssn = 6; /* HLR SSN (TS 23.003) */
+    out->gsup_roam_routes[idx].is_local = is_local;
+    return idx;
+}
+
+/* Parse [roaming_hlr] keys: mnc035_hlr_gt, mnc035_ssn, mnc035_src_ip, ... */
+static void gsup_roam_key(iwf_config_t *out, const char *key, const char *val)
+{
+    if (strncmp(key, "mnc", 3) != 0) {
+        LOGW("config", "unknown key [roaming_hlr].%s", key);
+        return;
+    }
+    const char *p = key + 3;
+    char mnc[4] = {0};
+    int mi = 0;
+    while (*p >= '0' && *p <= '9' && mi < 3)
+        mnc[mi++] = *p++;
+    if (mi != 3 || *p != '_') {
+        LOGW("config", "bad [roaming_hlr] key (expected mncNNN_field): %s", key);
+        return;
+    }
+    p++;
+    int is_local = !strcmp(mnc, out->gsup_local_mnc);
+    int idx = gsup_roam_route_index(out, mnc, is_local);
+    if (idx < 0) return;
+    if (!strcmp(p, "hlr_gt"))
+        copy_str(out->gsup_roam_routes[idx].hlr_gt,
+                 sizeof(out->gsup_roam_routes[idx].hlr_gt), val);
+    else if (!strcmp(p, "ssn"))
+        out->gsup_roam_routes[idx].hlr_ssn = (uint8_t)atoi(val);
+    else if (!strcmp(p, "src_ip"))
+        copy_str(out->gsup_roam_routes[idx].src_ip,
+                 sizeof(out->gsup_roam_routes[idx].src_ip), val);
+    else if (!strcmp(p, "src_gt"))
+        copy_str(out->gsup_roam_routes[idx].src_gt,
+                 sizeof(out->gsup_roam_routes[idx].src_gt), val);
+    else
+        LOGW("config", "unknown key [roaming_hlr].%s", key);
+}
 
 int iwf_config_load(const char *path, iwf_config_t *out)
 {
@@ -234,6 +323,7 @@ int iwf_config_load(const char *path, iwf_config_t *out)
         } else if (!strcmp(section, "diameter_s6d")) {
             if      (!strcmp(key, "peer_ip"))       copy_str(out->diam_peer_ip, sizeof(out->diam_peer_ip), val);
             else if (!strcmp(key, "peer_port"))     out->diam_peer_port = (uint16_t)atoi(val);
+            else if (!strcmp(key, "local_ip"))      copy_str(out->diam_local_ip, sizeof(out->diam_local_ip), val);
             else if (!strcmp(key, "origin_host"))   copy_str(out->diam_origin_host, sizeof(out->diam_origin_host), val);
             else if (!strcmp(key, "origin_realm"))  copy_str(out->diam_origin_realm, sizeof(out->diam_origin_realm), val);
             else if (!strcmp(key, "dest_host"))     copy_str(out->diam_dest_host, sizeof(out->diam_dest_host), val);
@@ -243,6 +333,16 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "watchdog_ms"))   out->diam_watchdog_ms = atoi(val);
             else if (!strcmp(key, "request_timeout_ms")) out->diam_request_timeout_ms = atoi(val);
             else LOGW("config", "unknown key [diameter_s6d].%s", key);
+        } else if (!strcmp(section, "gsup_server")) {
+            if      (!strcmp(key, "enabled"))        out->gsup_server_enabled = (atoi(val) != 0);
+            else if (!strcmp(key, "listen_port"))    out->gsup_listen_port = (uint16_t)atoi(val);
+            else if (!strcmp(key, "listen_ip"))      gsup_listen_ip_add(out, val);
+            else if (!strcmp(key, "listen_ips"))     gsup_listen_ips_split(out, val);
+            else if (!strcmp(key, "local_mnc"))      copy_str(out->gsup_local_mnc, sizeof(out->gsup_local_mnc), val);
+            else if (!strcmp(key, "timeout_ms"))     out->gsup_timeout_ms = atoi(val);
+            else LOGW("config", "unknown key [gsup_server].%s", key);
+        } else if (!strcmp(section, "roaming_hlr")) {
+            gsup_roam_key(out, key, val);
 #ifdef SMS_IWF_ENABLED
         } else if (!strcmp(section, "sms_iwf")) {
             if      (!strcmp(key, "enabled"))           out->sms_iwf_enabled = (atoi(val) != 0);
@@ -331,10 +431,12 @@ void iwf_config_dump(const iwf_config_t *c)
                  c->stp_remote_pc[0] ? c->stp_remote_pc : "(unset)",
                  (unsigned)c->stp_routing_context);
         }
-        LOGI("config", "map_iwf: diameter peer=%s:%u origin=%s/%s dest=%s/%s "
+        LOGI("config", "map_iwf: diameter peer=%s:%u local=%s origin=%s/%s dest=%s/%s "
                        "watchdog=%dms timeout=%dms",
              c->diam_peer_ip[0] ? c->diam_peer_ip : "(unset)",
              c->diam_peer_port,
+             c->diam_local_ip[0] ? c->diam_local_ip
+                                   : (c->local_ip[0] ? c->local_ip : "(any)"),
              c->diam_origin_host[0]  ? c->diam_origin_host  : "(unset)",
              c->diam_origin_realm[0] ? c->diam_origin_realm : "(unset)",
              c->diam_dest_host[0]    ? c->diam_dest_host    : "(unset)",

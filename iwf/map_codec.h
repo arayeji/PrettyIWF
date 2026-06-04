@@ -122,21 +122,36 @@ int map_encode_mt_fwd_sm_arg(const char *imsi_digits, const char *smsc_gt_digits
 
 /* ----- encoders (for the IWF -> SGSN direction) ------------------- */
 
+/* MAP SendAuthenticationInfo Invoke/ReturnResult (IWF -> foreign HLR). */
+int map_encode_sai_arg(const char *imsi_str, uint8_t num_vectors,
+                       uint8_t *out, size_t out_cap);
+int map_decode_sai_res(const uint8_t *p, size_t n,
+                       map_auth_vector_t *vec, size_t vec_cap, size_t *n_vec);
+
 /* MAP SendAuthenticationInfo ReturnResult, AuthenticationSetList of vectors. */
 int map_encode_sai_res(const map_auth_vector_t *vec, size_t n_vec,
                        uint8_t *out, size_t out_cap);
+
+/* MAP UpdateGprsLocation Invoke (IWF -> foreign HLR). */
+int map_encode_ugl_arg(const char *imsi_str,
+                       const uint8_t *sgsn_number_bcd, size_t sgsn_num_len,
+                       const uint8_t *sgsn_addr, size_t sgsn_addr_len,
+                       uint8_t *out, size_t out_cap);
+int map_decode_ugl_res(const uint8_t *p, size_t n,
+                       uint8_t *hlr_bcd, size_t hlr_cap, size_t *hlr_len);
 
 /* MAP UpdateGprsLocation ReturnResult: hlr-Number + optional extensions. */
 int map_encode_ugl_res(const uint8_t *hlr_number_bcd, size_t hlr_len,
                        uint8_t *out, size_t out_cap);
 
 /* MAP InsertSubscriberData Invoke argument (sent toward SGSN as a separate
- * dialogue between ULA and UGL response). Carries MSISDN + APN config. */
+ * dialogue between ULA and UGL response). Carries MSISDN + full GPRS PDP
+ * list (gprsSubscriptionData) built from the ULA APN-Configuration list. */
 int map_encode_isd_arg(const char *imsi_str,
                        const char *msisdn_str,
-                       const char *apn,
-                       uint64_t ambr_ul_bps,
-                       uint64_t ambr_dl_bps,
+                       const map_ula_apn_entry_t *apns,
+                       size_t n_apns,
+                       uint8_t default_context_id,
                        uint8_t *out, size_t out_cap);
 
 /* MAP CancelLocation Invoke argument (HSS-originated CLR -> we Invoke CL). */
@@ -161,6 +176,8 @@ int  map_str_to_bcd  (const char *digits, uint8_t *out, size_t out_cap);
 /* Visited-PLMN-Id is 3 BCD octets: MCC + MNC packed per TS 24.008. */
 int  map_plmn_pack   (uint16_t mcc, uint16_t mnc, uint8_t out[3]);
 int  map_plmn_unpack (const uint8_t in[3], uint16_t *mcc, uint16_t *mnc);
+/* Home PLMN (MCC 432 + configured MNC) for Visited-PLMN-Id on S6d. */
+int  map_plmn_pack_home(const char *mnc_digits, uint8_t out[3]);
 
 /* ----- AARQ/AARE dialogue portion helpers ------------------------- */
 
