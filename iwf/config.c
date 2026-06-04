@@ -38,8 +38,7 @@ static void defaults(iwf_config_t *c)
     c->map_t_dialogue_ms  = 10000;
     strncpy(c->stp_ip,   "127.0.0.1", sizeof(c->stp_ip)   - 1);
     c->stp_port           = 2905;
-    /* Default 4 matches osmo-stp as-iwf routing-key 4 on THR1 (override in iwf.conf). */
-    c->stp_routing_context = 4u;
+    c->stp_routing_context = 1u;
     c->diam_peer_port     = 3868;
     c->diam_watchdog_ms   = 30000;
     c->diam_request_timeout_ms = 10000;
@@ -59,7 +58,7 @@ static void defaults(iwf_config_t *c)
     c->sms_gsup_timeout_ms   = 3000;
     c->sms_sri_sm_timeout_ms = 5000;
     c->sms_fwdsm_timeout_ms  = 10000;
-    strncpy(c->gsup_remote_ip, "10.0.0.33", sizeof(c->gsup_remote_ip) - 1);
+    strncpy(c->gsup_remote_ip, "127.0.0.1", sizeof(c->gsup_remote_ip) - 1);
     c->gsup_remote_port      = 4222;
     strncpy(c->gsup_client_name, "IWF-SMS", sizeof(c->gsup_client_name) - 1);
     strncpy(c->smpp_bind_ip, "127.0.0.1", sizeof(c->smpp_bind_ip) - 1);
