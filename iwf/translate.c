@@ -1215,6 +1215,34 @@ static int try_handle_gtpu_context_response_reverse(iwf_runtime_t *rt,
 /* Northbound: GTPv1-C from osmo-sgsn -> GTPv2-C to SGW-C               */
 /* ------------------------------------------------------------------- */
 
+/* Fire-and-forget Delete Session Request for a stale session that we are
+ * about to drop locally. Used to implement the implicit detach behaviour
+ * described in TS 23.060 §9.2.2 / TS 23.401 §5.10.2 when a new attach
+ * arrives for an IMSI+NSAPI that already has an SGW-C session. We do not
+ * keep the session around to correlate the DSResp; SMF/SGW-C will tear
+ * down the old PFCP session and any DSResp it returns will be matched by
+ * TEID -> not found -> WARN -> drop, which is fine. */
+static int send_orphan_delete_session_req(iwf_runtime_t *rt,
+                                          uint32_t sgwc_ctrl_teid,
+                                          uint8_t  nsapi)
+{
+    if (!sgwc_ctrl_teid)
+        return 0;
+
+    uint8_t outbuf[IWF_MAX_PKT];
+    gtpv2_enc_t e;
+    gtpv2_enc_init(&e, outbuf, sizeof(outbuf));
+    gtpv2_enc_begin(&e, GTPV2_DELETE_SESSION_REQUEST,
+                    sgwc_ctrl_teid, ++rt->v2_seq);
+    gtpv2_enc_ebi(&e, 0, nsapi);
+    gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00);
+
+    int total = gtpv2_enc_finish(&e);
+    if (total <= 0) return -1;
+    iwf_log_hex("translate", "DSReq(orphan)", outbuf, (size_t)total);
+    return iwf_send_v2(rt, outbuf, (size_t)total);
+}
+
 static int translate_create_pdp_context(iwf_runtime_t *rt,
                                         const iwf_endpoint_t *from,
                                         const iwf_msg_t *v1)
@@ -1248,6 +1276,27 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
                  imsi, (unsigned)(uint16_t)v1->seq, (unsigned)pending->key.nsapi,
                  sess_state_str(pending->state));
             return 0;
+        }
+    }
+
+    /* Implicit detach: a Create-PDP for an IMSI+NSAPI that already has a
+     * session (and isn't a retransmit, handled above) means the UE/SGSN
+     * forgot the old context — TS 23.060 §9.2.2 / TS 23.401 §5.10.2 say
+     * the network must release the old PDN connection before installing
+     * the new one. Without this, SGW-C/SMF and UPF keep stale state and
+     * the next Create-Session may collide on TEIDs. */
+    {
+        sess_t *stale = sess_find(imsi, nsapi);
+        if (stale) {
+            LOGW("translate",
+                 "reattach for imsi=%s nsapi=%u (old state=%s sgwc_teid=0x%08x) — implicit detach",
+                 imsi, (unsigned)nsapi, sess_state_str(stale->state),
+                 stale->sgwc_ctrl_teid);
+            if (stale->sgwc_ctrl_teid)
+                (void)send_orphan_delete_session_req(rt,
+                                                     stale->sgwc_ctrl_teid,
+                                                     stale->key.nsapi);
+            sess_remove(stale);
         }
     }
 
