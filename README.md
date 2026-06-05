@@ -96,3 +96,7 @@ Development is organized into feature branches merged into `main`:
 ## License
 
 See [LICENSE](LICENSE).
+
+## Author
+
+**Ahmad Raeiji** — [ahmad.rayeji@gmail.com](mailto:ahmad.rayeji@gmail.com)
