@@ -217,6 +217,11 @@ static int start_local_diameter(gsup_route_t *route, gsup_parsed_t *req,
                          ? req->cn_domain : GSUP_CN_DOMAIN_PS;
     if (req && req->have_num_vectors)
         s->gsup_num_vectors = req->num_vectors;
+    if (req && gsup_parsed_have_resync(req)) {
+        memcpy(s->resync_rand, req->resync_rand, sizeof(s->resync_rand));
+        memcpy(s->resync_auts, req->resync_auts, sizeof(s->resync_auts));
+        s->have_resync = true;
+    }
 
     int bn = map_str_to_bcd(route->imsi, s->imsi_bcd, sizeof(s->imsi_bcd));
     if (bn < 0) {
@@ -240,7 +245,9 @@ static int start_local_diameter(gsup_route_t *route, gsup_parsed_t *req,
 
     int rc;
     if (op == MAP_OP_SAI) {
-        LOGI("gsup", "LOCAL→Diameter AIR imsi=%s conn=%d", route->imsi, conn_id);
+        LOGI("gsup", "LOCAL→Diameter AIR imsi=%s conn=%d%s",
+             route->imsi, conn_id,
+             s->have_resync ? " resync=1" : "");
         rc = diameter_send_air(g_rt, s);
     } else {
         LOGI("gsup", "LOCAL→Diameter ULR imsi=%s conn=%d", route->imsi, conn_id);
@@ -367,14 +374,21 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
     }
 
     const char *lip = gsup_server_conn_bind_ip(conn_id);
-    LOGI("gsup", "RX msg=0x%02x imsi=%s cn=%s route=%d conn=%d listen=%s src_ip=%s",
+    if (req.msg_type == GSUP_MSG_SAI_REQ &&
+        (req.have_resync_rand ^ req.have_resync_auts)) {
+        LOGW("gsup", "SAI resync incomplete imsi=%s rand=%d auts=%d",
+             req.imsi, req.have_resync_rand, req.have_resync_auts);
+    }
+    LOGI("gsup", "RX msg=0x%02x imsi=%s cn=%s route=%d conn=%d listen=%s src_ip=%s%s",
          req.msg_type, req.imsi,
          req.have_cn_domain
              ? (req.cn_domain == GSUP_CN_DOMAIN_CS ? "CS" : "PS")
              : "PS(default)",
          (int)route.kind, conn_id,
          lip ? lip : "?",
-         route.src_ip[0] ? route.src_ip : "(default)");
+         route.src_ip[0] ? route.src_ip : "(default)",
+         (req.msg_type == GSUP_MSG_SAI_REQ && gsup_parsed_have_resync(&req))
+             ? " resync=1" : "");
 
     /* ISD result completes a Diameter UL transaction. */
     if (req.msg_type == GSUP_MSG_ISD_RES || req.msg_type == GSUP_MSG_ISD_ERR) {
