@@ -18,11 +18,11 @@
 #define GSUP_IPA_EXT_GSUP       0x05
 
 #define GSUP_MSG_UL_REQ         0x04
-#define GSUP_MSG_UL_ERR         0x07
+#define GSUP_MSG_UL_ERR         0x05   /* OSMO_GSUP_MSGT_UPDATE_LOCATION_ERROR */
 #define GSUP_MSG_UL_RES         0x06
 #define GSUP_MSG_SAI_REQ        0x08
 #define GSUP_MSG_SAI_RES        0x0a
-#define GSUP_MSG_SAI_ERR        0x0b
+#define GSUP_MSG_SAI_ERR        0x09   /* OSMO_GSUP_MSGT_SEND_AUTH_INFO_ERROR (not 0x0b AUTH_FAIL_REPORT) */
 #define GSUP_MSG_ISD_REQ        0x10
 #define GSUP_MSG_ISD_ERR        0x11
 #define GSUP_MSG_ISD_RES        0x12
