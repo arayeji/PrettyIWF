@@ -140,7 +140,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   fi
 fi
 
-echo "==> Step 1/5: Install build dependencies (build-essential)"
+echo "==> Step 1/5: Install build dependencies"
 if need_cmd apt-get; then
   export DEBIAN_FRONTEND=noninteractive
   if [[ "${EUID:-$(id -u)}" -ne 0 && -z "$SUDO_APT" ]]; then
@@ -149,9 +149,10 @@ if need_cmd apt-get; then
     exit 1
   fi
   $SUDO_APT apt-get update -qq
-  $SUDO_APT apt-get install -y -qq build-essential
+  $SUDO_APT apt-get install -y -qq build-essential pkg-config \
+    libosmocore-dev libosmo-sccp-dev libosmo-sigtran-dev
 else
-  echo "apt-get not found; install gcc and make manually, then re-run." >&2
+  echo "apt-get not found; install gcc, make, and libosmo-* dev packages manually." >&2
   exit 1
 fi
 

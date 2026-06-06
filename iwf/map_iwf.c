@@ -470,35 +470,130 @@ static int send_tcap_end_with_error(struct iwf_runtime *rt,
 /* Diameter answer handlers (called by diameter.c)                         */
 /* ====================================================================== */
 
+static void avp_copy_octets(uint8_t *dst, size_t dst_len, const diameter_avp_t *a)
+{
+    if (!dst || !a || !a->data || a->data_len == 0)
+        return;
+    size_t n = a->data_len > dst_len ? dst_len : a->data_len;
+    memcpy(dst, a->data, n);
+}
+
 /* Parse one E-UTRAN/UTRAN/GERAN-Vector grouped AVP into map_auth_vector_t. */
 static int parse_vector_avp(const uint8_t *body, size_t len,
                             map_auth_vector_t *v)
 {
     diameter_avp_t a;
-    /* RAND */
-    if (diameter_avp_find(body, len, AVP_3GPP_RAND, DIAMETER_VENDOR_3GPP, &a) == 0) {
-        size_t n = a.data_len > 16 ? 16 : a.data_len;
-        memcpy(v->rand, a.data, n);
+    memset(v, 0, sizeof(*v));
+
+    if (diameter_avp_find_3gpp_recursive(body, len, AVP_3GPP_RAND, &a) == 0)
+        avp_copy_octets(v->rand, sizeof(v->rand), &a);
+    if (diameter_avp_find_3gpp_recursive(body, len, AVP_3GPP_XRES, &a) == 0) {
+        avp_copy_octets(v->xres, sizeof(v->xres), &a);
+        v->xres_len = (uint8_t)(a.data_len > 16 ? 16 : a.data_len);
     }
-    if (diameter_avp_find(body, len, AVP_3GPP_XRES, DIAMETER_VENDOR_3GPP, &a) == 0) {
-        size_t n = a.data_len > 16 ? 16 : a.data_len;
-        memcpy(v->xres, a.data, n);
-        v->xres_len = (uint8_t)n;
+    if (diameter_avp_find_3gpp_recursive(body, len, AVP_3GPP_AUTN, &a) == 0)
+        avp_copy_octets(v->autn, sizeof(v->autn), &a);
+    if (diameter_avp_find_3gpp_recursive(body, len, AVP_3GPP_CK, &a) == 0)
+        avp_copy_octets(v->ck, sizeof(v->ck), &a);
+    if (diameter_avp_find_3gpp_recursive(body, len, AVP_3GPP_IK, &a) == 0)
+        avp_copy_octets(v->ik, sizeof(v->ik), &a);
+
+    /* GERAN-Vector: Kc/SRES when CK/IK absent. */
+    if (diameter_avp_find_3gpp_recursive(body, len, AVP_3GPP_KC, &a) == 0) {
+        avp_copy_octets(v->kc, sizeof(v->kc), &a);
+        if (!v->ck[0] && !v->ck[1])
+            memcpy(v->ck, v->kc, sizeof(v->kc));
+        v->have_triplet = true;
     }
-    if (diameter_avp_find(body, len, AVP_3GPP_AUTN, DIAMETER_VENDOR_3GPP, &a) == 0) {
-        size_t n = a.data_len > 16 ? 16 : a.data_len;
-        memcpy(v->autn, a.data, n);
+    if (diameter_avp_find_3gpp_recursive(body, len, AVP_3GPP_SRES, &a) == 0) {
+        avp_copy_octets(v->sres, sizeof(v->sres), &a);
+        if (v->xres_len == 0) {
+            size_t n = a.data_len > 16 ? 16 : a.data_len;
+            memcpy(v->xres, a.data, n);
+            v->xres_len = (uint8_t)n;
+        }
     }
-    if (diameter_avp_find(body, len, AVP_3GPP_CK, DIAMETER_VENDOR_3GPP, &a) == 0) {
-        size_t n = a.data_len > 16 ? 16 : a.data_len;
-        memcpy(v->ck, a.data, n);
-    }
-    if (diameter_avp_find(body, len, AVP_3GPP_IK, DIAMETER_VENDOR_3GPP, &a) == 0) {
-        size_t n = a.data_len > 16 ? 16 : a.data_len;
-        memcpy(v->ik, a.data, n);
-    }
-    v->have_quintuplet = true;
+
+    v->have_quintuplet = v->rand[0] || v->rand[1];
     return 0;
+}
+
+static bool auth_vector_has_ckik(const map_auth_vector_t *v)
+{
+    for (int i = 0; i < 16; i++) {
+        if (v->ck[i] || v->ik[i])
+            return true;
+    }
+    return false;
+}
+
+static int auth_vector_find_rand(map_session_t *s, const uint8_t rand[16])
+{
+    for (uint8_t i = 0; i < s->n_av; i++) {
+        if (!memcmp(s->av[i].rand, rand, 16))
+            return (int)i;
+    }
+    return -1;
+}
+
+static void auth_vector_merge_ckik(map_auth_vector_t *dst,
+                                 const map_auth_vector_t *src)
+{
+    if (auth_vector_has_ckik(dst) || !auth_vector_has_ckik(src))
+        return;
+    if (memcmp(dst->rand, src->rand, 16))
+        return;
+    memcpy(dst->ck, src->ck, 16);
+    memcpy(dst->ik, src->ik, 16);
+}
+
+static void aia_collect_vectors(const uint8_t *buf, size_t len,
+                                map_session_t *s, int depth)
+{
+    diameter_avp_t it;
+    if (!buf || len < 8 || depth > 8 || !s)
+        return;
+    if (diameter_avp_first(buf, len, &it) < 0)
+        return;
+    for (;;) {
+        bool is_vec = (it.code == AVP_3GPP_E_UTRAN_VECTOR ||
+                       it.code == AVP_3GPP_UTRAN_VECTOR  ||
+                       it.code == AVP_3GPP_GERAN_VECTOR) &&
+                      (it.vendor_id == DIAMETER_VENDOR_3GPP ||
+                       !(it.flags & DIAM_AVP_FLAG_VENDOR));
+        if (is_vec && s->n_av < MAP_AUTH_VECTOR_MAX) {
+            map_auth_vector_t tmp;
+            parse_vector_avp(it.data, it.data_len, &tmp);
+            if (tmp.have_quintuplet || tmp.have_triplet) {
+                int idx = auth_vector_find_rand(s, tmp.rand);
+                if (idx >= 0)
+                    auth_vector_merge_ckik(&s->av[idx], &tmp);
+                else
+                    s->av[s->n_av++] = tmp;
+            }
+        } else if (it.data_len >= 8) {
+            aia_collect_vectors(it.data, it.data_len, s, depth + 1);
+        }
+        if (diameter_avp_next(buf, len, &it) < 0)
+            break;
+    }
+}
+
+static void aia_finalize_vectors(map_session_t *s)
+{
+    for (uint8_t i = 0; i < s->n_av; i++) {
+        for (uint8_t j = 0; j < s->n_av; j++)
+            if (i != j)
+                auth_vector_merge_ckik(&s->av[i], &s->av[j]);
+    }
+    for (uint8_t i = 1; i < s->n_av; i++) {
+        if (auth_vector_has_ckik(&s->av[i]) &&
+            !auth_vector_has_ckik(&s->av[0])) {
+            map_auth_vector_t tmp = s->av[0];
+            s->av[0] = s->av[i];
+            s->av[i] = tmp;
+        }
+    }
 }
 
 void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
@@ -506,12 +601,20 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
 {
     const bool is_cmd_test = s->cmd_test;
 
-    diameter_avp_t auth_info;
-    if (diameter_avp_find(body, body_len, AVP_3GPP_AUTHENTICATION_INFO,
-                          DIAMETER_VENDOR_3GPP, &auth_info) < 0) {
-        LOGW("map", "AIA imsi=%s: no Authentication-Info AVP", s->imsi_str);
+    s->n_av = 0;
+    aia_collect_vectors(body, body_len, s, 0);
+    aia_finalize_vectors(s);
+
+    LOGI("map", "AIA imsi=%s vectors=%u -> emitting MAP SAI Resp",
+         s->imsi_str, s->n_av);
+    if (s->gsup_originated && s->n_av > 0 && !auth_vector_has_ckik(&s->av[0]))
+        LOGW("map", "AIA imsi=%s: no CK/IK in HSS answer (3G needs UTRAN-Vector "
+             "with Confidentiality-Key/Integrity-Key AVPs)", s->imsi_str);
+
+    if (s->n_av == 0) {
+        LOGW("map", "AIA imsi=%s: no auth vectors in answer", s->imsi_str);
         if (is_cmd_test) {
-            cmd_test_abort(s, "no_authentication_info_avp");
+            cmd_test_abort(s, "no_vectors");
             return;
         }
         if (s->gsup_originated) {
@@ -523,29 +626,8 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
         send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
         return;
     }
-    /* Walk every E-UTRAN-Vector / UTRAN-Vector / GERAN-Vector child. */
-    s->n_av = 0;
-    diameter_avp_t v;
-    if (diameter_avp_first(auth_info.data, auth_info.data_len, &v) == 0) {
-        do {
-            if (s->n_av >= MAP_AUTH_VECTOR_MAX) break;
-            if ((v.code == AVP_3GPP_E_UTRAN_VECTOR ||
-                 v.code == AVP_3GPP_UTRAN_VECTOR  ||
-                 v.code == AVP_3GPP_GERAN_VECTOR) &&
-                v.vendor_id == DIAMETER_VENDOR_3GPP) {
-                parse_vector_avp(v.data, v.data_len, &s->av[s->n_av]);
-                s->n_av++;
-            }
-        } while (diameter_avp_next(auth_info.data, auth_info.data_len, &v) == 0);
-    }
-    LOGI("map", "AIA imsi=%s vectors=%u -> emitting MAP SAI Resp",
-         s->imsi_str, s->n_av);
 
     if (is_cmd_test) {
-        if (s->n_av == 0) {
-            cmd_test_abort(s, "no_vectors");
-            return;
-        }
         int fd = s->cmd_test_reply_fd;
         s->cmd_test_reply_fd = -1;
         s->cmd_test = false;
@@ -561,16 +643,6 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
         return;
     }
 
-    if (s->n_av == 0) {
-        if (s->gsup_originated) {
-#ifdef GSUP_PROXY_ENABLED
-            gsup_map_proxy_diameter_error(rt, s, 0);
-#endif
-            return;
-        }
-        send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
-        return;
-    }
     if (s->gsup_originated) {
 #ifdef GSUP_PROXY_ENABLED
         gsup_map_proxy_finish_sai(rt, s);
@@ -711,8 +783,12 @@ static void extract_ula_subdata(map_session_t *s,
     s->have_ula_subdata = true;
 
     /* CS GSUP: MSISDN only toward MSC; skip GPRS APN walk. */
+#ifdef GSUP_PROXY_ENABLED
     const bool want_apn =
         !(s->gsup_originated && s->gsup_cn_domain == GSUP_CN_DOMAIN_CS);
+#else
+    const bool want_apn = true;
+#endif
 
     /* APN-Configuration-Profile → all APN-Configuration (1430) children. */
     diameter_avp_t apnp;
@@ -794,6 +870,7 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
     if (s->gsup_originated) {
 #ifdef GSUP_PROXY_ENABLED
         extract_ula_subdata(s, body, body_len);
+        /* osmo-hlr pattern: ISD_REQ (subscription data) then minimal UL_RES. */
         bool need_isd = false;
         if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS)
             need_isd = s->msisdn_str[0] != '\0';
@@ -1005,11 +1082,29 @@ void map_iwf_on_pua(struct iwf_runtime *rt, map_session_t *s,
     send_tcap_end_with_result(rt, s, 1, MAP_OP_CODE_PURGE_MS, params, (size_t)pn);
 }
 
+static bool air_auth_data_unavailable(uint32_t rc)
+{
+    return rc == DIAM_RC_AUTH_DATA_UNAVAILABLE
+        || rc == DIAM_EXP_RC_AUTH_DATA_UNAVAILABLE;
+}
+
 void map_iwf_diameter_error(struct iwf_runtime *rt, map_session_t *s,
                             uint32_t rc)
 {
     if (s->gsup_originated) {
 #ifdef GSUP_PROXY_ENABLED
+        /* Retry with E-UTRAN/1408 only if UTRAN/1441 fails (e.g. DRA rejects 1441). */
+        if (s->map_op == MAP_OP_SAI && !s->air_eutran_fallback
+            && air_auth_data_unavailable(rc)) {
+            s->air_eutran_fallback = true;
+            s->diameter_hop_by_hop = 0;
+            s->diameter_end_to_end = 0;
+            LOGW("map", "AIR UTRAN/1441 rc=%u imsi=%s -> retry EUTRAN/1408",
+                 (unsigned)rc, s->imsi_str);
+            map_sess_touch(s);
+            if (diameter_send_air(rt, s) == 0)
+                return;
+        }
         gsup_map_proxy_diameter_error(rt, s, rc);
 #endif
         return;

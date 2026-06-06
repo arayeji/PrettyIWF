@@ -206,6 +206,46 @@ int diameter_avp_find_recursive(const uint8_t *buf, size_t len,
     }
 }
 
+static bool diameter_avp_is_3gpp(const diameter_avp_t *a, uint32_t code)
+{
+    if (!a || a->code != code)
+        return false;
+    if (a->vendor_id == DIAMETER_VENDOR_3GPP)
+        return true;
+    return !(a->flags & DIAM_AVP_FLAG_VENDOR);
+}
+
+int diameter_avp_find_3gpp(const uint8_t *buf, size_t len,
+                           uint32_t code, diameter_avp_t *out)
+{
+    diameter_avp_t it;
+    if (diameter_avp_first(buf, len, &it) < 0) return -1;
+    for (;;) {
+        if (diameter_avp_is_3gpp(&it, code)) {
+            *out = it;
+            return 0;
+        }
+        if (diameter_avp_next(buf, len, &it) < 0) return -1;
+    }
+}
+
+int diameter_avp_find_3gpp_recursive(const uint8_t *buf, size_t len,
+                                     uint32_t code, diameter_avp_t *out)
+{
+    diameter_avp_t it;
+    if (diameter_avp_first(buf, len, &it) < 0) return -1;
+    for (;;) {
+        if (diameter_avp_is_3gpp(&it, code)) {
+            *out = it;
+            return 0;
+        }
+        if (it.data_len >= 8 &&
+            diameter_avp_find_3gpp_recursive(it.data, it.data_len, code, out) == 0)
+            return 0;
+        if (diameter_avp_next(buf, len, &it) < 0) return -1;
+    }
+}
+
 int diameter_get_result_code(const uint8_t *body, size_t len, uint32_t *out_rc)
 {
     diameter_avp_t a;
@@ -511,13 +551,11 @@ static int diameter_body_valid(const uint8_t *body, size_t len)
 }
 
 static int put_req_auth_info_group(uint8_t *pkt, size_t cap, size_t *off,
+                                   uint32_t grouped_avp_code,
                                    uint8_t num_vectors,
                                    const uint8_t *resync_rand,
                                    const uint8_t *resync_auts)
 {
-    /* Use 1408 (E-UTRAN) not 1441 (UTRAN/GERAN): Open5GS DRA loads S6a dict
-     * and rejects 1441 with "Bad message". Open5GS HSS expects Re-Synchronization-
-     * Info (1411, OctetString) inside this grouped AVP, not at AIR top level. */
     uint8_t inner[128];
     size_t io = 0;
     uint32_t nv = num_vectors > 0 ? num_vectors : 3;
@@ -539,7 +577,7 @@ static int put_req_auth_info_group(uint8_t *pkt, size_t cap, size_t *off,
                     DIAMETER_VENDOR_3GPP, rsi, sizeof(rsi)) < 0)
             return -1;
     }
-    return avp_put_grouped(pkt, cap, off, AVP_3GPP_REQ_EUTRAN_AUTH_INFO,
+    return avp_put_grouped(pkt, cap, off, grouped_avp_code,
                            DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
                            DIAMETER_VENDOR_3GPP, inner, io);
 }
@@ -570,13 +608,17 @@ int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
                 DIAMETER_VENDOR_3GPP, s->visited_plmn_bcd, 3);
     }
 
-    /* Requested-E-UTRAN-Authentication-Info (1408) grouped AVP. */
+    /* osmo-sgsn 3G: request UTRAN/GERAN vectors (1441).  HSS should answer with
+     * UTRAN-Vector (1415) containing CK+IK.  Fallback to 1408 on error. */
     {
         uint8_t nv = s->gsup_num_vectors > 0 ? s->gsup_num_vectors
                     : (s->have_resync ? 1 : 3);
         const uint8_t *rr = s->have_resync ? s->resync_rand : NULL;
         const uint8_t *ra = s->have_resync ? s->resync_auts : NULL;
-        if (put_req_auth_info_group(pkt, sizeof(pkt), &off, nv, rr, ra) < 0)
+        uint32_t auth_avp = s->air_eutran_fallback
+                            ? AVP_3GPP_REQ_EUTRAN_AUTH_INFO
+                            : AVP_3GPP_REQ_UTRAN_GERAN_AUTH_INFO;
+        if (put_req_auth_info_group(pkt, sizeof(pkt), &off, auth_avp, nv, rr, ra) < 0)
             return -1;
     }
 
@@ -590,8 +632,9 @@ int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
         LOGE("diameter", "AIR imsi=%s: encoded AVP layout invalid", s->imsi_str);
         return -1;
     }
-    LOGI("diameter", "TX AIR imsi=%s sid=%s len=%zu%s",
+    LOGI("diameter", "TX AIR imsi=%s sid=%s len=%zu auth=%s%s",
          s->imsi_str, s->diameter_session_id, off,
+         s->air_eutran_fallback ? "EUTRAN/1408" : "UTRAN/1441",
          s->have_resync ? " resync=1" : "");
     int rc = diameter_tx(d, pkt, off);
     if (rc == 0) rt->map->stat_diam_tx++;

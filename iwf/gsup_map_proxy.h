@@ -18,6 +18,7 @@ struct map_session;
 
 void gsup_map_proxy_init(struct iwf_runtime *rt);
 void gsup_map_proxy_shutdown(void);
+void gsup_map_proxy_on_conn_closed(int conn_id);
 
 void gsup_map_proxy_on_gsup(struct iwf_runtime *rt, int conn_id,
                             const uint8_t *gsup, size_t len);

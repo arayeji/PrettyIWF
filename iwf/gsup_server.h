@@ -29,5 +29,7 @@ void gsup_server_on_epoll(struct iwf_runtime *rt, uint64_t tag);
 
 int  gsup_server_send(int conn_id, const uint8_t *gsup, size_t len);
 const char *gsup_server_conn_bind_ip(int conn_id);
+const char *gsup_server_conn_peer(int conn_id);
+bool gsup_server_conn_valid(int conn_id);
 
 #endif /* IWF_GSUP_SERVER_H */

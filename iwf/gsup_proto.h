@@ -35,6 +35,7 @@
 #define GSUP_IE_PDP_INFO        0x05
 #define GSUP_IE_CANCEL_TYPE     0x06
 #define GSUP_IE_MSISDN          0x08
+#define GSUP_IE_HLR_NUMBER      0x09
 #define GSUP_IE_NUM_VECTORS     0x0a
 #define GSUP_IE_PDP_CONTEXT_ID  0x10
 #define GSUP_IE_PDP_ADDRESS     0x11
@@ -82,7 +83,9 @@ int  gsup_build_sai_res(const char *imsi,
                         uint8_t *out, size_t cap);
 int  gsup_build_sai_err(const char *imsi, uint8_t cause,
                         uint8_t *out, size_t cap);
-int  gsup_build_ul_res(const char *imsi, const char *msisdn, uint8_t cn_domain,
+int  gsup_build_ul_res(const char *imsi, const char *msisdn,
+                       const map_ula_apn_entry_t *apns, size_t n_apns,
+                       uint8_t cn_domain, const char *hlr_number,
                        uint8_t *out, size_t cap);
 int  gsup_build_ul_err(const char *imsi, uint8_t cause,
                        uint8_t *out, size_t cap);
