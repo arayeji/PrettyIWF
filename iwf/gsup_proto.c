@@ -148,14 +148,11 @@ static int gsup_enc_auth_tuple(const map_auth_vector_t *v,
 
     if (v->have_quintuplet) {
         /* UMTS quintuplet for OsmoMSC/OsmoSGSN:
-         *   RAND(16) + SRES(4) + Kc(8) + AUTN(16) + XRES(16, zero-padded)
+         *   RAND(16) + SRES(4) + Kc(8) + [IK][CK] + AUTN(16) + XRES(actual len)
          *
-         * Notes:
-         * - OsmoMSC vlr_auth_fsm expects XRES == 16 bytes for UMTS AKA.
-         *   PyHSS returns 8-byte XRES; zero-pad to 16.
-         * - IK/CK (0x29/0x2a) are NOT included: Osmocom VLR does not use
-         *   them for 3G UMTS AKA and their presence triggers a
-         *   "not expected in PDP info" parse warning in gsup.c:310.
+         * SRES/Kc are derived from XRES/CK for GSM fallback (gsup_prep_auth_vector).
+         * Include IK/CK when the HSS AIA carries them (UTRAN-Vector); Open5GS
+         * E-UTRAN-Vector omits CK/IK — RES length fix is still required for 3G.
          */
         if (gsup_put_sub(tuple, sizeof(tuple), &to, GSUP_AUTH_IE_RAND, v->rand, 16) < 0)
             return -1;
@@ -174,12 +171,14 @@ static int gsup_enc_auth_tuple(const map_auth_vector_t *v,
         }
         if (gsup_put_sub(tuple, sizeof(tuple), &to, GSUP_AUTH_IE_AUTN, v->autn, 16) < 0)
             return -1;
-        /* XRES zero-padded to 16 bytes */
-        uint8_t xres16[16];
-        memset(xres16, 0, sizeof(xres16));
-        if (v->xres_len > 0)
-            memcpy(xres16, v->xres, v->xres_len < 16 ? v->xres_len : 16);
-        if (gsup_put_sub(tuple, sizeof(tuple), &to, GSUP_AUTH_IE_XRES, xres16, 16) < 0)
+        /* XRES: send actual length (Milenage/Open5GS typically 8). OsmoSGSN on
+         * UTRAN requires res_len == vec->res_len; zero-padding to 16 breaks
+         * the post-resync auth response (first attempt often fails earlier on
+         * SQN sync before RES is compared). */
+        if (v->xres_len == 0)
+            return -1;
+        if (gsup_put_sub(tuple, sizeof(tuple), &to, GSUP_AUTH_IE_XRES,
+                         v->xres, v->xres_len) < 0)
             return -1;
     } else if (v->have_triplet) {
         /* GSM triplet: RAND + SRES + Kc */
