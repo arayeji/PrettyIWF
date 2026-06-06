@@ -139,6 +139,9 @@ typedef struct map_session {
     uint8_t             gsup_req_type;          /* original GSUP message type   */
     uint8_t             gsup_cn_domain;         /* GSUP_CN_DOMAIN_PS or _CS      */
     uint8_t             gsup_num_vectors;       /* SAI: vectors requested       */
+    uint8_t             resync_rand[16];        /* SAI resync: MS RAND          */
+    uint8_t             resync_auts[14];        /* SAI resync: AUTS (3GPP)      */
+    bool                have_resync;            /* forward Re-Synchronization-Info */
 
     UT_hash_handle      hh_tid;                 /* indexed by tcap_dialogue_id */
     UT_hash_handle      hh_sid;                 /* indexed by diameter_session_id */
