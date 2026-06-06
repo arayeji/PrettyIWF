@@ -448,8 +448,9 @@ void gsup_map_proxy_finish_sai(iwf_runtime_t *rt, map_session_t *s)
         int hlen = n < 150 ? n : 150;
         for (int _i = 0; _i < hlen; _i++)
             snprintf(hexbuf + _i*3, sizeof(hexbuf) - _i*3, "%02x ", gsup[_i]);
-        LOGI("gsup", "TX SAI_RES imsi=%s vectors=%u conn=%d len=%d hex=%s",
-             s->imsi_str, (unsigned)s->n_av, s->gsup_conn_id, n, hexbuf);
+        LOGI("gsup", "TX SAI_RES imsi=%s vectors=%u conn=%d len=%d xres_len=%u hex=%s",
+             s->imsi_str, (unsigned)s->n_av, s->gsup_conn_id, n,
+             (unsigned)s->av[0].xres_len, hexbuf);
         (void)proxy_send_gsup(s->gsup_conn_id, gsup, (size_t)n);
     }
     s->gsup_originated = false;
