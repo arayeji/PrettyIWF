@@ -1,22 +1,20 @@
 # Makefile for the IWF.
 #
-# Two build modes:
+# Build modes:
 #
-#   make                       GTP-only IWF (default; no MAP/Diameter, no
-#                              libosmo-sigtran required).  The MAP source
-#                              files still compile - they just stub the SS7
-#                              layer so the binary refuses to enable
-#                              [map_iwf] if it is set in the config.
+#   make                       Full IWF (default): GTP + MAP-Diameter S6d/S6a
+#                              + GSUP proxy + MAP SMS interworking.
+#                              Requires libosmocore, libosmo-sccp, libosmo-sigtran.
 #
-#   make MAP_IWF_ENABLED=1 SMS_IWF_ENABLED=1
-#                              Full IWF + MAP SMS interworking (GSUP/SMPP).
+#   make MAP_IWF_ENABLED=0 SMS_IWF_ENABLED=0
+#                              GTP-only IWF (no MAP/Diameter; no libosmo deps).
 #
-#   make MAP_IWF_ENABLED=1     Full IWF: GTP + MAP-Diameter S6d.  Requires
-#                              libosmocore, libosmo-sccp, libosmo-sigtran
-#                              development headers and libraries.
-#                              On Debian/Ubuntu install:
-#                                sudo apt install libosmocore-dev \
-#                                  libosmo-sccp-dev libosmo-sigtran-dev
+#   make MAP_IWF_ENABLED=1     MAP + GSUP (same as default).
+#   make MAP_IWF_ENABLED=1 SMS_IWF_ENABLED=1   Full (same as default).
+#
+# On Debian/Ubuntu:
+#   sudo apt install build-essential pkg-config \
+#     libosmocore-dev libosmo-sccp-dev libosmo-sigtran-dev
 #
 # Other targets:
 #   make clean      Remove objects and binary.
@@ -52,10 +50,8 @@ HDRS    := iwf.h gtpv1.h gtpv2.h session.h translate.h config.h logging.h \
 BIN     := iwf
 
 # --- Optional MAP-IWF (libosmo-sigtran) integration ----------------------
-# Set MAP_IWF_ENABLED=1 on the make command line to link libosmo-sigtran in.
-# Without it, ss7_link.c compiles a stub that refuses to bring [map_iwf] up
-# at runtime.
-MAP_IWF_ENABLED ?= 0
+# Set MAP_IWF_ENABLED=0 on the make command line for a GTP-only stub build.
+MAP_IWF_ENABLED ?= 1
 ifeq ($(MAP_IWF_ENABLED),1)
   PKG_OSMO_CFLAGS := $(shell pkg-config --cflags libosmocore libosmo-sigtran libosmo-sccp 2>/dev/null)
   PKG_OSMO_LIBS   := $(shell pkg-config --libs   libosmocore libosmo-sigtran libosmo-sccp 2>/dev/null)
@@ -70,7 +66,7 @@ ifeq ($(MAP_IWF_ENABLED),1)
 endif
 
 # --- Optional MAP SMS interworking (requires MAP_IWF_ENABLED=1) ------------
-SMS_IWF_ENABLED ?= 0
+SMS_IWF_ENABLED ?= 1
 ifeq ($(SMS_IWF_ENABLED),1)
   ifneq ($(MAP_IWF_ENABLED),1)
     $(error SMS_IWF_ENABLED=1 requires MAP_IWF_ENABLED=1)
