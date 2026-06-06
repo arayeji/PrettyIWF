@@ -511,11 +511,14 @@ static int diameter_body_valid(const uint8_t *body, size_t len)
 }
 
 static int put_req_auth_info_group(uint8_t *pkt, size_t cap, size_t *off,
-                                   uint8_t num_vectors)
+                                   uint8_t num_vectors,
+                                   const uint8_t *resync_rand,
+                                   const uint8_t *resync_auts)
 {
     /* Use 1408 (E-UTRAN) not 1441 (UTRAN/GERAN): Open5GS DRA loads S6a dict
-     * and rejects 1441 with "Bad message". PyHSS returns usable vectors either way. */
-    uint8_t inner[64];
+     * and rejects 1441 with "Bad message". Open5GS HSS expects Re-Synchronization-
+     * Info (1419) inside this grouped AVP, not at AIR top level. */
+    uint8_t inner[128];
     size_t io = 0;
     uint32_t nv = num_vectors > 0 ? num_vectors : 3;
     if (nv > 5) nv = 5;
@@ -527,6 +530,15 @@ static int put_req_auth_info_group(uint8_t *pkt, size_t cap, size_t *off,
                     DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
                     DIAMETER_VENDOR_3GPP, 1) < 0)
         return -1;
+    if (resync_rand && resync_auts) {
+        uint8_t rsi[16 + 14];
+        memcpy(rsi, resync_rand, 16);
+        memcpy(rsi + 16, resync_auts, 14);
+        if (avp_put(inner, sizeof(inner), &io, AVP_3GPP_RE_SYNCHRONIZATION_INFO,
+                    DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
+                    DIAMETER_VENDOR_3GPP, rsi, sizeof(rsi)) < 0)
+            return -1;
+    }
     return avp_put_grouped(pkt, cap, off, AVP_3GPP_REQ_EUTRAN_AUTH_INFO,
                            DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
                            DIAMETER_VENDOR_3GPP, inner, io);
@@ -558,21 +570,13 @@ int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
                 DIAMETER_VENDOR_3GPP, s->visited_plmn_bcd, 3);
     }
 
-    /* Re-Synchronization-Info (1419): RAND || AUTS from GSUP SAI resync. */
-    if (s->have_resync) {
-        uint8_t rsi[16 + 14];
-        memcpy(rsi, s->resync_rand, 16);
-        memcpy(rsi + 16, s->resync_auts, 14);
-        avp_put(pkt, sizeof(pkt), &off, AVP_3GPP_RE_SYNCHRONIZATION_INFO,
-                DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
-                DIAMETER_VENDOR_3GPP, rsi, sizeof(rsi));
-    }
-
     /* Requested-E-UTRAN-Authentication-Info (1408) grouped AVP. */
     {
         uint8_t nv = s->gsup_num_vectors > 0 ? s->gsup_num_vectors
                     : (s->have_resync ? 1 : 3);
-        if (put_req_auth_info_group(pkt, sizeof(pkt), &off, nv) < 0)
+        const uint8_t *rr = s->have_resync ? s->resync_rand : NULL;
+        const uint8_t *ra = s->have_resync ? s->resync_auts : NULL;
+        if (put_req_auth_info_group(pkt, sizeof(pkt), &off, nv, rr, ra) < 0)
             return -1;
     }
 

@@ -121,8 +121,11 @@ static void reply_gsup_err(int conn_id, const char *imsi,
         n = gsup_build_ul_err(imsi, cause, gsup, sizeof(gsup));
     else
         return;
-    if (n > 0)
+    if (n > 0) {
+        LOGI("gsup", "TX GSUP err imsi=%s type=0x%02x cause=0x%02x conn=%d len=%d",
+             imsi, gsup[0], cause, conn_id, n);
         (void)proxy_send_gsup(conn_id, gsup, (size_t)n);
+    }
 }
 
 static int sgsn_number_bcd(iwf_runtime_t *rt, uint8_t *out, size_t cap)
@@ -484,8 +487,9 @@ void gsup_map_proxy_on_timeout(iwf_runtime_t *rt, map_session_t *s)
 void gsup_map_proxy_diameter_error(iwf_runtime_t *rt, map_session_t *s,
                                    uint32_t diameter_result_code)
 {
-    (void)diameter_result_code;
     if (!rt || !s || !s->gsup_originated) return;
+    LOGW("gsup", "Diameter error rc=%u imsi=%s -> SAI/UL err",
+         (unsigned)diameter_result_code, s->imsi_str);
     reply_gsup_err(s->gsup_conn_id, s->imsi_str, s->gsup_req_type,
                    GSUP_CAUSE_IMSI_UNKNOWN);
     s->gsup_originated = false;
