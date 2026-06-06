@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -23,6 +24,8 @@ typedef struct {
     int         fd;
     int         listen_idx;
     char        bind_ip[64];
+    char        peer_ip[64];
+    uint16_t    peer_port;
     uint8_t     rx[GSUP_RX_CAP];
     size_t      rx_used;
     bool        in_use;
@@ -48,6 +51,8 @@ static int set_nb(int fd)
 static void conn_close(int cid)
 {
     gsup_conn_t *c = &g_srv.conn[cid];
+    if (c->in_use)
+        gsup_map_proxy_on_conn_closed(cid);
     if (c->fd >= 0) {
         if (g_srv.epfd >= 0)
             epoll_ctl(g_srv.epfd, EPOLL_CTL_DEL, c->fd, NULL);
@@ -164,6 +169,9 @@ static void accept_on_listen(int li)
             close(cfd);
             continue;
         }
+        gsup_conn_t *nc = &g_srv.conn[cid];
+        strncpy(nc->peer_ip, inet_ntoa(peer.sin_addr), sizeof(nc->peer_ip) - 1);
+        nc->peer_port = ntohs(peer.sin_port);
         struct epoll_event ev = {
             .events = EPOLLIN | EPOLLET,
             .data.u64 = GSUP_EPOLL_PACK(GSUP_EPOLL_ROLE_CONN, (uint32_t)cid),
@@ -173,8 +181,8 @@ static void accept_on_listen(int li)
             conn_close(cid);
             continue;
         }
-        LOGI("gsup", "accepted conn=%d from %s:%u on listen %s:%u",
-             cid, inet_ntoa(peer.sin_addr), (unsigned)ntohs(peer.sin_port),
+        LOGI("gsup", "accepted conn=%d fd=%d peer=%s:%u listen=%s:%u",
+             cid, cfd, nc->peer_ip, (unsigned)nc->peer_port,
              g_srv.listen_ip[li],
              (unsigned)(g_srv.rt ? g_srv.rt->cfg.gsup_listen_port : 0));
     }
@@ -201,13 +209,44 @@ int gsup_server_send(int conn_id, const uint8_t *gsup, size_t len)
     while (sent < (size_t)fl) {
         ssize_t n = send(c->fd, frame + sent, (size_t)fl - sent, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = { .fd = c->fd, .events = POLLOUT };
+                if (poll(&pfd, 1, 2000) <= 0) {
+                    conn_close(conn_id);
+                    return -1;
+                }
+                continue;
+            }
             conn_close(conn_id);
             return -1;
         }
         sent += (size_t)n;
     }
     return 0;
+}
+
+bool gsup_server_conn_valid(int conn_id)
+{
+    if (conn_id < 0 || conn_id >= GSUP_MAX_CONN)
+        return false;
+    gsup_conn_t *c = &g_srv.conn[conn_id];
+    return c->in_use && c->fd >= 0;
+}
+
+const char *gsup_server_conn_peer(int conn_id)
+{
+    static char buf[96];
+    if (conn_id < 0 || conn_id >= GSUP_MAX_CONN || !g_srv.conn[conn_id].in_use) {
+        buf[0] = '\0';
+        return buf;
+    }
+    gsup_conn_t *c = &g_srv.conn[conn_id];
+    if (!c->peer_ip[0]) {
+        buf[0] = '\0';
+        return buf;
+    }
+    snprintf(buf, sizeof(buf), "%s:%u", c->peer_ip, (unsigned)c->peer_port);
+    return buf;
 }
 
 const char *gsup_server_conn_bind_ip(int conn_id)

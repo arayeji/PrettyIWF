@@ -227,23 +227,6 @@ int gsup_build_sai_err(const char *imsi, uint8_t cause,
     return (int)off;
 }
 
-int gsup_build_ul_res(const char *imsi, const char *msisdn, uint8_t cn_domain,
-                      uint8_t *out, size_t cap)
-{
-    if (!imsi || !out) return -1;
-    size_t off = 0;
-    out[off++] = GSUP_MSG_UL_RES;
-    if (gsup_put_imsi_ie(out, cap, &off, imsi) < 0) return -1;
-    if (gsup_enc_msisdn_ie(out, cap, &off, msisdn) < 0) return -1;
-    if (cn_domain) {
-        uint8_t cn = (cn_domain == GSUP_CN_DOMAIN_CS)
-                     ? GSUP_CN_DOMAIN_CS : GSUP_CN_DOMAIN_PS;
-        if (gsup_put_ie(out, cap, &off, GSUP_IE_CN_DOMAIN, &cn, 1) < 0)
-            return -1;
-    }
-    return (int)off;
-}
-
 int gsup_build_ul_err(const char *imsi, uint8_t cause,
                       uint8_t *out, size_t cap)
 {
@@ -271,15 +254,15 @@ int gsup_build_loc_cancel_req(const char *imsi, uint8_t cancel_type,
     return (int)off;
 }
 
-static int gsup_enc_msisdn_ie(uint8_t *out, size_t cap, size_t *off,
-                              const char *msisdn)
+static int gsup_enc_isdn_addr_ie(uint8_t *out, size_t cap, size_t *off,
+                                 uint8_t tag, const char *digits)
 {
-    if (!msisdn || !msisdn[0]) return 0;
+    if (!digits || !digits[0]) return 0;
     /* OsmoMSC gsm48_decode_bcd_number2(..., h_len=0): [len][TBCD digits only]. */
     uint8_t lv[16];
     size_t in_len = 0;
-    for (size_t k = 0; msisdn[k]; k++) {
-        if (msisdn[k] >= '0' && msisdn[k] <= '9')
+    for (size_t k = 0; digits[k]; k++) {
+        if (digits[k] >= '0' && digits[k] <= '9')
             in_len++;
     }
     if (in_len == 0) return 0;
@@ -290,9 +273,9 @@ static int gsup_enc_msisdn_ie(uint8_t *out, size_t cap, size_t *off,
 
     uint8_t *bcd_cur = lv + 1;
     size_t di = 0;
-    for (size_t k = 0; msisdn[k]; k++) {
-        if (msisdn[k] < '0' || msisdn[k] > '9') continue;
-        uint8_t d = (uint8_t)(msisdn[k] - '0');
+    for (size_t k = 0; digits[k]; k++) {
+        if (digits[k] < '0' || digits[k] > '9') continue;
+        uint8_t d = (uint8_t)(digits[k] - '0');
         if ((di & 1) == 0)
             *bcd_cur = d;
         else
@@ -304,7 +287,13 @@ static int gsup_enc_msisdn_ie(uint8_t *out, size_t cap, size_t *off,
 
     size_t total = (size_t)(bcd_cur - lv);
     if (total > sizeof(lv)) return -1;
-    return gsup_put_ie(out, cap, off, GSUP_IE_MSISDN, lv, total);
+    return gsup_put_ie(out, cap, off, tag, lv, total);
+}
+
+static int gsup_enc_msisdn_ie(uint8_t *out, size_t cap, size_t *off,
+                              const char *msisdn)
+{
+    return gsup_enc_isdn_addr_ie(out, cap, off, GSUP_IE_MSISDN, msisdn);
 }
 
 static int gsup_enc_apn_wire(const char *apn, uint8_t *out, size_t cap)
@@ -364,6 +353,52 @@ static int gsup_enc_pdp_info(uint8_t *out, size_t cap, size_t *off,
     return gsup_put_ie(out, cap, off, GSUP_IE_PDP_INFO, pdp, po);
 }
 
+static int gsup_enc_subscriber_data_ies(uint8_t *out, size_t cap, size_t *off,
+                                        const char *msisdn,
+                                        const char *hlr_number,
+                                        uint8_t cn_domain,
+                                        const map_ula_apn_entry_t *apns,
+                                        size_t n_apns)
+{
+    if (gsup_enc_msisdn_ie(out, cap, off, msisdn) < 0) return -1;
+    if (gsup_enc_isdn_addr_ie(out, cap, off, GSUP_IE_HLR_NUMBER,
+                              hlr_number) < 0)
+        return -1;
+
+    uint8_t cn = (cn_domain == GSUP_CN_DOMAIN_CS)
+                 ? GSUP_CN_DOMAIN_CS : GSUP_CN_DOMAIN_PS;
+    if (gsup_put_ie(out, cap, off, GSUP_IE_CN_DOMAIN, &cn, 1) < 0)
+        return -1;
+
+    if (cn == GSUP_CN_DOMAIN_PS && apns && n_apns > 0) {
+        if (gsup_put_ie(out, cap, off, GSUP_IE_PDP_INFO_COMPL, NULL, 0) < 0)
+            return -1;
+        for (size_t i = 0; i < n_apns; i++) {
+            if (!apns[i].apn[0]) continue;
+            if (gsup_enc_pdp_info(out, cap, off, &apns[i], i) < 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
+int gsup_build_ul_res(const char *imsi, const char *msisdn,
+                      const map_ula_apn_entry_t *apns, size_t n_apns,
+                      uint8_t cn_domain, const char *hlr_number,
+                      uint8_t *out, size_t cap)
+{
+    if (!imsi || !out) return -1;
+    size_t off = 0;
+    out[off++] = GSUP_MSG_UL_RES;
+    if (gsup_put_imsi_ie(out, cap, &off, imsi) < 0) return -1;
+    if (msisdn || hlr_number || n_apns > 0 || cn_domain) {
+        if (gsup_enc_subscriber_data_ies(out, cap, &off, msisdn, hlr_number,
+                                         cn_domain, apns, n_apns) < 0)
+            return -1;
+    }
+    return (int)off;
+}
+
 int gsup_build_isd_req(const char *imsi, const char *msisdn,
                        const map_ula_apn_entry_t *apns, size_t n_apns,
                        uint8_t cn_domain,
@@ -373,23 +408,9 @@ int gsup_build_isd_req(const char *imsi, const char *msisdn,
     size_t off = 0;
     out[off++] = GSUP_MSG_ISD_REQ;
     if (gsup_put_imsi_ie(out, cap, &off, imsi) < 0) return -1;
-    if (gsup_enc_msisdn_ie(out, cap, &off, msisdn) < 0) return -1;
-
-    uint8_t cn = (cn_domain == GSUP_CN_DOMAIN_CS)
-                 ? GSUP_CN_DOMAIN_CS : GSUP_CN_DOMAIN_PS;
-    if (gsup_put_ie(out, cap, &off, GSUP_IE_CN_DOMAIN, &cn, 1) < 0)
+    if (gsup_enc_subscriber_data_ies(out, cap, &off, msisdn, NULL,
+                                     cn_domain, apns, n_apns) < 0)
         return -1;
-
-    /* GPRS PDP context list is PS-only; MSC/VLR CS ISD carries MSISDN only. */
-    if (cn == GSUP_CN_DOMAIN_PS && apns && n_apns > 0) {
-        if (gsup_put_ie(out, cap, &off, GSUP_IE_PDP_INFO_COMPL, NULL, 0) < 0)
-            return -1;
-        for (size_t i = 0; i < n_apns; i++) {
-            if (!apns[i].apn[0]) continue;
-            if (gsup_enc_pdp_info(out, cap, &off, &apns[i], i) < 0)
-                return -1;
-        }
-    }
     return (int)off;
 }
 

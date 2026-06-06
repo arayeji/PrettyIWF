@@ -129,6 +129,7 @@ struct map_session;
 /* Experimental-Result-Code (3GPP, vendor 10415). */
 #define DIAM_EXP_RC_USER_UNKNOWN                5001
 #define DIAM_EXP_RC_AUTH_DATA_UNAVAILABLE       4181
+#define DIAM_RC_AUTH_DATA_UNAVAILABLE           5014  /* some DRA/HSS on bad UTRAN AIR */
 #define DIAM_EXP_RC_RAT_NOT_ALLOWED             5421
 #define DIAM_EXP_RC_ROAMING_NOT_ALLOWED         5004
 
@@ -184,6 +185,12 @@ int  diameter_avp_find (const uint8_t *buf, size_t len,
 int  diameter_avp_find_recursive(const uint8_t *buf, size_t len,
                                  uint32_t code, uint32_t vendor_id,
                                  diameter_avp_t *out);
+
+/* 3GPP AVP lookup: match code and vendor 10415, or code with no V flag. */
+int  diameter_avp_find_3gpp(const uint8_t *buf, size_t len,
+                            uint32_t code, diameter_avp_t *out);
+int  diameter_avp_find_3gpp_recursive(const uint8_t *buf, size_t len,
+                                      uint32_t code, diameter_avp_t *out);
 
 /* Convenience: extract Result-Code (or Experimental-Result-Code if present)
  * and the textual Session-Id from an answer body. */

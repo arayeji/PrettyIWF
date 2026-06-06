@@ -2,9 +2,9 @@
 # Build the IWF and install binary + sample config (see Makefile install target).
 #
 # Usage:
-#   ./build-install.sh                 # plain GTP build, install under /usr/local
+#   ./build-install.sh                 # full build (MAP + GSUP + SMS), install under /usr/local
 #   PREFIX=/opt/iwf ./build-install.sh
-#   ./build-install.sh MAP_IWF_ENABLED=1    # requires libosmo-* dev packages
+#   ./build-install.sh MAP_IWF_ENABLED=0 SMS_IWF_ENABLED=0   # GTP-only
 #
 # On Windows: run from WSL, from this directory:
 #   bash ./build-install.sh
