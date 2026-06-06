@@ -41,6 +41,12 @@
 #define GSUP_IE_APN             0x12
 #define GSUP_IE_PDP_QOS         0x13
 #define GSUP_IE_CN_DOMAIN       0x28
+#define GSUP_IE_RAND            0x20   /* osmo GSUP resync (top-level IE) */
+#define GSUP_IE_AUTS            0x26
+#define GSUP_IE_NUM_VECTORS_REQ 0x52   /* OSMO_GSUP_NUM_VECTORS_REQ_IE */
+
+#define GSUP_RESYNC_RAND_LEN    16
+#define GSUP_RESYNC_AUTS_LEN    14
 
 #define GSUP_CAUSE_IMSI_UNKNOWN 0x02
 
@@ -58,7 +64,14 @@ typedef struct {
     bool     have_num_vectors;
     uint8_t  cn_domain;
     bool     have_cn_domain;
+    uint8_t  resync_rand[GSUP_RESYNC_RAND_LEN];
+    uint8_t  resync_auts[GSUP_RESYNC_AUTS_LEN];
+    bool     have_resync_rand;
+    bool     have_resync_auts;
 } gsup_parsed_t;
+
+#define gsup_parsed_have_resync(p) \
+    ((p) && (p)->have_resync_rand && (p)->have_resync_auts)
 
 int  gsup_parse_payload(const uint8_t *body, size_t len, gsup_parsed_t *out);
 int  gsup_imsi_from_payload(const uint8_t *body, size_t len,

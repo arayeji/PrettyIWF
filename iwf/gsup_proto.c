@@ -52,9 +52,22 @@ int gsup_parse_payload(const uint8_t *body, size_t len, gsup_parsed_t *out)
             out->have_imsi = out->imsi[0] != '\0';
             break;
         case GSUP_IE_NUM_VECTORS:
+        case GSUP_IE_NUM_VECTORS_REQ:
             if (l >= 1) {
                 out->num_vectors = v[0];
                 out->have_num_vectors = true;
+            }
+            break;
+        case GSUP_IE_RAND:
+            if (l == GSUP_RESYNC_RAND_LEN) {
+                memcpy(out->resync_rand, v, GSUP_RESYNC_RAND_LEN);
+                out->have_resync_rand = true;
+            }
+            break;
+        case GSUP_IE_AUTS:
+            if (l == GSUP_RESYNC_AUTS_LEN) {
+                memcpy(out->resync_auts, v, GSUP_RESYNC_AUTS_LEN);
+                out->have_resync_auts = true;
             }
             break;
         case GSUP_IE_CN_DOMAIN:

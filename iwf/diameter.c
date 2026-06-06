@@ -558,9 +558,20 @@ int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
                 DIAMETER_VENDOR_3GPP, s->visited_plmn_bcd, 3);
     }
 
+    /* Re-Synchronization-Info (1419): RAND || AUTS from GSUP SAI resync. */
+    if (s->have_resync) {
+        uint8_t rsi[16 + 14];
+        memcpy(rsi, s->resync_rand, 16);
+        memcpy(rsi + 16, s->resync_auts, 14);
+        avp_put(pkt, sizeof(pkt), &off, AVP_3GPP_RE_SYNCHRONIZATION_INFO,
+                DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
+                DIAMETER_VENDOR_3GPP, rsi, sizeof(rsi));
+    }
+
     /* Requested-E-UTRAN-Authentication-Info (1408) grouped AVP. */
     {
-        uint8_t nv = s->gsup_num_vectors > 0 ? s->gsup_num_vectors : 3;
+        uint8_t nv = s->gsup_num_vectors > 0 ? s->gsup_num_vectors
+                    : (s->have_resync ? 1 : 3);
         if (put_req_auth_info_group(pkt, sizeof(pkt), &off, nv) < 0)
             return -1;
     }
@@ -575,8 +586,9 @@ int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
         LOGE("diameter", "AIR imsi=%s: encoded AVP layout invalid", s->imsi_str);
         return -1;
     }
-    LOGI("diameter", "TX AIR imsi=%s sid=%s len=%zu",
-         s->imsi_str, s->diameter_session_id, off);
+    LOGI("diameter", "TX AIR imsi=%s sid=%s len=%zu%s",
+         s->imsi_str, s->diameter_session_id, off,
+         s->have_resync ? " resync=1" : "");
     int rc = diameter_tx(d, pkt, off);
     if (rc == 0) rt->map->stat_diam_tx++;
     return rc;
