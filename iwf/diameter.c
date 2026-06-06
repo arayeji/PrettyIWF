@@ -517,7 +517,7 @@ static int put_req_auth_info_group(uint8_t *pkt, size_t cap, size_t *off,
 {
     /* Use 1408 (E-UTRAN) not 1441 (UTRAN/GERAN): Open5GS DRA loads S6a dict
      * and rejects 1441 with "Bad message". Open5GS HSS expects Re-Synchronization-
-     * Info (1419) inside this grouped AVP, not at AIR top level. */
+     * Info (1411, OctetString) inside this grouped AVP, not at AIR top level. */
     uint8_t inner[128];
     size_t io = 0;
     uint32_t nv = num_vectors > 0 ? num_vectors : 3;
