@@ -608,8 +608,8 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
     LOGI("map", "AIA imsi=%s vectors=%u -> emitting MAP SAI Resp",
          s->imsi_str, s->n_av);
     if (s->gsup_originated && s->n_av > 0 && !auth_vector_has_ckik(&s->av[0]))
-        LOGW("map", "AIA imsi=%s: no CK/IK in HSS answer (3G needs UTRAN-Vector "
-             "with Confidentiality-Key/Integrity-Key AVPs)", s->imsi_str);
+        LOGW("map", "AIA imsi=%s: no CK/IK (Confidentiality-Key/625, Integrity-Key/626)",
+             s->imsi_str);
 
     if (s->n_av == 0) {
         LOGW("map", "AIA imsi=%s: no auth vectors in answer", s->imsi_str);
@@ -1082,29 +1082,12 @@ void map_iwf_on_pua(struct iwf_runtime *rt, map_session_t *s,
     send_tcap_end_with_result(rt, s, 1, MAP_OP_CODE_PURGE_MS, params, (size_t)pn);
 }
 
-static bool air_auth_data_unavailable(uint32_t rc)
-{
-    return rc == DIAM_RC_AUTH_DATA_UNAVAILABLE
-        || rc == DIAM_EXP_RC_AUTH_DATA_UNAVAILABLE;
-}
-
 void map_iwf_diameter_error(struct iwf_runtime *rt, map_session_t *s,
                             uint32_t rc)
 {
     if (s->gsup_originated) {
 #ifdef GSUP_PROXY_ENABLED
-        /* Retry with E-UTRAN/1408 only if UTRAN/1441 fails (e.g. DRA rejects 1441). */
-        if (s->map_op == MAP_OP_SAI && !s->air_eutran_fallback
-            && air_auth_data_unavailable(rc)) {
-            s->air_eutran_fallback = true;
-            s->diameter_hop_by_hop = 0;
-            s->diameter_end_to_end = 0;
-            LOGW("map", "AIR UTRAN/1441 rc=%u imsi=%s -> retry EUTRAN/1408",
-                 (unsigned)rc, s->imsi_str);
-            map_sess_touch(s);
-            if (diameter_send_air(rt, s) == 0)
-                return;
-        }
+        /* 3G GSUP: never fall back to 1408 — E-UTRAN vectors lack CK/IK. */
         gsup_map_proxy_diameter_error(rt, s, rc);
 #endif
         return;

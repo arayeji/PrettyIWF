@@ -83,7 +83,7 @@ struct map_session;
 /* 3GPP AVP codes (TS 29.272 §7.3 - all carry vendor-id 10415). */
 #define AVP_3GPP_VISITED_PLMN_ID                1407
 #define AVP_3GPP_REQ_EUTRAN_AUTH_INFO           1408
-#define AVP_3GPP_REQ_UTRAN_GERAN_AUTH_INFO      1441
+#define AVP_3GPP_REQ_UTRAN_GERAN_AUTH_INFO      1409  /* TS 29.272 §7.3.12; not 1441 (IDA-Flags) */
 #define AVP_3GPP_NUM_REQ_VECTORS                1410
 #define AVP_3GPP_RE_SYNCHRONIZATION_INFO        1411
 #define AVP_3GPP_IMMEDIATE_RESPONSE_PREFERRED   1412
@@ -95,8 +95,8 @@ struct map_session;
 #define AVP_3GPP_XRES                           1448
 #define AVP_3GPP_AUTN                           1449
 #define AVP_3GPP_KASME                          1450
-#define AVP_3GPP_CK                             1522
-#define AVP_3GPP_IK                             1520
+#define AVP_3GPP_CK                             625    /* Confidentiality-Key (29.229) */
+#define AVP_3GPP_IK                             626    /* Integrity-Key (29.229); not 1520/1522 */
 #define AVP_3GPP_SUBSCRIPTION_DATA              1400
 #define AVP_3GPP_MSISDN                          701
 #define AVP_3GPP_APN_CONFIGURATION_PROFILE      1429
@@ -129,7 +129,7 @@ struct map_session;
 /* Experimental-Result-Code (3GPP, vendor 10415). */
 #define DIAM_EXP_RC_USER_UNKNOWN                5001
 #define DIAM_EXP_RC_AUTH_DATA_UNAVAILABLE       4181
-#define DIAM_RC_AUTH_DATA_UNAVAILABLE           5014  /* some DRA/HSS on bad UTRAN AIR */
+#define DIAM_RC_INVALID_AVP_LENGTH              5014  /* e.g. grouped AVP sent as IDA-Flags (1441) */
 #define DIAM_EXP_RC_RAT_NOT_ALLOWED             5421
 #define DIAM_EXP_RC_ROAMING_NOT_ALLOWED         5004
 

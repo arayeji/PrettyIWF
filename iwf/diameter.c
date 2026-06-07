@@ -601,24 +601,25 @@ int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
     avp_put_str(pkt, sizeof(pkt), &off, AVP_USER_NAME,
                 DIAM_AVP_FLAG_MANDATORY, 0, s->imsi_str);
 
-    /* Visited-PLMN-Id (3 BCD bytes), V+M. */
+    /* Visited-PLMN-Id (3 BCD bytes), V+M — required by Open5GS HSS for Milenage. */
     if (s->have_visited_plmn) {
         avp_put(pkt, sizeof(pkt), &off, AVP_3GPP_VISITED_PLMN_ID,
                 DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
                 DIAMETER_VENDOR_3GPP, s->visited_plmn_bcd, 3);
+    } else {
+        LOGW("diameter", "AIR imsi=%s: no Visited-PLMN-Id (set [gsup_server] local_mnc)",
+             s->imsi_str);
     }
 
-    /* osmo-sgsn 3G: request UTRAN/GERAN vectors (1441).  HSS should answer with
-     * UTRAN-Vector (1415) containing CK+IK.  Fallback to 1408 on error. */
+    /* osmo-sgsn 3G: Requested-UTRAN-GERAN-Authentication-Info (1409) only.
+     * Do not use 1408 here — HSS returns E-UTRAN/KASME without CK/IK. */
     {
-        uint8_t nv = s->gsup_num_vectors > 0 ? s->gsup_num_vectors
-                    : (s->have_resync ? 1 : 3);
+        uint8_t nv = s->gsup_num_vectors > 0 ? s->gsup_num_vectors : 1;
         const uint8_t *rr = s->have_resync ? s->resync_rand : NULL;
         const uint8_t *ra = s->have_resync ? s->resync_auts : NULL;
-        uint32_t auth_avp = s->air_eutran_fallback
-                            ? AVP_3GPP_REQ_EUTRAN_AUTH_INFO
-                            : AVP_3GPP_REQ_UTRAN_GERAN_AUTH_INFO;
-        if (put_req_auth_info_group(pkt, sizeof(pkt), &off, auth_avp, nv, rr, ra) < 0)
+        if (put_req_auth_info_group(pkt, sizeof(pkt), &off,
+                                    AVP_3GPP_REQ_UTRAN_GERAN_AUTH_INFO,
+                                    nv, rr, ra) < 0)
             return -1;
     }
 
@@ -632,9 +633,8 @@ int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
         LOGE("diameter", "AIR imsi=%s: encoded AVP layout invalid", s->imsi_str);
         return -1;
     }
-    LOGI("diameter", "TX AIR imsi=%s sid=%s len=%zu auth=%s%s",
+    LOGI("diameter", "TX AIR imsi=%s sid=%s len=%zu auth=UTRAN/1409%s",
          s->imsi_str, s->diameter_session_id, off,
-         s->air_eutran_fallback ? "EUTRAN/1408" : "UTRAN/1441",
          s->have_resync ? " resync=1" : "");
     int rc = diameter_tx(d, pkt, off);
     if (rc == 0) rt->map->stat_diam_tx++;
