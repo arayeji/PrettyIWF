@@ -1706,6 +1706,14 @@ static int translate_delete_pdp_context(iwf_runtime_t *rt,
         return -1;
     }
 
+    if (s->state == SESS_WAIT_DS_RESP &&
+        s->sgsn_seq == (uint16_t)v1->seq) {
+        LOGI("translate",
+             "duplicate Delete-PDP-Req (retransmit) imsi=%s gn_seq=%u — ignoring",
+             s->key.imsi, (unsigned)(uint16_t)v1->seq);
+        return 0;
+    }
+
     s->sgsn_ep   = *from;
     s->sgsn_seq  = (uint16_t)v1->seq;
     s->state     = SESS_DELETING;
