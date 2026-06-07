@@ -143,8 +143,6 @@ typedef struct map_session {
     uint8_t             resync_rand[16];        /* SAI resync: MS RAND          */
     uint8_t             resync_auts[14];        /* SAI resync: AUTS (3GPP)      */
     bool                have_resync;            /* forward Re-Synchronization-Info */
-    bool                air_eutran_fallback;    /* AIR: retry with 1408 after 1441 fail */
-
     UT_hash_handle      hh_tid;                 /* indexed by tcap_dialogue_id */
     UT_hash_handle      hh_sid;                 /* indexed by diameter_session_id */
 } map_session_t;
