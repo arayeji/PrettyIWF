@@ -12,9 +12,7 @@
 
 #include "tcap.h"
 #include "ss7_link.h"
-
-struct iwf_runtime;
-struct map_session;
+#include "map_session.h"
 
 void gsup_map_proxy_init(struct iwf_runtime *rt);
 void gsup_map_proxy_shutdown(void);
