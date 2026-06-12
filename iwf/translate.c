@@ -1419,9 +1419,12 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
      * we leave pdp_type = 0 ("unknown"). */
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_END_USER_ADDRESS))) {
         uint8_t org = 0, type = 0;
-        uint32_t ipv4_ignored = 0;
-        if (gtpv1_decode_eua(ie, &org, &type, &ipv4_ignored) == 0)
+        uint32_t ipv4 = 0;
+        if (gtpv1_decode_eua(ie, &org, &type, &ipv4) == 0) {
             s->pdp_type = type;
+            if (ipv4)
+                s->ue_ipv4 = ipv4;
+        }
     }
 
     /* TEIDs SGSN advertises to us: control plane = where to send responses;
@@ -1557,11 +1560,9 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     /* Selection Mode = MS or network provided APN, subscribed verified (0). */
     gtpv2_enc_selection_mode(&e, 0);
 
-    /* PDN Type = IPv4 (consistent with EUA decoding below). */
+    /* PDN Type = IPv4. PAA: use static EUA from Gn if present, else dynamic. */
     gtpv2_enc_pdn_type(&e, GTPV2_PDN_TYPE_IPV4);
-
-    /* PAA - request 0.0.0.0 (dynamic allocation). */
-    gtpv2_enc_paa_ipv4(&e, 0);
+    gtpv2_enc_paa_ipv4(&e, s->ue_ipv4);
 
     /* Forward the MS's Protocol Configuration Options verbatim (GTPv1 IE 132 ->
      * GTPv2 IE 78). EPS PCO container layout is identical between TS 29.060

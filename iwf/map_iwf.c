@@ -922,18 +922,9 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
     if (s->gsup_originated) {
 #ifdef GSUP_PROXY_ENABLED
         extract_ula_subdata(s, body, body_len);
-        /* osmo-hlr pattern: ISD_REQ (subscription data) then minimal UL_RES. */
-        bool need_isd = false;
-        if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS)
-            need_isd = s->msisdn_str[0] != '\0';
-        else
-            need_isd = s->msisdn_str[0] != '\0' || s->n_ula_apns > 0;
-        if (s->have_ula_subdata && need_isd) {
-            if (gsup_map_proxy_send_isd(rt, s) < 0)
-                gsup_map_proxy_finish_ugl(rt, s);
-        } else {
-            gsup_map_proxy_finish_ugl(rt, s);
-        }
+        /* Answer GSUP UL_REQ with HSS subscription data in UL_RES (osmo-sgsn
+         * accepts PDP_INFO piggybacked on Update Location Result). */
+        gsup_map_proxy_finish_ugl(rt, s);
 #endif
         return;
     }
