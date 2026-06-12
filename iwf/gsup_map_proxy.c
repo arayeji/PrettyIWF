@@ -364,18 +364,18 @@ int gsup_map_proxy_send_isd(iwf_runtime_t *rt, map_session_t *s)
     s->gsup_isd_sent = true;
     map_sess_touch(s);
     {
-        char hexbuf[128] = {0};
-        int hlen = n < 40 ? n : 40;
+        char hexbuf[512] = {0};
+        int hlen = n < 150 ? n : 150;
         for (int i = 0; i < hlen; i++)
             snprintf(hexbuf + (size_t)i * 3, sizeof(hexbuf) - (size_t)i * 3,
                      "%02x ", gsup[i]);
-        LOGI("gsup", "TX ISD_REQ imsi=%s msisdn=%s cn=%s pdp=%u conn=%d peer=%s hex=%s",
+        LOGI("gsup", "TX ISD_REQ imsi=%s msisdn=%s cn=%s pdp=%u conn=%d peer=%s len=%d hex=%s",
              s->imsi_str,
              s->msisdn_str[0] ? s->msisdn_str : "(none)",
              s->gsup_cn_domain == GSUP_CN_DOMAIN_CS ? "CS" : "PS",
              (unsigned)(s->gsup_cn_domain == GSUP_CN_DOMAIN_CS
                         ? 0 : s->n_ula_apns),
-             s->gsup_conn_id, gsup_server_conn_peer(s->gsup_conn_id), hexbuf);
+             s->gsup_conn_id, gsup_server_conn_peer(s->gsup_conn_id), n, hexbuf);
     }
     return 0;
 }
@@ -556,15 +556,21 @@ void gsup_map_proxy_finish_ugl(iwf_runtime_t *rt, map_session_t *s)
         return;
     }
 
-    const char *msisdn = s->msisdn_str[0] ? s->msisdn_str : NULL;
-    const char *hlr = rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt : NULL;
+    const char *msisdn = NULL;
+    const char *hlr = NULL;
     const map_ula_apn_entry_t *apns = NULL;
     size_t n_apns = 0;
-    uint8_t cn = s->gsup_cn_domain;
+    uint8_t cn = 0;
 
-    if (s->gsup_cn_domain != GSUP_CN_DOMAIN_CS && s->n_ula_apns > 0) {
-        apns = s->ula_apns;
-        n_apns = s->n_ula_apns;
+    /* After ISD_REQ+ISD_RES, osmo-hlr sends UL_RES with IMSI only. */
+    if (!s->gsup_isd_sent) {
+        msisdn = s->msisdn_str[0] ? s->msisdn_str : NULL;
+        hlr = rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt : NULL;
+        cn = s->gsup_cn_domain;
+        if (s->gsup_cn_domain != GSUP_CN_DOMAIN_CS && s->n_ula_apns > 0) {
+            apns = s->ula_apns;
+            n_apns = s->n_ula_apns;
+        }
     }
 
     uint8_t gsup[2048];
@@ -584,11 +590,12 @@ void gsup_map_proxy_finish_ugl(iwf_runtime_t *rt, map_session_t *s)
             LOGW("gsup", "UL_RES send failed imsi=%s conn=%d",
                  s->imsi_str, s->gsup_conn_id);
         } else {
-            LOGI("gsup", "TX UL_RES imsi=%s msisdn=%s cn=%s pdp=%u conn=%d peer=%s len=%d hex=%s",
-                 s->imsi_str,
+            LOGI("gsup", "TX UL_RES imsi=%s isd=%d msisdn=%s cn=%s pdp=%u conn=%d peer=%s len=%d hex=%s",
+                 s->imsi_str, s->gsup_isd_sent ? 1 : 0,
                  msisdn ? msisdn : "(none)",
-                 cn == GSUP_CN_DOMAIN_CS ? "CS" : "PS",
-                 (unsigned)n_apns,
+                 cn ? (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS ? "CS" : "PS")
+                    : "(none)",
+                 (unsigned)(s->gsup_isd_sent ? 0 : n_apns),
                  s->gsup_conn_id, gsup_server_conn_peer(s->gsup_conn_id),
                  n, hexbuf);
         }
