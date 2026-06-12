@@ -104,6 +104,7 @@ struct map_session;
 #define AVP_3GPP_CONTEXT_IDENTIFIER             1423
 #define AVP_3GPP_ALL_APN_CONFIGS_INCLUDED       1428
 #define AVP_3GPP_PDN_TYPE                       1456
+#define AVP_3GPP_SERVED_PARTY_IP_ADDRESS        848
 #define AVP_3GPP_SERVICE_SELECTION              493
 #define AVP_3GPP_AMBR                           1435
 #define AVP_3GPP_MAX_REQUESTED_BANDWIDTH_UL     516

@@ -61,6 +61,10 @@ typedef struct {
     uint8_t     pdn_type_nr;            /* 0x21 v4, 0x57 v6, 0x8d v4v6; 0=default v4 */
     uint32_t    ambr_ul_kbps;
     uint32_t    ambr_dl_kbps;
+    bool        has_ue_ipv4;            /* static IPv4 from ULA Served-Party-IP-Address */
+    uint8_t     ue_ipv4[4];
+    bool        has_ue_ipv6;
+    uint8_t     ue_ipv6[16];
 } map_ula_apn_entry_t;
 
 /* One authentication vector parsed out of AIA, kept verbatim for repacking

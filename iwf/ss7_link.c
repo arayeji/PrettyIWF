@@ -62,6 +62,7 @@
 #  include <osmocom/core/msgb.h>
 #  include <osmocom/core/prim.h>
 #  include <osmocom/sigtran/osmo_ss7.h>
+#  include <osmocom/sigtran/protocol/mtp.h>
 #  include <osmocom/sigtran/sccp_sap.h>
 #  include <osmocom/sigtran/sccp_helpers.h>
 #endif
@@ -103,15 +104,18 @@ static int parse_pc_triplet(const char *pcs, unsigned *a,
     return 1;
 }
 
-/* Same ITU 3-8-3 packing as ss7_link_make_local_addr; returns OSMO_SS7_PC_INVALID
- * when local_pc is missing or not dotted a.b.c. */
-static uint32_t pack_map_local_pc(const struct iwf_runtime *rt)
+/* ITU 3-8-3 packing for dotted point code "a.b.c". */
+static uint32_t pack_dotted_pc(const char *pcs)
 {
-    const char *pcs = rt->cfg.map_local_pc;
     unsigned a = 0, b = 0, c = 0;
     if (!pcs || !pcs[0] || !parse_pc_triplet(pcs, &a, &b, &c))
         return OSMO_SS7_PC_INVALID;
     return ((a & 0x7u) << 11) | ((b & 0xffu) << 3) | (c & 0x7u);
+}
+
+static uint32_t pack_map_local_pc(const struct iwf_runtime *rt)
+{
+    return pack_dotted_pc(rt ? rt->cfg.map_local_pc : NULL);
 }
 
 void ss7_link_set_recv_cb(struct iwf_runtime *rt, ss7_recv_cb_t cb)
@@ -125,12 +129,12 @@ void ss7_gt_from_digits(const char *digits, uint8_t ssn, ss7_sccp_addr_t *out)
     memset(out, 0, sizeof(*out));
     if (!digits || !out) return;
     out->ssn = ssn;
-    out->gt_bcd[0] = 0x91; /* international E.164 TON/NPI */
+    /* TBCD digits only — osmo_sccp_addr carries NAI/NPI separately in ss7_to_osmo_addr. */
     int di = 0;
     for (size_t i = 0; digits[i] && di < 30; i++) {
         if (digits[i] < '0' || digits[i] > '9') continue;
         uint8_t d = (uint8_t)(digits[i] - '0');
-        size_t off = 1u + (size_t)(di / 2);
+        size_t off = (size_t)(di / 2);
         if (off >= sizeof(out->gt_bcd)) break;
         if ((di & 1) == 0)
             out->gt_bcd[off] = d;
@@ -139,11 +143,11 @@ void ss7_gt_from_digits(const char *digits, uint8_t ssn, ss7_sccp_addr_t *out)
         di++;
     }
     if (di & 1) {
-        size_t off = 1u + (size_t)(di / 2);
+        size_t off = (size_t)(di / 2);
         if (off < sizeof(out->gt_bcd))
             out->gt_bcd[off] = (uint8_t)((out->gt_bcd[off] & 0x0f) | 0xf0);
     }
-    out->gt_bcd_len = (uint8_t)(1u + (size_t)((di + 1) / 2));
+    out->gt_bcd_len = (uint8_t)((size_t)(di + 1) / 2);
     out->have_gt = (di > 0);
 }
 
@@ -184,10 +188,14 @@ int ss7_link_get_fd(const struct iwf_runtime *rt)
     return rt && rt->map ? rt->map->ss7.fd : -1;
 }
 
+#ifdef MAP_IWF_WITH_OSMO_SIGTRAN
+/* ss7_link_is_active() defined after ss7_impl_ctx below. */
+#else
 bool ss7_link_is_active(const struct iwf_runtime *rt)
 {
     return rt && rt->map && rt->map->ss7.active;
 }
+#endif
 
 #ifdef MAP_IWF_WITH_OSMO_SIGTRAN
 /* ====================================================================== */
@@ -204,9 +212,26 @@ struct ss7_impl_ctx {
     ss7_recv_cb_t          recv_cb_hlr;
 #endif
     int                    eventfd_to_main;       /* main thread polls this */
+    uint32_t               local_pc;              /* packed [map_iwf] local_pc */
+    uint32_t               stp_dpc;               /* packed [stp] remote_pc (MTP routes) */
 };
 
-#ifdef MAP_IWF_WITH_OSMO_SIGTRAN
+bool ss7_link_is_active(const struct iwf_runtime *rt)
+{
+    if (!rt || !rt->map || !rt->map->ss7.active || !rt->map->ss7.opaque)
+        return false;
+    struct ss7_impl_ctx *ctx = rt->map->ss7.opaque;
+    struct osmo_ss7_as *as =
+        osmo_ss7_as_find_by_name(ctx->ss7, IWF_SIMPLE_CLIENT_AS_NAME);
+    if (!as)
+        as = osmo_ss7_as_find_by_proto(ctx->ss7, OSMO_SS7_ASP_PROT_M3UA);
+    if (!as || !osmo_ss7_as_active(as))
+        return false;
+    struct osmo_ss7_asp *asp =
+        osmo_ss7_asp_find_by_proto(as, OSMO_SS7_ASP_PROT_M3UA);
+    return asp && osmo_ss7_asp_active(asp);
+}
+
 static void osmo_addr_to_ss7(const struct osmo_sccp_addr *in, ss7_sccp_addr_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -222,35 +247,92 @@ static void osmo_addr_to_ss7(const struct osmo_sccp_addr *in, ss7_sccp_addr_t *o
     }
 }
 
-static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *out,
-                             bool route_by_gt)
+static void ss7_put_gt_in_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *out)
+{
+    out->presence |= OSMO_SCCP_ADDR_T_GT;
+    out->gt.gti = OSMO_SCCP_GTI_TT_NPL_ENC_NAI;
+    out->gt.tt  = 0;
+    out->gt.npi = OSMO_SCCP_NPI_E164_ISDN;
+    out->gt.nai = OSMO_SCCP_NAI_INTL;
+    memcpy(out->gt.digits, in->gt_bcd, in->gt_bcd_len);
+}
+
+static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *out)
 {
     memset(out, 0, sizeof(*out));
     if (!in || !out) return;
     out->ssn = in->ssn;
     out->pc  = in->point_code;
-    if (route_by_gt && in->have_gt) {
-        out->ri = OSMO_SCCP_RI_GT;
-        out->presence = OSMO_SCCP_ADDR_T_GT | OSMO_SCCP_ADDR_T_SSN;
-        out->gt.gti = OSMO_SCCP_GTI_TT_NPL_ENC_NAI;
-        out->gt.tt  = 0;
-        out->gt.npi = OSMO_SCCP_NPI_E164_ISDN;
-        out->gt.nai = OSMO_SCCP_NAI_INTL;
-        memcpy(out->gt.digits, in->gt_bcd, in->gt_bcd_len);
-    } else {
-        out->ri = OSMO_SCCP_RI_SSN_PC;
-        out->presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
-        if (in->have_gt) {
-            out->presence |= OSMO_SCCP_ADDR_T_GT;
-            out->gt.gti = OSMO_SCCP_GTI_TT_NPL_ENC_NAI;
-            out->gt.tt  = 0;
-            out->gt.npi = OSMO_SCCP_NPI_E164_ISDN;
-            out->gt.nai = OSMO_SCCP_NAI_INTL;
-            memcpy(out->gt.digits, in->gt_bcd, in->gt_bcd_len);
-        }
-    }
+    /* libosmo SCRC does not implement RI=GT ("GT Routing not implemented yet").
+     * Always use PC+SSN; keep GT in CDPA for the STP to translate. */
+    out->ri = OSMO_SCCP_RI_SSN_PC;
+    out->presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
+    if (in->have_gt)
+        ss7_put_gt_in_osmo_addr(in, out);
 }
-#endif
+
+static void ss7_encode_outbound_called(const ss7_sccp_addr_t *in,
+                                       struct osmo_sccp_addr *out,
+                                       uint32_t stp_dpc)
+{
+    /* RI=SSN+PC; CDPA PC=[stp] remote_pc (STP own MTP PC). PC=0 makes osmo-stp
+     * try MTP route 0.0.0 → DUNA/no route; local STP PC triggers SCCP GTT. */
+    ss7_to_osmo_addr(in, out);
+    out->pc = osmo_ss7_pc_is_valid(stp_dpc) ? stp_dpc : 0;
+}
+
+/* libosmo keeps struct osmo_ss7_instance opaque; cfg layout varies between
+ * releases (e.g. secondary_pc added in 2.x).  Locate cfg.network_indicator
+ * relative to cfg.primary_pc using osmo_ss7_instance_get_*(). */
+static int iwf_ss7_set_network_indicator(struct osmo_ss7_instance *inst, uint8_t ni)
+{
+    if (!inst)
+        return -1;
+
+    size_t maxb = talloc_get_size(inst);
+    if (maxb == (size_t)-1 || maxb == 0 || maxb > 65536u)
+        maxb = 16384u;
+    uint8_t *base = (uint8_t *)inst;
+
+    uint32_t pc_orig = osmo_ss7_instance_get_primary_pc(inst);
+    ptrdiff_t pc_off = -1;
+
+    for (size_t off = 0; off + sizeof(uint32_t) <= maxb; off++) {
+        uint32_t saved;
+        memcpy(&saved, base + off, sizeof(saved));
+        uint32_t probe = saved ^ 0x01010101u;
+        memcpy(base + off, &probe, sizeof(probe));
+        if (osmo_ss7_instance_get_primary_pc(inst) == probe) {
+            memcpy(base + off, &saved, sizeof(saved));
+            pc_off = (ptrdiff_t)off;
+            break;
+        }
+        memcpy(base + off, &saved, sizeof(saved));
+    }
+    if (pc_off < 0) {
+        LOGE("ss7", "could not locate cfg.primary_pc (pc=0x%x) for NI setup",
+             (unsigned)pc_orig);
+        return -1;
+    }
+
+    static const ptrdiff_t ni_rel[] = { 4, 5, 8, 12, 16 };
+    for (size_t i = 0; i < sizeof(ni_rel) / sizeof(ni_rel[0]); i++) {
+        ptrdiff_t noff = pc_off + ni_rel[i];
+        if (noff < 0 || (size_t)noff >= maxb)
+            continue;
+        uint8_t saved = base[noff];
+        base[noff] = ni;
+        if (osmo_ss7_instance_get_network_indicator(inst) == ni) {
+            LOGI("ss7", "network-indicator=%u (cfg offset primary_pc+%td)",
+                 (unsigned)ni, ni_rel[i]);
+            return 0;
+        }
+        base[noff] = saved;
+    }
+
+    LOGE("ss7", "could not locate cfg.network_indicator near primary_pc");
+    return -1;
+}
 
 /* libosmo keeps struct osmo_ss7_as opaque; cfg offset varies (e.g. WITH_TCAP_LOADSHARING).
  * Find cfg by simple-client AS name prefix, then validate proto (see osmo ss7_as.h). */
@@ -388,21 +470,17 @@ int ss7_link_init(struct iwf_runtime *rt)
         m3ua_local = rt->cfg.stp_local_ip;
     }
 
-    /* osmo_sccp_simple_client_on_ss7_id() assigns default_pc only when it *creates*
-     * the SS7 instance. If instance 0 already exists with primary_pc == 0, libosmo
-     * treats 0 as a valid OPC (osmo_ss7_pc_is_valid(0)) and does not overwrite it.
-     * Older IWF called osmo_ss7_instance_find_or_create(0) before simple_client,
-     * which produced exactly that — drop a stale inst-0 so OPC comes from local_pc. */
+    /* Drop stale inst-0; NI is applied after simple_client once primary_pc is set. */
     {
         struct osmo_ss7_instance *stale = osmo_ss7_instance_find(0);
         if (stale) {
-            LOGW("ss7", "destroying pre-existing SS7 instance 0 before M3UA client (OPC from local_pc)");
+            LOGW("ss7", "destroying pre-existing SS7 instance 0 before M3UA client");
             osmo_ss7_instance_destroy(stale);
         }
     }
 
-    ctx->sccp = osmo_sccp_simple_client(
-        ctx->tall_ctx, "iwf",
+    ctx->sccp = osmo_sccp_simple_client_on_ss7_id(
+        ctx->tall_ctx, 0, "iwf",
         default_pc,
         OSMO_SS7_ASP_PROT_M3UA,
         /* default_local_port */  (int)rt->cfg.stp_local_port,
@@ -423,6 +501,16 @@ int ss7_link_init(struct iwf_runtime *rt)
         talloc_free(ctx->tall_ctx);
         free(ctx);
         return -1;
+    }
+
+    if (iwf_ss7_set_network_indicator(ctx->ss7, rt->cfg.stp_network_indicator) < 0) {
+        LOGE("ss7", "failed to set network-indicator=%u — STP may reject M3UA DATA",
+             (unsigned)rt->cfg.stp_network_indicator);
+    } else if (osmo_ss7_instance_get_network_indicator(ctx->ss7)
+               != rt->cfg.stp_network_indicator) {
+        LOGE("ss7", "network-indicator readback %u != config %u",
+             (unsigned)osmo_ss7_instance_get_network_indicator(ctx->ss7),
+             (unsigned)rt->cfg.stp_network_indicator);
     }
 
     /* RKM: xua_rkm_send_reg_req() omits ROUTE_CTX when routing_key.context==0, so the
@@ -449,15 +537,14 @@ int ss7_link_init(struct iwf_runtime *rt)
             }
             struct osmo_ss7_asp *asp =
                 osmo_ss7_asp_find_by_proto(as, OSMO_SS7_ASP_PROT_M3UA);
-            /* osmo_sccp_simple_client() may already have brought the ASP up;
-             * a second restart while ACTIVE causes duplicate ASPAC/ACK on STP. */
+            /* simple_client may ASP-UP before we patch RKM; restart so STP
+             * sees RCTX/OPC from [stp] routing_context + [map_iwf] local_pc. */
             if (asp) {
-                if (osmo_ss7_asp_active(asp))
-                    LOGI("ss7", "M3UA ASP already ACTIVE; skip asp_restart (RCTX=%u)",
-                         (unsigned)rt->cfg.stp_routing_context);
-                else
-                    osmo_ss7_asp_restart(asp);
+                LOGI("ss7", "restarting M3UA ASP after RKM patch RCTX=%u OPC=0x%x",
+                     (unsigned)rt->cfg.stp_routing_context, (unsigned)default_pc);
+                osmo_ss7_asp_restart(asp);
             }
+            iwf_ss7_set_network_indicator(ctx->ss7, rt->cfg.stp_network_indicator);
         } else {
             LOGW("ss7", "could not find M3UA AS for RKM");
         }
@@ -480,6 +567,13 @@ int ss7_link_init(struct iwf_runtime *rt)
     LOGI("ss7", "SS7 primary OPC packed 0x%x (config %s)",
          (unsigned)default_pc,
          rt->cfg.map_local_pc[0] ? rt->cfg.map_local_pc : "?");
+
+    ctx->local_pc = default_pc;
+    ctx->stp_dpc  = pack_dotted_pc(rt->cfg.stp_remote_pc);
+    LOGI("ss7", "outbound MAP: SCCP CDPA GT+SSN, CDPA PC=%s (STP local MTP for GTT)",
+         osmo_ss7_pc_is_valid(ctx->stp_dpc)
+             ? rt->cfg.stp_remote_pc
+             : "0");
 
     rt->map->ss7.opaque = ctx;
     rt->map->ss7.active = true;
@@ -521,12 +615,15 @@ static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
 
     struct osmo_sccp_addr called_addr = {0};
     struct osmo_sccp_addr calling_addr = {0};
-    bool called_gt = called && called->have_gt;
-    bool calling_gt = calling && calling->have_gt;
-    ss7_to_osmo_addr(called, &called_addr, called_gt);
-    ss7_to_osmo_addr(calling, &calling_addr, calling_gt);
+    ss7_encode_outbound_called(called, &called_addr, ctx->stp_dpc);
+    ss7_to_osmo_addr(calling, &calling_addr);
+    if (osmo_ss7_pc_is_valid(ctx->local_pc))
+        calling_addr.pc = ctx->local_pc;
 
-    return osmo_sccp_tx_unitdata_msg(user, &calling_addr, &called_addr, msg);
+    int rc = osmo_sccp_tx_unitdata_msg(user, &calling_addr, &called_addr, msg);
+    if (rc < 0)
+        msgb_free(msg);
+    return rc;
 }
 
 int ss7_link_send_tcap(struct iwf_runtime *rt,

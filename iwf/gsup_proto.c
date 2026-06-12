@@ -325,13 +325,32 @@ static int gsup_enc_pdp_info(uint8_t *out, size_t cap, size_t *off,
                      &ctx, 1) < 0)
         return -1;
 
-    uint8_t pdp_addr[2] = { 0xF1, 0x21 };
-    if (e->pdn_type_nr == 0x57)
-        pdp_addr[1] = 0x57;
-    else if (e->pdn_type_nr == 0x8d)
-        pdp_addr[1] = 0x8d;
+    uint8_t pdp_addr[22];
+    size_t pdp_addr_len = 2;
+    uint8_t pdn_type = e->pdn_type_nr ? e->pdn_type_nr : GTPV1_PDP_TYPE_IPV4;
+
+    pdp_addr[0] = 0xF1;
+    pdp_addr[1] = pdn_type;
+
+    if (pdn_type == GTPV1_PDP_TYPE_IPV4 && e->has_ue_ipv4) {
+        memcpy(pdp_addr + 2, e->ue_ipv4, 4);
+        pdp_addr_len = 6;
+    } else if (pdn_type == GTPV1_PDP_TYPE_IPV6 && e->has_ue_ipv6) {
+        memcpy(pdp_addr + 2, e->ue_ipv6, 16);
+        pdp_addr_len = 18;
+    } else if (pdn_type == GTPV1_PDP_TYPE_IPV4V6) {
+        if (e->has_ue_ipv4) {
+            memcpy(pdp_addr + 2, e->ue_ipv4, 4);
+            pdp_addr_len = 6;
+        }
+        if (e->has_ue_ipv6) {
+            memcpy(pdp_addr + pdp_addr_len, e->ue_ipv6, 16);
+            pdp_addr_len += 16;
+        }
+    }
+
     if (gsup_put_sub(pdp, sizeof(pdp), &po, GSUP_IE_PDP_ADDRESS,
-                     pdp_addr, sizeof(pdp_addr)) < 0)
+                     pdp_addr, pdp_addr_len) < 0)
         return -1;
 
     uint8_t apn_wire[68];
