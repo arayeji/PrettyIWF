@@ -351,10 +351,11 @@ int gsup_map_proxy_send_isd(iwf_runtime_t *rt, map_session_t *s)
     if (!rt || !s || !s->gsup_originated) return -1;
     if (gsup_resolve_conn(s) < 0) return -1;
 
+    const char *hlr = rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt : NULL;
     uint8_t gsup[2048];
     int n = gsup_build_isd_req(s->imsi_str, s->msisdn_str,
                                s->ula_apns, s->n_ula_apns,
-                               s->gsup_cn_domain,
+                               s->gsup_cn_domain, hlr,
                                gsup, sizeof(gsup));
     if (n <= 0) return -1;
     if (proxy_send_gsup(s->gsup_conn_id, gsup, (size_t)n) < 0)

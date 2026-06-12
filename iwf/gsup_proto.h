@@ -91,7 +91,7 @@ int  gsup_build_ul_err(const char *imsi, uint8_t cause,
                        uint8_t *out, size_t cap);
 int  gsup_build_isd_req(const char *imsi, const char *msisdn,
                         const map_ula_apn_entry_t *apns, size_t n_apns,
-                        uint8_t cn_domain,
+                        uint8_t cn_domain, const char *hlr_number,
                         uint8_t *out, size_t cap);
 int  gsup_build_loc_cancel_req(const char *imsi, uint8_t cancel_type,
                                uint8_t *out, size_t cap);
