@@ -419,14 +419,14 @@ int gsup_build_ul_res(const char *imsi, const char *msisdn,
 
 int gsup_build_isd_req(const char *imsi, const char *msisdn,
                        const map_ula_apn_entry_t *apns, size_t n_apns,
-                       uint8_t cn_domain,
+                       uint8_t cn_domain, const char *hlr_number,
                        uint8_t *out, size_t cap)
 {
     if (!imsi || !out) return -1;
     size_t off = 0;
     out[off++] = GSUP_MSG_ISD_REQ;
     if (gsup_put_imsi_ie(out, cap, &off, imsi) < 0) return -1;
-    if (gsup_enc_subscriber_data_ies(out, cap, &off, msisdn, NULL,
+    if (gsup_enc_subscriber_data_ies(out, cap, &off, msisdn, hlr_number,
                                      cn_domain, apns, n_apns) < 0)
         return -1;
     return (int)off;
