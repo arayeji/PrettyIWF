@@ -5,8 +5,9 @@
  * association. M3UA is the underlying transport; we run as an ASP (Application
  * Server Process) in IPSP-client mode, ASP-UP -> ACTIVE.
  *
- * GT routing is via osmo-stp's existing tables; we just present an SSN +
- * Point Code and let the STP forward to the foreign SGSN over GRX.
+ * Outbound MAP toward a partner HLR GT uses SCCP RI=PC+SSN (libosmo cannot
+ * route RI=GT locally).  The called-party GT is included for osmo-stp GTT;
+ * DPC is [stp] remote_pc (or 0 via the simple_client default route).
  *
  * Build-time switch
  * -----------------

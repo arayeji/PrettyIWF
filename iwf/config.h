@@ -56,6 +56,9 @@ typedef struct {
      * omit ROUTE_CTX so SG allocates (libosmo). Default 1 avoids clashes
      * with stacks that commonly use RCTX 3 (e.g. osmo-sgsn). */
     uint32_t    stp_routing_context;
+    /* MTP Network Indicator in M3UA protocol data (Q.704). Must match the
+     * STP cs7 instance (osmo-stp: network-indicator reserved = 3). */
+    uint8_t     stp_network_indicator;
 
     /* [diameter_s6d] */
     char        diam_peer_ip[64];

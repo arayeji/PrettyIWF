@@ -202,8 +202,14 @@ static int sgsn_addr_ipv4(iwf_runtime_t *rt, uint8_t *out, size_t cap)
 
 static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
                            const uint8_t *arg, size_t arg_len,
-                           int conn_id)
+                           int conn_id, uint8_t cn_domain)
 {
+    if (!ss7_link_is_active(g_rt)) {
+        LOGW("gsup", "MAP %s imsi=%s: M3UA ASP not active (wait for STP)",
+             map_op_str(op), route->imsi);
+        return -1;
+    }
+
     uint32_t tid = map_sess_new_tid();
     map_app_ctx_t ac = (op == MAP_OP_SAI)
                        ? MAP_AC_INFO_RETRIEVAL_V3
@@ -230,10 +236,14 @@ static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
     ss7_sccp_addr_t called, calling;
     ss7_gt_from_digits(route->hlr_gt, route->hlr_ssn, &called);
     memset(&calling, 0, sizeof(calling));
+    uint8_t orig_ssn = (cn_domain == GSUP_CN_DOMAIN_CS)
+                       ? SS7_SSN_MSC : g_rt->cfg.map_local_ssn;
     if (route->src_gt[0])
-        ss7_gt_from_digits(route->src_gt, g_rt->cfg.map_local_ssn, &calling);
+        ss7_gt_from_digits(route->src_gt, orig_ssn, &calling);
     else
         ss7_link_make_local_addr(g_rt, &calling);
+    if (cn_domain == GSUP_CN_DOMAIN_CS)
+        calling.ssn = SS7_SSN_MSC;
 
     if (ss7_link_send_tcap_ex(g_rt, &called,
                               calling.have_gt ? &calling : NULL,
@@ -386,7 +396,8 @@ static int handle_sai(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
     uint8_t nv = req->have_num_vectors ? req->num_vectors : 3;
     int an = map_encode_sai_arg(route->imsi, nv, arg, sizeof(arg));
     if (an < 0) return -1;
-    return send_map_to_hlr(route, MAP_OP_SAI, arg, (size_t)an, conn_id);
+    uint8_t cn = (req && req->have_cn_domain) ? req->cn_domain : GSUP_CN_DOMAIN_PS;
+    return send_map_to_hlr(route, MAP_OP_SAI, arg, (size_t)an, conn_id, cn);
 }
 
 static int handle_ul(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
@@ -413,7 +424,8 @@ static int handle_ul(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
                                 sal > 0 ? saddr : NULL, sal > 0 ? (size_t)sal : 0,
                                 arg, sizeof(arg));
     if (an < 0) return -1;
-    return send_map_to_hlr(route, MAP_OP_UGL, arg, (size_t)an, conn_id);
+    uint8_t cn = (req && req->have_cn_domain) ? req->cn_domain : GSUP_CN_DOMAIN_PS;
+    return send_map_to_hlr(route, MAP_OP_UGL, arg, (size_t)an, conn_id, cn);
 }
 
 void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,

@@ -661,6 +661,27 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
 }
 
 /* Extract subscription data from ULA (MSISDN, APN config, AMBR). */
+static int ula_parse_served_party_ip(const uint8_t *data, size_t len,
+                                     bool *has_v4, uint8_t v4[4],
+                                     bool *has_v6, uint8_t v6[16])
+{
+    if (!data || len < 2)
+        return -1;
+
+    uint16_t addr_type = (uint16_t)((data[0] << 8) | data[1]);
+    if (addr_type == 1 && len >= 6) {
+        if (has_v4) *has_v4 = true;
+        if (v4) memcpy(v4, data + 2, 4);
+        return 0;
+    }
+    if (addr_type == 2 && len >= 18) {
+        if (has_v6) *has_v6 = true;
+        if (v6) memcpy(v6, data + 2, 16);
+        return 0;
+    }
+    return -1;
+}
+
 static int ula_add_apn_entry(map_session_t *s, const diameter_avp_t *apnc)
 {
     if (!s || !apnc || s->n_ula_apns >= MAP_MAX_ULA_APN)
@@ -722,6 +743,30 @@ static int ula_add_apn_entry(map_session_t *s, const diameter_avp_t *apnc)
                               DIAMETER_VENDOR_3GPP, &dl) == 0 &&
             dl.data_len == 4)
             e->ambr_dl_kbps = iwf_be32(dl.data);
+    }
+
+    diameter_avp_t ip_it;
+    if (diameter_avp_first(apnc->data, apnc->data_len, &ip_it) == 0) {
+        for (;;) {
+            if (ip_it.code == AVP_3GPP_SERVED_PARTY_IP_ADDRESS &&
+                ip_it.vendor_id == DIAMETER_VENDOR_3GPP) {
+                bool hv4 = false, hv6 = false;
+                uint8_t v4[4], v6[16];
+                if (ula_parse_served_party_ip(ip_it.data, ip_it.data_len,
+                                              &hv4, v4, &hv6, v6) == 0) {
+                    if (hv4) {
+                        e->has_ue_ipv4 = true;
+                        memcpy(e->ue_ipv4, v4, 4);
+                    }
+                    if (hv6) {
+                        e->has_ue_ipv6 = true;
+                        memcpy(e->ue_ipv6, v6, 16);
+                    }
+                }
+            }
+            if (diameter_avp_next(apnc->data, apnc->data_len, &ip_it) < 0)
+                break;
+        }
     }
 
     s->n_ula_apns++;
@@ -844,11 +889,18 @@ static void extract_ula_subdata(map_session_t *s,
              (unsigned long)s->ula_ambr_ul_bps,
              (unsigned long)s->ula_ambr_dl_bps);
         for (uint8_t i = 0; i < s->n_ula_apns; i++) {
-            LOGI("map", "  ULA APN[%u] ctx=%u apn=%s pdp=0x%02x",
-                 (unsigned)i,
-                 (unsigned)s->ula_apns[i].context_id,
-                 s->ula_apns[i].apn,
-                 (unsigned)s->ula_apns[i].pdn_type_nr);
+            const map_ula_apn_entry_t *a = &s->ula_apns[i];
+            if (a->has_ue_ipv4) {
+                LOGI("map", "  ULA APN[%u] ctx=%u apn=%s pdp=0x%02x static_v4=%u.%u.%u.%u",
+                     (unsigned)i, (unsigned)a->context_id, a->apn,
+                     (unsigned)a->pdn_type_nr,
+                     (unsigned)a->ue_ipv4[0], (unsigned)a->ue_ipv4[1],
+                     (unsigned)a->ue_ipv4[2], (unsigned)a->ue_ipv4[3]);
+            } else {
+                LOGI("map", "  ULA APN[%u] ctx=%u apn=%s pdp=0x%02x",
+                     (unsigned)i, (unsigned)a->context_id, a->apn,
+                     (unsigned)a->pdn_type_nr);
+            }
         }
     }
 }

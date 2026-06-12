@@ -39,6 +39,7 @@ static void defaults(iwf_config_t *c)
     strncpy(c->stp_ip,   "127.0.0.1", sizeof(c->stp_ip)   - 1);
     c->stp_port           = 2905;
     c->stp_routing_context = 1u;
+    c->stp_network_indicator = 0;   /* international; set reserved (3) for osmo-stp lab */
     c->diam_peer_port     = 3868;
     c->diam_watchdog_ms   = 30000;
     c->diam_request_timeout_ms = 10000;
@@ -66,6 +67,25 @@ static void defaults(iwf_config_t *c)
     strncpy(c->smpp_system_id, "iwf", sizeof(c->smpp_system_id) - 1);
     strncpy(c->smpp_password, "changeme", sizeof(c->smpp_password) - 1);
 #endif
+}
+
+static uint8_t parse_network_indicator(const char *val)
+{
+    if (!val || !*val)
+        return 0;
+    if (!strcasecmp(val, "international"))
+        return 0;
+    if (!strcasecmp(val, "spare"))
+        return 1;
+    if (!strcasecmp(val, "national"))
+        return 2;
+    if (!strcasecmp(val, "reserved"))
+        return 3;
+    long n = strtol(val, NULL, 0);
+    if (n >= 0 && n <= 3)
+        return (uint8_t)n;
+    LOGW("config", "invalid network_indicator %s, using international (0)", val);
+    return 0;
 }
 
 static uint8_t parse_rat_type(const char *val)
@@ -318,6 +338,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "remote_pc"))  copy_str(out->stp_remote_pc, sizeof(out->stp_remote_pc), val);
             else if (!strcmp(key, "routing_context") || !strcmp(key, "rctx"))
                 out->stp_routing_context = (uint32_t)strtoul(val, NULL, 0);
+            else if (!strcmp(key, "network_indicator") || !strcmp(key, "ni"))
+                out->stp_network_indicator = parse_network_indicator(val);
             else LOGW("config", "unknown key [stp].%s", key);
         } else if (!strcmp(section, "diameter_s6d")) {
             if      (!strcmp(key, "peer_ip"))       copy_str(out->diam_peer_ip, sizeof(out->diam_peer_ip), val);
@@ -424,11 +446,12 @@ void iwf_config_dump(const iwf_config_t *c)
                          (unsigned)c->stp_local_port);
             else
                 strcpy(lports, "ephemeral");
-            LOGI("config", "map_iwf: stp M3UA bind %s:%s -> peer %s:%u remote_pc=%s rctx=%u",
+            LOGI("config", "map_iwf: stp M3UA bind %s:%s -> peer %s:%u remote_pc=%s rctx=%u ni=%u",
                  c->stp_local_ip[0] ? c->stp_local_ip : "(any)",
                  lports, c->stp_ip, c->stp_port,
                  c->stp_remote_pc[0] ? c->stp_remote_pc : "(unset)",
-                 (unsigned)c->stp_routing_context);
+                 (unsigned)c->stp_routing_context,
+                 (unsigned)c->stp_network_indicator);
         }
         LOGI("config", "map_iwf: diameter peer=%s:%u local=%s origin=%s/%s dest=%s/%s "
                        "watchdog=%dms timeout=%dms",
