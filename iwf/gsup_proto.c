@@ -258,36 +258,35 @@ static int gsup_enc_isdn_addr_ie(uint8_t *out, size_t cap, size_t *off,
                                  uint8_t tag, const char *digits)
 {
     if (!digits || !digits[0]) return 0;
-    /* OsmoMSC gsm48_decode_bcd_number2(..., h_len=0): [len][TBCD digits only]. */
-    uint8_t lv[16];
-    size_t in_len = 0;
-    for (size_t k = 0; digits[k]; k++) {
-        if (digits[k] >= '0' && digits[k] <= '9')
-            in_len++;
-    }
-    if (in_len == 0) return 0;
 
-    lv[0] = (uint8_t)(in_len / 2);
-    if (in_len & 1)
-        lv[0]++;
+    /* Osmo GSUP MSISDN/HLR IE: AddressString = [0x91 TON/NPI][TBCD digits].
+     * No inner length byte (GSUP IE length covers the value). osmo-sgsn stores
+     * this verbatim and gsm48_decode_called() requires NPI=ISDN (plan 1). */
+    uint8_t val[16];
+    size_t pos = 0;
+    val[pos++] = 0x91; /* international number, ISDN/telephony (E.164) */
 
-    uint8_t *bcd_cur = lv + 1;
-    size_t di = 0;
-    for (size_t k = 0; digits[k]; k++) {
+    int di = 0;
+    for (size_t k = 0; digits[k] && pos < sizeof(val); k++) {
         if (digits[k] < '0' || digits[k] > '9') continue;
         uint8_t d = (uint8_t)(digits[k] - '0');
+        size_t boff = pos + (size_t)(di / 2);
+        if (boff >= sizeof(val)) break;
         if ((di & 1) == 0)
-            *bcd_cur = d;
+            val[boff] = d;
         else
-            *bcd_cur++ |= (uint8_t)(d << 4);
+            val[boff] = (uint8_t)(val[boff] | (d << 4));
         di++;
     }
-    if (di & 1)
-        *bcd_cur++ |= 0xf0;
-
-    size_t total = (size_t)(bcd_cur - lv);
-    if (total > sizeof(lv)) return -1;
-    return gsup_put_ie(out, cap, off, tag, lv, total);
+    if (di == 0) return 0;
+    if (di & 1) {
+        size_t boff = pos + (size_t)(di / 2);
+        if (boff >= sizeof(val)) return -1;
+        val[boff] = (uint8_t)((val[boff] & 0x0f) | 0xf0);
+    }
+    pos += (size_t)((di + 1) / 2);
+    if (pos > sizeof(val)) return -1;
+    return gsup_put_ie(out, cap, off, tag, val, pos);
 }
 
 static int gsup_enc_msisdn_ie(uint8_t *out, size_t cap, size_t *off,
