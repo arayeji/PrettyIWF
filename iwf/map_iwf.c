@@ -922,8 +922,7 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
     if (s->gsup_originated) {
 #ifdef GSUP_PROXY_ENABLED
         extract_ula_subdata(s, body, body_len);
-        /* osmo-hlr pattern: ISD_REQ (subscription + static PDP address) then
-         * minimal UL_RES after SGSN ISD_RES. */
+        /* ISD_REQ (subscription + static PDP address) then UL_RES with MSISDN. */
         bool need_isd = false;
         if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS)
             need_isd = s->msisdn_str[0] != '\0';

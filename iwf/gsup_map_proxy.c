@@ -557,21 +557,17 @@ void gsup_map_proxy_finish_ugl(iwf_runtime_t *rt, map_session_t *s)
         return;
     }
 
-    const char *msisdn = NULL;
-    const char *hlr = NULL;
+    const char *msisdn = s->msisdn_str[0] ? s->msisdn_str : NULL;
+    const char *hlr = rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt : NULL;
     const map_ula_apn_entry_t *apns = NULL;
     size_t n_apns = 0;
-    uint8_t cn = 0;
+    uint8_t cn = s->gsup_cn_domain;
 
-    /* After ISD_REQ+ISD_RES, osmo-hlr sends UL_RES with IMSI only. */
-    if (!s->gsup_isd_sent) {
-        msisdn = s->msisdn_str[0] ? s->msisdn_str : NULL;
-        hlr = rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt : NULL;
-        cn = s->gsup_cn_domain;
-        if (s->gsup_cn_domain != GSUP_CN_DOMAIN_CS && s->n_ula_apns > 0) {
-            apns = s->ula_apns;
-            n_apns = s->n_ula_apns;
-        }
+    /* MSISDN (and HLR/CN) always in UL_RES — osmo-msc requires MSISDN here for
+     * CS attach/calls. PS PDP/APN details stay ISD-first when ISD was sent. */
+    if (!s->gsup_isd_sent && cn != GSUP_CN_DOMAIN_CS && s->n_ula_apns > 0) {
+        apns = s->ula_apns;
+        n_apns = s->n_ula_apns;
     }
 
     uint8_t gsup[2048];
@@ -596,7 +592,7 @@ void gsup_map_proxy_finish_ugl(iwf_runtime_t *rt, map_session_t *s)
                  msisdn ? msisdn : "(none)",
                  cn ? (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS ? "CS" : "PS")
                     : "(none)",
-                 (unsigned)(s->gsup_isd_sent ? 0 : n_apns),
+                 (unsigned)n_apns,
                  s->gsup_conn_id, gsup_server_conn_peer(s->gsup_conn_id),
                  n, hexbuf);
         }
