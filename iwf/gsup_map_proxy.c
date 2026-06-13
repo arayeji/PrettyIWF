@@ -350,6 +350,8 @@ int gsup_map_proxy_send_isd(iwf_runtime_t *rt, map_session_t *s)
 {
     if (!rt || !s || !s->gsup_originated) return -1;
     if (gsup_resolve_conn(s) < 0) return -1;
+    if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS && !s->msisdn_str[0])
+        return -1;
 
     const char *hlr = rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt : NULL;
     uint8_t gsup[2048];
@@ -546,25 +548,37 @@ void gsup_map_proxy_finish_sai(iwf_runtime_t *rt, map_session_t *s)
     map_sess_remove(s);
 }
 
+void gsup_map_proxy_abort_ugl(iwf_runtime_t *rt, map_session_t *s)
+{
+    if (!rt || !s || !s->gsup_originated) return;
+    reply_gsup_err(s->gsup_conn_id, s->imsi_str, GSUP_MSG_UL_REQ,
+                   GSUP_CAUSE_IMSI_UNKNOWN);
+    s->gsup_originated = false;
+    map_sess_remove(s);
+}
+
 void gsup_map_proxy_finish_ugl(iwf_runtime_t *rt, map_session_t *s)
 {
     if (!rt || !s || !s->gsup_originated) return;
     if (gsup_resolve_conn(s) < 0) {
-        reply_gsup_err(s->gsup_conn_id, s->imsi_str, GSUP_MSG_UL_REQ,
-                       GSUP_CAUSE_IMSI_UNKNOWN);
-        s->gsup_originated = false;
-        map_sess_remove(s);
+        gsup_map_proxy_abort_ugl(rt, s);
         return;
     }
 
-    const char *msisdn = s->msisdn_str[0] ? s->msisdn_str : NULL;
     const char *hlr = rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt : NULL;
     const map_ula_apn_entry_t *apns = NULL;
     size_t n_apns = 0;
     uint8_t cn = s->gsup_cn_domain;
 
-    /* MSISDN (and HLR/CN) always in UL_RES — osmo-msc requires MSISDN here for
-     * CS attach/calls. PS PDP/APN details stay ISD-first when ISD was sent. */
+    /* CS: MSISDN is delivered in ISD_REQ (step 3); UL_RES is IMSI + HLR/CN only.
+     * PS: repeat MSISDN in UL_RES when ISD was skipped; PDP/APN stay ISD-first. */
+    const char *msisdn = NULL;
+    if (cn == GSUP_CN_DOMAIN_CS && s->gsup_isd_sent) {
+        msisdn = NULL;
+    } else if (s->msisdn_str[0]) {
+        msisdn = s->msisdn_str;
+    }
+
     if (!s->gsup_isd_sent && cn != GSUP_CN_DOMAIN_CS && s->n_ula_apns > 0) {
         apns = s->ula_apns;
         n_apns = s->n_ula_apns;

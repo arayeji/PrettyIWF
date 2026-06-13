@@ -779,6 +779,17 @@ static void decode_ula_msisdn(const uint8_t *data, size_t n, char *out, size_t c
     out[0] = '\0';
     if (!data || n == 0) return;
 
+    /* Some HSS builds store plain ASCII digits (no TBCD / TON-NPI). */
+    if (data[0] >= '0' && data[0] <= '9') {
+        size_t o = 0;
+        for (size_t i = 0; i < n && o + 1 < cap; i++) {
+            if (data[i] >= '0' && data[i] <= '9')
+                out[o++] = (char)data[i];
+        }
+        out[o] = '\0';
+        return;
+    }
+
     /* TS 29.329 MSISDN AVP: optional leading TON/NPI (e.g. 0x91), not digits. */
     size_t start = 0;
     if (n > 0 && (data[0] & 0x0f) == 0x01) /* ISDN numbering plan */
@@ -826,6 +837,12 @@ static void extract_ula_subdata(map_session_t *s,
     }
 
     s->have_ula_subdata = true;
+
+    if (!s->msisdn_str[0] &&
+        diameter_avp_find(sd.data, sd.data_len, AVP_3GPP_MSISDN,
+                          DIAMETER_VENDOR_3GPP, &msisdn_avp) == 0)
+        decode_ula_msisdn(msisdn_avp.data, msisdn_avp.data_len,
+                          s->msisdn_str, sizeof(s->msisdn_str));
 
     /* CS GSUP: MSISDN only toward MSC; skip GPRS APN walk. */
 #ifdef GSUP_PROXY_ENABLED
@@ -922,15 +939,23 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
     if (s->gsup_originated) {
 #ifdef GSUP_PROXY_ENABLED
         extract_ula_subdata(s, body, body_len);
-        /* ISD_REQ (subscription + static PDP address) then UL_RES with MSISDN. */
-        bool need_isd = false;
-        if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS)
-            need_isd = s->msisdn_str[0] != '\0';
-        else
-            need_isd = s->msisdn_str[0] != '\0' || s->n_ula_apns > 0;
+        /* CS: ISD_REQ (step 3) must carry MSISDN before UL_RES (step 5).
+         * PS: ISD carries PDP/APN; UL_RES may repeat subscription IEs. */
+        if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS) {
+            if (!s->msisdn_str[0]) {
+                LOGE("map", "CS ULA imsi=%s: no MSISDN for ISD "
+                     "(Open5GS subscriber msisdn[] required)", s->imsi_str);
+                gsup_map_proxy_abort_ugl(rt, s);
+                return;
+            }
+            if (gsup_map_proxy_send_isd(rt, s) < 0)
+                gsup_map_proxy_abort_ugl(rt, s);
+            return;
+        }
+        bool need_isd = s->msisdn_str[0] != '\0' || s->n_ula_apns > 0;
         if (s->have_ula_subdata && need_isd) {
             if (gsup_map_proxy_send_isd(rt, s) < 0)
-                gsup_map_proxy_finish_ugl(rt, s);
+                gsup_map_proxy_abort_ugl(rt, s);
         } else {
             gsup_map_proxy_finish_ugl(rt, s);
         }
