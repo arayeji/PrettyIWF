@@ -142,7 +142,7 @@ typedef struct map_session {
     int                 gsup_conn_id;           /* gsup_server connection slot  */
     uint8_t             gsup_req_type;          /* original GSUP message type   */
     uint8_t             gsup_cn_domain;         /* GSUP_CN_DOMAIN_PS or _CS      */
-    bool                gsup_isd_sent;          /* ISD_REQ sent; UL_RES is minimal */
+    bool                gsup_isd_sent;          /* ISD_REQ sent; UL_RES skips PDP IEs */
     uint8_t             gsup_num_vectors;       /* SAI: vectors requested       */
     uint8_t             resync_rand[16];        /* SAI resync: MS RAND          */
     uint8_t             resync_auts[14];        /* SAI resync: AUTS (3GPP)      */
