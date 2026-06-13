@@ -23,6 +23,7 @@ void gsup_map_proxy_on_gsup(struct iwf_runtime *rt, int conn_id,
 
 void gsup_map_proxy_finish_sai(struct iwf_runtime *rt, struct map_session *s);
 void gsup_map_proxy_finish_ugl(struct iwf_runtime *rt, struct map_session *s);
+void gsup_map_proxy_abort_ugl(struct iwf_runtime *rt, struct map_session *s);
 int  gsup_map_proxy_send_isd(struct iwf_runtime *rt, struct map_session *s);
 void gsup_map_proxy_on_timeout(struct iwf_runtime *rt, struct map_session *s);
 void gsup_map_proxy_diameter_error(struct iwf_runtime *rt,

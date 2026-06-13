@@ -254,17 +254,48 @@ int gsup_build_loc_cancel_req(const char *imsi, uint8_t cancel_type,
     return (int)off;
 }
 
+/* gsm48_encode_bcd_number(h_len=0): [L][TBCD digits], no TON/NPI — same as
+ * osmo-hlr osmo_gsup_create_insert_subscriber_data_msg().  osmo-msc decodes
+ * with gsm48_decode_bcd_number2(..., h_len=0). */
+static int gsup_enc_bcd_digits_gsm48(uint8_t *out, size_t cap, const char *digits)
+{
+    if (!digits || !digits[0]) return 0;
+
+    char num[24];
+    size_t n = 0;
+    for (size_t k = 0; digits[k] && n + 1 < sizeof(num); k++) {
+        if (digits[k] >= '0' && digits[k] <= '9')
+            num[n++] = digits[k];
+    }
+    if (n == 0) return 0;
+
+    uint8_t bcd_len = (uint8_t)(n / 2 + (n & 1));
+    if ((size_t)1 + bcd_len > cap) return -1;
+
+    out[0] = bcd_len;
+    size_t pos = 1;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t d = (uint8_t)(num[i] - '0');
+        if ((i & 1) == 0)
+            out[pos + i / 2] = d;
+        else
+            out[pos + i / 2] = (uint8_t)(out[pos + i / 2] | (d << 4));
+    }
+    if (n & 1)
+        out[pos + n / 2] = (uint8_t)(out[pos + n / 2] | 0xf0);
+
+    return (int)(1 + bcd_len);
+}
+
 static int gsup_enc_isdn_addr_ie(uint8_t *out, size_t cap, size_t *off,
                                  uint8_t tag, const char *digits)
 {
     if (!digits || !digits[0]) return 0;
 
-    /* Osmo GSUP MSISDN/HLR IE: AddressString = [0x91 TON/NPI][TBCD digits].
-     * No inner length byte (GSUP IE length covers the value). osmo-sgsn stores
-     * this verbatim and gsm48_decode_called() requires NPI=ISDN (plan 1). */
+    /* HLR-Number: MAP AddressString with TON/NPI (international ISDN). */
     uint8_t val[16];
     size_t pos = 0;
-    val[pos++] = 0x91; /* international number, ISDN/telephony (E.164) */
+    val[pos++] = 0x91;
 
     int di = 0;
     for (size_t k = 0; digits[k] && pos < sizeof(val); k++) {
@@ -292,7 +323,12 @@ static int gsup_enc_isdn_addr_ie(uint8_t *out, size_t cap, size_t *off,
 static int gsup_enc_msisdn_ie(uint8_t *out, size_t cap, size_t *off,
                               const char *msisdn)
 {
-    return gsup_enc_isdn_addr_ie(out, cap, off, GSUP_IE_MSISDN, msisdn);
+    if (!msisdn || !msisdn[0]) return 0;
+
+    uint8_t val[16];
+    int n = gsup_enc_bcd_digits_gsm48(val, sizeof(val), msisdn);
+    if (n <= 0) return n;
+    return gsup_put_ie(out, cap, off, GSUP_IE_MSISDN, val, (size_t)n);
 }
 
 static int gsup_enc_apn_wire(const char *apn, uint8_t *out, size_t cap)
