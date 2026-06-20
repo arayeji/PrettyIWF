@@ -15,6 +15,8 @@ User-plane GTP-U is **not** terminated here: the IWF is **control-plane only**. 
 
 See [iwf/README.md](iwf/README.md) for build, install, and operational detail.
 
+Standards coverage audit (Open5GS, Kamailio, osmo-msc, IWF): [iwf/docs/standards-audit.md](iwf/docs/standards-audit.md).
+
 ## Architecture
 
 ```mermaid

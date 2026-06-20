@@ -65,6 +65,10 @@ typedef struct {
     uint16_t    diam_peer_port;
     char        diam_local_ip[64];  /* optional TCP bind before connect (DRA ACL) */
     char        diam_origin_host[128];
+    /* Optional CS/VLR identity for GSUP CN=CS (osmo-msc).  When set, ULR/AIR/PUR
+     * from CS sessions use this Origin-Host so HSS stores a distinct peer from
+     * PS/SGSN (TS 29.272 Origin-Host registration). */
+    char        diam_origin_host_cs[128];
     char        diam_origin_realm[128];
     char        diam_dest_host[128];
     char        diam_dest_realm[128];

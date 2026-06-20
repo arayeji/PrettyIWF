@@ -1134,6 +1134,69 @@ void map_iwf_on_clr(struct iwf_runtime *rt,
                                    DIAM_RC_SUCCESS);
 }
 
+void map_iwf_on_idr(struct iwf_runtime *rt,
+                    const uint8_t *body, size_t body_len,
+                    uint32_t hop_by_hop, uint32_t end_to_end)
+{
+    char sid[DIAMETER_SESSION_ID_MAX];
+    char imsi[MAP_IMSI_STR_MAX];
+    char dest_host[128];
+    uint32_t idr_flags = 0;
+    const iwf_config_t *cfg = &rt->cfg;
+
+    sid[0] = '\0';
+    dest_host[0] = '\0';
+    (void)diameter_get_session_id(body, body_len, sid, sizeof(sid));
+
+    if (diameter_get_user_name(body, body_len, imsi, sizeof(imsi)) < 0) {
+        LOGW("map", "IDR: missing User-Name");
+        (void)diameter_send_ida_answer(rt, hop_by_hop, end_to_end, sid,
+                                       DIAM_RC_UNABLE_TO_DELIVER, NULL);
+        return;
+    }
+
+    (void)diameter_get_uint32_avp(body, body_len, AVP_3GPP_IDR_FLAGS,
+                                  DIAMETER_VENDOR_3GPP, &idr_flags);
+    (void)diameter_get_os_avp(body, body_len, AVP_DESTINATION_HOST, 0,
+                              dest_host, sizeof(dest_host));
+
+    const char *origin = cfg->diam_origin_host;
+    if (dest_host[0])
+        origin = dest_host;
+
+    LOGI("map", "RX IDR imsi=%s idr_flags=0x%x sid=%s dest=%s",
+         imsi, (unsigned)idr_flags, sid[0] ? sid : "-",
+         dest_host[0] ? dest_host : "-");
+
+    diameter_avp_t sub_avp;
+    bool has_sub = (diameter_avp_find_3gpp(body, body_len,
+                                           AVP_3GPP_SUBSCRIPTION_DATA,
+                                           &sub_avp) == 0);
+    bool has_urrp = (idr_flags & IDR_FLAG_UE_REACHABILITY) != 0;
+
+    if (!has_urrp && !has_sub) {
+        LOGW("map", "IDR: unsupported flags=0x%x for imsi=%s",
+             (unsigned)idr_flags, imsi);
+        (void)diameter_send_ida_answer(rt, hop_by_hop, end_to_end, sid,
+                                       DIAM_RC_UNABLE_TO_DELIVER, origin);
+        return;
+    }
+
+    if (has_sub && !has_urrp)
+        LOGI("map", "IDR: Subscription-Data ack (no GSUP push) imsi=%s", imsi);
+
+    (void)diameter_send_ida_answer(rt, hop_by_hop, end_to_end, sid,
+                                   DIAM_RC_SUCCESS, origin);
+
+    if (has_urrp) {
+#ifdef GSUP_PROXY_ENABLED
+        gsup_map_proxy_on_urrp(rt, imsi, origin);
+#else
+        (void)diameter_send_nor(rt, imsi, origin, UE_REACHABILITY_REACHABLE);
+#endif
+    }
+}
+
 void map_iwf_on_cla(struct iwf_runtime *rt, map_session_t *s,
                     const uint8_t *body, size_t body_len)
 {

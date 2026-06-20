@@ -40,4 +40,8 @@ void gsup_map_proxy_sweep(struct iwf_runtime *rt, time_t now);
 bool gsup_map_proxy_hss_clr(struct iwf_runtime *rt, const char *imsi,
                             uint8_t cancel_type);
 
+/* HSS IDR(URRP-MME): report UE reachability via S6a NOR. */
+void gsup_map_proxy_on_urrp(struct iwf_runtime *rt, const char *imsi,
+                            const char *diam_origin_host);
+
 #endif /* IWF_GSUP_MAP_PROXY_H */

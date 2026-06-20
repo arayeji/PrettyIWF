@@ -104,4 +104,9 @@ void map_iwf_on_clr(struct iwf_runtime *rt,
                     const uint8_t *body, size_t body_len,
                     uint32_t hop_by_hop, uint32_t end_to_end);
 
+/* Inbound HSS-initiated Insert-Subscriber-Data-Request (Diameter IDR). */
+void map_iwf_on_idr(struct iwf_runtime *rt,
+                    const uint8_t *body, size_t body_len,
+                    uint32_t hop_by_hop, uint32_t end_to_end);
+
 #endif /* IWF_MAP_IWF_H */
