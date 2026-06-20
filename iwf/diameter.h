@@ -46,7 +46,9 @@ struct map_session;
 #define DIAMETER_CMD_ULR                316
 #define DIAMETER_CMD_CLR                317
 #define DIAMETER_CMD_AIR                318
+#define DIAMETER_CMD_IDR                319
 #define DIAMETER_CMD_PUR                321
+#define DIAMETER_CMD_NOR                323
 
 /* Diameter header flags. */
 #define DIAM_HDR_FLAG_REQUEST           0x80
@@ -111,6 +113,7 @@ struct map_session;
 #define AVP_3GPP_MAX_REQUESTED_BANDWIDTH_DL     515
 #define AVP_3GPP_ULR_FLAGS                      1405
 #define AVP_3GPP_ULA_FLAGS                      1406
+#define AVP_3GPP_SGSN_NUMBER                    1648   /* TS 29.272; CS VLR GT via IWF */
 #define AVP_3GPP_CANCELLATION_TYPE              1420
 #define AVP_3GPP_PUR_FLAGS                      1635
 #define AVP_3GPP_PUA_FLAGS                      1442
@@ -118,6 +121,17 @@ struct map_session;
 #define AVP_3GPP_TERMINAL_INFORMATION           1401
 #define AVP_3GPP_KC                             1453     /* GERAN-Vector inner */
 #define AVP_3GPP_SRES                           1454
+#define AVP_3GPP_IDR_FLAGS                      1490
+#define AVP_3GPP_NOR_FLAGS                      1443
+#define AVP_3GPP_UE_REACHABILITY                1614
+
+/* IDR-Flags (TS 29.272 §7.3.30) bit 0 = URRP-MME (arm UE-reachability report). */
+#define IDR_FLAG_UE_REACHABILITY                0x00000001U
+/* NOR-Flags (TS 29.272 §7.3.83) bit 0 = UE-Reachability-Report. */
+#define NOR_FLAG_UE_REACHABILITY                0x00000001U
+/* UE-Reachability (TS 29.272 §7.3.164). */
+#define UE_REACHABILITY_UNREACHABLE             0
+#define UE_REACHABILITY_REACHABLE               1
 
 /* Diameter Result-Code values we care about. */
 #define DIAM_RC_SUCCESS                         2001
@@ -139,11 +153,11 @@ struct map_session;
 #define DIAM_RAT_TYPE_UTRAN                     1000
 #define DIAM_RAT_TYPE_EUTRAN                    1004
 
-/* ULR-Flags (TS 29.272 §7.3.7). */
+/* ULR-Flags (TS 29.272 §7.3.7).  Bit1: set=S6a/MME, clear=S6d/SGSN. */
 #define ULR_FLAG_SINGLE_REGISTRATION            0x00000001
-#define ULR_FLAG_S6A_S6D_INDICATOR              0x00000002 /* S6d if set     */
+#define ULR_FLAG_S6A_S6D_INDICATOR              0x00000002 /* 1=MME/S6a      */
 #define ULR_FLAG_SKIP_SUBSCRIBER_DATA           0x00000004
-#define ULR_FLAG_GPRS_SUBSCRIPTION_REQ          0x00000008
+#define ULR_FLAG_GPRS_SUBSCRIPTION_REQ          0x00000008 /* GPRS-Sub in ULA */
 #define ULR_FLAG_NODE_TYPE_INDICATOR            0x00000020
 
 /* ----- Module API used by main.c + map_iwf.c ---------------------- */
@@ -209,5 +223,20 @@ int  diameter_get_uint32_avp   (const uint8_t *body, size_t len,
 int  diameter_send_cla_answer  (struct iwf_runtime *rt,
                                 uint32_t hop_by_hop, uint32_t end_to_end,
                                 const char *session_id, uint32_t result_code);
+
+/* Answer an inbound Insert-Subscriber-Data-Request (HSS -> IWF). */
+int  diameter_send_ida_answer (struct iwf_runtime *rt,
+                               uint32_t hop_by_hop, uint32_t end_to_end,
+                               const char *session_id, uint32_t result_code,
+                               const char *origin_host);
+
+/* Notify HSS that a UE became reachable (S6a NOR after URRP-MME). */
+int  diameter_send_nor        (struct iwf_runtime *rt,
+                               const char *imsi, const char *origin_host,
+                               uint32_t ue_reachability);
+
+int  diameter_get_os_avp      (const uint8_t *body, size_t len,
+                               uint32_t code, uint32_t vendor_id,
+                               char *out, size_t out_cap);
 
 #endif /* IWF_DIAMETER_H */

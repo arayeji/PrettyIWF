@@ -332,18 +332,43 @@ bool gsup_map_proxy_hss_clr(iwf_runtime_t *rt, const char *imsi,
 {
     if (!rt || !imsi || !imsi[0]) return false;
 
-    int conn_id = gsup_conn_for_imsi(imsi, GSUP_CN_DOMAIN_PS);
-    if (conn_id < 0) return false;
-
     uint8_t gsup[128];
     int n = gsup_build_loc_cancel_req(imsi, cancel_type, gsup, sizeof(gsup));
     if (n <= 0) return false;
-    if (proxy_send_gsup(conn_id, gsup, (size_t)n) < 0) return false;
 
-    LOGI("gsup", "TX LOC-CANCEL imsi=%s conn=%d type=%u (HSS CLR)",
-         imsi, conn_id, (unsigned)cancel_type);
-    gsup_forget_imsi_conn(imsi);
-    return true;
+    bool sent = false;
+    static const uint8_t domains[] = { GSUP_CN_DOMAIN_PS, GSUP_CN_DOMAIN_CS };
+    for (size_t i = 0; i < sizeof(domains); i++) {
+        int conn_id = gsup_conn_for_imsi(imsi, domains[i]);
+        if (conn_id < 0) continue;
+        if (proxy_send_gsup(conn_id, gsup, (size_t)n) < 0) continue;
+        LOGI("gsup", "TX LOC-CANCEL imsi=%s conn=%d cn=%s type=%u (HSS CLR)",
+             imsi, conn_id,
+             domains[i] == GSUP_CN_DOMAIN_CS ? "CS" : "PS",
+             (unsigned)cancel_type);
+        sent = true;
+    }
+    if (sent)
+        gsup_forget_imsi_conn(imsi);
+    return sent;
+}
+
+void gsup_map_proxy_on_urrp(iwf_runtime_t *rt, const char *imsi,
+                            const char *diam_origin_host)
+{
+    if (!rt || !imsi || !imsi[0]) return;
+
+    int cs = gsup_conn_for_imsi(imsi, GSUP_CN_DOMAIN_CS);
+    int ps = gsup_conn_for_imsi(imsi, GSUP_CN_DOMAIN_PS);
+    uint32_t reach = (cs >= 0 || ps >= 0)
+                     ? UE_REACHABILITY_REACHABLE
+                     : UE_REACHABILITY_UNREACHABLE;
+
+    LOGI("gsup", "URRP imsi=%s cs_conn=%d ps_conn=%d -> NOR reach=%u",
+         imsi, cs, ps, (unsigned)reach);
+
+    if (diameter_send_nor(rt, imsi, diam_origin_host, reach) < 0)
+        LOGW("gsup", "NOR send failed imsi=%s", imsi);
 }
 
 int gsup_map_proxy_send_isd(iwf_runtime_t *rt, map_session_t *s)

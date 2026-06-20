@@ -35,6 +35,7 @@
 #include "map_session.h"
 #include "map_iwf.h"
 #include "map_iwf_priv.h"
+#include "map_codec.h"
 #include "gsup_proto.h"
 
 #include <stdint.h>
@@ -291,6 +292,23 @@ int diameter_get_user_name(const uint8_t *body, size_t len,
     return 0;
 }
 
+int diameter_get_os_avp(const uint8_t *body, size_t len,
+                        uint32_t code, uint32_t vendor_id,
+                        char *out, size_t out_cap)
+{
+    diameter_avp_t a;
+    if (vendor_id) {
+        if (diameter_avp_find(body, len, code, vendor_id, &a) < 0)
+            return -1;
+    } else if (diameter_avp_find(body, len, code, 0, &a) < 0) {
+        return -1;
+    }
+    if (a.data_len == 0 || a.data_len >= out_cap) return -1;
+    memcpy(out, a.data, a.data_len);
+    out[a.data_len] = '\0';
+    return 0;
+}
+
 int diameter_get_uint32_avp(const uint8_t *body, size_t len,
                             uint32_t code, uint32_t vendor_id,
                             uint32_t *out_val)
@@ -346,11 +364,22 @@ static uint32_t next_end_to_end(diameter_state_t *d)
 }
 
 /* Build the standard origin/realm/destination AVPs all S6d requests share. */
-static int build_s6d_route_avps(struct iwf_runtime *rt,
-                                uint8_t *avps, size_t cap, size_t *off,
-                                const char *session_id)
+static const char *diam_origin_host_for_sess(const iwf_runtime_t *rt,
+                                             const map_session_t *s)
 {
     const iwf_config_t *c = &rt->cfg;
+    if (s && s->gsup_cn_domain == GSUP_CN_DOMAIN_CS && c->diam_origin_host_cs[0])
+        return c->diam_origin_host_cs;
+    return c->diam_origin_host;
+}
+
+static int build_s6d_route_avps(struct iwf_runtime *rt,
+                                uint8_t *avps, size_t cap, size_t *off,
+                                const char *session_id,
+                                const map_session_t *s)
+{
+    const iwf_config_t *c = &rt->cfg;
+    const char *origin_host = diam_origin_host_for_sess(rt, s);
     if (avp_put_str(avps, cap, off, AVP_SESSION_ID,
                     DIAM_AVP_FLAG_MANDATORY, 0, session_id) < 0) return -1;
     if (avp_put_u32(avps, cap, off, AVP_AUTH_APPLICATION_ID,
@@ -361,7 +390,7 @@ static int build_s6d_route_avps(struct iwf_runtime *rt,
                     DIAM_AVP_FLAG_MANDATORY, 0, 1 /* NO_STATE_MAINTAINED */) < 0)
         return -1;
     if (avp_put_str(avps, cap, off, AVP_ORIGIN_HOST,
-                    DIAM_AVP_FLAG_MANDATORY, 0, c->diam_origin_host) < 0)
+                    DIAM_AVP_FLAG_MANDATORY, 0, origin_host) < 0)
         return -1;
     if (avp_put_str(avps, cap, off, AVP_ORIGIN_REALM,
                     DIAM_AVP_FLAG_MANDATORY, 0, c->diam_origin_realm) < 0)
@@ -595,7 +624,7 @@ int diameter_send_air(struct iwf_runtime *rt, map_session_t *s)
     size_t off = (size_t)hl;
 
     if (build_s6d_route_avps(rt, pkt, sizeof(pkt), &off,
-                             s->diameter_session_id) < 0) return -1;
+                             s->diameter_session_id, s) < 0) return -1;
 
     /* User-Name = IMSI (UTF-8 digits). */
     avp_put_str(pkt, sizeof(pkt), &off, AVP_USER_NAME,
@@ -651,7 +680,7 @@ int diameter_send_ulr(struct iwf_runtime *rt, map_session_t *s)
     size_t off = (size_t)hl;
 
     if (build_s6d_route_avps(rt, pkt, sizeof(pkt), &off,
-                             s->diameter_session_id) < 0) return -1;
+                             s->diameter_session_id, s) < 0) return -1;
 
     avp_put_str(pkt, sizeof(pkt), &off, AVP_USER_NAME,
                 DIAM_AVP_FLAG_MANDATORY, 0, s->imsi_str);
@@ -661,15 +690,16 @@ int diameter_send_ulr(struct iwf_runtime *rt, map_session_t *s)
                 DIAMETER_VENDOR_3GPP, s->visited_plmn_bcd, 3);
     }
 
-    /* GSUP CS (MSC/VLR): S6a ULR — clear S6d-Indicator so Open5GS HSS returns
-     * Subscription-Data with MSISDN.  GSUP PS (SGSN): S6d + GPRS-Sub-Req. */
+    /* TS 29.272 §7.3.7 ULR-Flags:
+     *  CS (GSUP CN=CS): S6d-style — bit1 clear, no GPRS-Sub-Req → MSISDN ULA.
+     *  PS (SGSN):       S6d/SGSN — bit1 clear, GPRS-Sub-Req set → PDP/APN ULA.
+     *  Do not set S6a/MME indicator (bit1) for Osmocom interworking. */
     uint32_t ulr_flags = 0;
     uint32_t rat_type  = DIAM_RAT_TYPE_UTRAN;
     if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS) {
         ulr_flags = 0;
-        rat_type  = DIAM_RAT_TYPE_UTRAN;
     } else {
-        ulr_flags = ULR_FLAG_S6A_S6D_INDICATOR | ULR_FLAG_GPRS_SUBSCRIPTION_REQ;
+        ulr_flags = ULR_FLAG_GPRS_SUBSCRIPTION_REQ;
     }
     avp_put_u32(pkt, sizeof(pkt), &off, AVP_3GPP_ULR_FLAGS,
                 DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
@@ -679,11 +709,37 @@ int diameter_send_ulr(struct iwf_runtime *rt, map_session_t *s)
                 DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
                 DIAMETER_VENDOR_3GPP, rat_type);
 
+    /* CS ULR: SGSN-Number carries the osmo-msc VLR GT (TBCD). Pretty5GS HSS
+     * detects CS attach from this AVP and stores vlr_number / vlr_host. */
+    if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS) {
+        const char *vlr_gt = rt->cfg.map_local_gt;
+        uint8_t sn_bcd[8];
+        int snl = -1;
+
+        if (vlr_gt[0])
+            snl = map_str_to_bcd(vlr_gt, sn_bcd, sizeof(sn_bcd));
+        if (snl > 0) {
+            if (avp_put(pkt, sizeof(pkt), &off, AVP_3GPP_SGSN_NUMBER,
+                        DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
+                        DIAMETER_VENDOR_3GPP, sn_bcd, (size_t)snl) < 0)
+                return -1;
+        } else {
+            LOGW("diameter", "CS ULR imsi=%s: no SGSN-Number (set [map_iwf] local_gt "
+                 "to osmo-msc VLR GT)", s->imsi_str);
+        }
+    }
+
     finalize_length(pkt, off);
-    LOGI("diameter", "TX ULR imsi=%s cn=%s flags=0x%x sid=%s len=%zu",
-         s->imsi_str,
-         s->gsup_cn_domain == GSUP_CN_DOMAIN_CS ? "CS/S6a" : "PS/S6d",
-         (unsigned)ulr_flags, s->diameter_session_id, off);
+    if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS) {
+        LOGI("diameter", "TX ULR imsi=%s cn=CS/S6d flags=0x%x origin=%s vlr_gt=%s sid=%s len=%zu",
+             s->imsi_str, (unsigned)ulr_flags, diam_origin_host_for_sess(rt, s),
+             rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt : "(unset)",
+             s->diameter_session_id, off);
+    } else {
+        LOGI("diameter", "TX ULR imsi=%s cn=PS/S6d flags=0x%x rat=%u origin=%s sid=%s len=%zu",
+             s->imsi_str, (unsigned)ulr_flags, (unsigned)rat_type,
+             diam_origin_host_for_sess(rt, s), s->diameter_session_id, off);
+    }
     int rc = diameter_tx(d, pkt, off);
     if (rc == 0) rt->map->stat_diam_tx++;
     return rc;
@@ -699,7 +755,7 @@ int diameter_send_clr(struct iwf_runtime *rt, map_session_t *s)
     size_t off = (size_t)hl;
 
     if (build_s6d_route_avps(rt, pkt, sizeof(pkt), &off,
-                             s->diameter_session_id) < 0) return -1;
+                             s->diameter_session_id, s) < 0) return -1;
 
     avp_put_str(pkt, sizeof(pkt), &off, AVP_USER_NAME,
                 DIAM_AVP_FLAG_MANDATORY, 0, s->imsi_str);
@@ -755,6 +811,115 @@ int diameter_send_cla_answer(struct iwf_runtime *rt,
     return rc;
 }
 
+int diameter_send_ida_answer(struct iwf_runtime *rt,
+                             uint32_t hop_by_hop, uint32_t end_to_end,
+                             const char *session_id, uint32_t result_code,
+                             const char *origin_host)
+{
+    if (!diameter_is_open(rt)) return -1;
+    diameter_state_t *d = &rt->map->diam;
+    const iwf_config_t *c = &rt->cfg;
+    const char *oh = (origin_host && origin_host[0]) ? origin_host
+                                                     : c->diam_origin_host;
+    uint8_t pkt[512];
+    int hl = build_header(pkt, sizeof(pkt),
+                          0 /* answer */, DIAMETER_CMD_IDR,
+                          DIAMETER_APP_S6D,
+                          hop_by_hop, end_to_end);
+    if (hl < 0) return -1;
+    size_t off = (size_t)hl;
+
+    if (session_id && session_id[0]) {
+        if (avp_put_str(pkt, sizeof(pkt), &off, AVP_SESSION_ID,
+                        DIAM_AVP_FLAG_MANDATORY, 0, session_id) < 0)
+            return -1;
+    }
+    if (avp_put_u32(pkt, sizeof(pkt), &off, AVP_RESULT_CODE,
+                    DIAM_AVP_FLAG_MANDATORY, 0, result_code) < 0)
+        return -1;
+    if (avp_put_str(pkt, sizeof(pkt), &off, AVP_ORIGIN_HOST,
+                    DIAM_AVP_FLAG_MANDATORY, 0, oh) < 0)
+        return -1;
+    if (avp_put_str(pkt, sizeof(pkt), &off, AVP_ORIGIN_REALM,
+                    DIAM_AVP_FLAG_MANDATORY, 0, c->diam_origin_realm) < 0)
+        return -1;
+    if (avp_put_u32(pkt, sizeof(pkt), &off, AVP_AUTH_SESSION_STATE,
+                    DIAM_AVP_FLAG_MANDATORY, 0, 1) < 0)
+        return -1;
+
+    finalize_length(pkt, off);
+    LOGI("diameter", "TX IDA rc=%u sid=%s origin=%s",
+         (unsigned)result_code, session_id ? session_id : "", oh);
+    int rc = diameter_tx(d, pkt, off);
+    if (rc == 0) rt->map->stat_diam_tx++;
+    return rc;
+}
+
+int diameter_send_nor(struct iwf_runtime *rt,
+                      const char *imsi, const char *origin_host,
+                      uint32_t ue_reachability)
+{
+    if (!diameter_is_open(rt) || !imsi || !imsi[0]) return -1;
+    diameter_state_t *d = &rt->map->diam;
+    const iwf_config_t *c = &rt->cfg;
+    const char *oh = (origin_host && origin_host[0]) ? origin_host
+                                                     : c->diam_origin_host;
+    char sid[128];
+    uint8_t pkt[512];
+    size_t off;
+
+    make_session_id(oh, sid, sizeof(sid));
+
+    int hl = build_header(pkt, sizeof(pkt),
+                          DIAM_HDR_FLAG_REQUEST | DIAM_HDR_FLAG_PROXYABLE,
+                          DIAMETER_CMD_NOR, DIAMETER_APP_S6D,
+                          next_hop_by_hop(d), next_end_to_end(d));
+    if (hl < 0) return -1;
+    off = (size_t)hl;
+
+    if (avp_put_str(pkt, sizeof(pkt), &off, AVP_SESSION_ID,
+                    DIAM_AVP_FLAG_MANDATORY, 0, sid) < 0)
+        return -1;
+    if (avp_put_u32(pkt, sizeof(pkt), &off, AVP_AUTH_APPLICATION_ID,
+                    DIAM_AVP_FLAG_MANDATORY, 0, DIAMETER_APP_S6D) < 0)
+        return -1;
+    if (avp_put_u32(pkt, sizeof(pkt), &off, AVP_AUTH_SESSION_STATE,
+                    DIAM_AVP_FLAG_MANDATORY, 0, 1) < 0)
+        return -1;
+    if (avp_put_str(pkt, sizeof(pkt), &off, AVP_ORIGIN_HOST,
+                    DIAM_AVP_FLAG_MANDATORY, 0, oh) < 0)
+        return -1;
+    if (avp_put_str(pkt, sizeof(pkt), &off, AVP_ORIGIN_REALM,
+                    DIAM_AVP_FLAG_MANDATORY, 0, c->diam_origin_realm) < 0)
+        return -1;
+    if (c->diam_dest_host[0]) {
+        if (avp_put_str(pkt, sizeof(pkt), &off, AVP_DESTINATION_HOST,
+                        DIAM_AVP_FLAG_MANDATORY, 0, c->diam_dest_host) < 0)
+            return -1;
+    }
+    if (avp_put_str(pkt, sizeof(pkt), &off, AVP_DESTINATION_REALM,
+                    DIAM_AVP_FLAG_MANDATORY, 0, c->diam_dest_realm) < 0)
+        return -1;
+    if (avp_put_str(pkt, sizeof(pkt), &off, AVP_USER_NAME,
+                    DIAM_AVP_FLAG_MANDATORY, 0, imsi) < 0)
+        return -1;
+    if (avp_put_u32(pkt, sizeof(pkt), &off, AVP_3GPP_NOR_FLAGS,
+                    DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
+                    DIAMETER_VENDOR_3GPP, NOR_FLAG_UE_REACHABILITY) < 0)
+        return -1;
+    if (avp_put_u32(pkt, sizeof(pkt), &off, AVP_3GPP_UE_REACHABILITY,
+                    DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
+                    DIAMETER_VENDOR_3GPP, ue_reachability) < 0)
+        return -1;
+
+    finalize_length(pkt, off);
+    LOGI("diameter", "TX NOR imsi=%s reach=%u origin=%s sid=%s",
+         imsi, (unsigned)ue_reachability, oh, sid);
+    int rc = diameter_tx(d, pkt, off);
+    if (rc == 0) rt->map->stat_diam_tx++;
+    return rc;
+}
+
 int diameter_send_pur(struct iwf_runtime *rt, map_session_t *s)
 {
     if (!diameter_is_open(rt)) return -1;
@@ -765,7 +930,7 @@ int diameter_send_pur(struct iwf_runtime *rt, map_session_t *s)
     size_t off = (size_t)hl;
 
     if (build_s6d_route_avps(rt, pkt, sizeof(pkt), &off,
-                             s->diameter_session_id) < 0) return -1;
+                             s->diameter_session_id, s) < 0) return -1;
 
     avp_put_str(pkt, sizeof(pkt), &off, AVP_USER_NAME,
                 DIAM_AVP_FLAG_MANDATORY, 0, s->imsi_str);
@@ -1043,6 +1208,10 @@ static void dispatch_message(struct iwf_runtime *rt,
         }
         if (cmd_code == DIAMETER_CMD_CLR && app_id == DIAMETER_APP_S6D) {
             map_iwf_on_clr(rt, body, body_len, hbh, e2e);
+            return;
+        }
+        if (cmd_code == DIAMETER_CMD_IDR && app_id == DIAMETER_APP_S6D) {
+            map_iwf_on_idr(rt, body, body_len, hbh, e2e);
             return;
         }
         /* Other S6d requests from the peer: not expected for a client. */

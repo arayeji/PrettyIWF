@@ -346,6 +346,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "peer_port"))     out->diam_peer_port = (uint16_t)atoi(val);
             else if (!strcmp(key, "local_ip"))      copy_str(out->diam_local_ip, sizeof(out->diam_local_ip), val);
             else if (!strcmp(key, "origin_host"))   copy_str(out->diam_origin_host, sizeof(out->diam_origin_host), val);
+            else if (!strcmp(key, "origin_host_cs"))
+                copy_str(out->diam_origin_host_cs, sizeof(out->diam_origin_host_cs), val);
             else if (!strcmp(key, "origin_realm"))  copy_str(out->diam_origin_realm, sizeof(out->diam_origin_realm), val);
             else if (!strcmp(key, "dest_host"))     copy_str(out->diam_dest_host, sizeof(out->diam_dest_host), val);
             else if (!strcmp(key, "dest_realm"))    copy_str(out->diam_dest_realm, sizeof(out->diam_dest_realm), val);
@@ -453,13 +455,14 @@ void iwf_config_dump(const iwf_config_t *c)
                  (unsigned)c->stp_routing_context,
                  (unsigned)c->stp_network_indicator);
         }
-        LOGI("config", "map_iwf: diameter peer=%s:%u local=%s origin=%s/%s dest=%s/%s "
-                       "watchdog=%dms timeout=%dms",
+        LOGI("config", "map_iwf: diameter peer=%s:%u local=%s origin=%s cs_origin=%s realm=%s "
+                       "dest=%s/%s watchdog=%dms timeout=%dms",
              c->diam_peer_ip[0] ? c->diam_peer_ip : "(unset)",
              c->diam_peer_port,
              c->diam_local_ip[0] ? c->diam_local_ip
                                    : (c->local_ip[0] ? c->local_ip : "(any)"),
              c->diam_origin_host[0]  ? c->diam_origin_host  : "(unset)",
+             c->diam_origin_host_cs[0] ? c->diam_origin_host_cs : "(same)",
              c->diam_origin_realm[0] ? c->diam_origin_realm : "(unset)",
              c->diam_dest_host[0]    ? c->diam_dest_host    : "(unset)",
              c->diam_dest_realm[0]   ? c->diam_dest_realm   : "(unset)",
