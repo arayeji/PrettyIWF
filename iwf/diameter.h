@@ -113,7 +113,7 @@ struct map_session;
 #define AVP_3GPP_MAX_REQUESTED_BANDWIDTH_DL     515
 #define AVP_3GPP_ULR_FLAGS                      1405
 #define AVP_3GPP_ULA_FLAGS                      1406
-#define AVP_3GPP_SGSN_NUMBER                    1648   /* TS 29.272; CS VLR GT via IWF */
+#define AVP_3GPP_SGSN_NUMBER                    1489   /* TS 29.272 §7.3.102; CS VLR GT via IWF */
 #define AVP_3GPP_CANCELLATION_TYPE              1420
 #define AVP_3GPP_PUR_FLAGS                      1635
 #define AVP_3GPP_PUA_FLAGS                      1442
