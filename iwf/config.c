@@ -193,6 +193,45 @@ static void gsup_listen_ips_split(iwf_config_t *out, const char *csv)
     }
 }
 
+static void diam_peer_add(iwf_config_t *out, const char *ip, uint16_t port)
+{
+    if (!ip || !ip[0] || out->diam_n_peers >= DIAM_MAX_PEERS_CFG) return;
+    int idx = out->diam_n_peers++;
+    copy_str(out->diam_peers[idx].ip, sizeof(out->diam_peers[idx].ip), ip);
+    out->diam_peers[idx].port = port ? port : 3868;
+}
+
+static void diam_peers_split(iwf_config_t *out, const char *csv)
+{
+    if (!csv || !*csv) return;
+    char buf[512];
+    copy_str(buf, sizeof(buf), csv);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        tok = trim(tok);
+        if (!*tok) continue;
+        char *colon = strchr(tok, ':');
+        if (colon) {
+            *colon = '\0';
+            char *ip = trim(tok);
+            char *port_s = trim(colon + 1);
+            uint16_t port = (uint16_t)atoi(port_s);
+            diam_peer_add(out, ip, port);
+        } else {
+            diam_peer_add(out, tok, out->diam_peer_port ? out->diam_peer_port : 3868);
+        }
+    }
+}
+
+static void diam_peers_finalize(iwf_config_t *out)
+{
+    if (out->diam_n_peers == 0 && out->diam_peer_ip[0]) {
+        diam_peer_add(out, out->diam_peer_ip,
+                      out->diam_peer_port ? out->diam_peer_port : 3868);
+    }
+}
+
 static int gsup_roam_route_index(iwf_config_t *out, const char *mnc, int is_local)
 {
     for (int i = 0; i < out->gsup_n_roam_routes; i++) {
@@ -243,6 +282,14 @@ static void gsup_roam_key(iwf_config_t *out, const char *key, const char *val)
     else if (!strcmp(p, "src_gt"))
         copy_str(out->gsup_roam_routes[idx].src_gt,
                  sizeof(out->gsup_roam_routes[idx].src_gt), val);
+    else if (!strcmp(p, "dest_realm"))
+        copy_str(out->gsup_roam_routes[idx].dest_realm,
+                 sizeof(out->gsup_roam_routes[idx].dest_realm), val);
+    else if (!strcmp(p, "dest_host"))
+        copy_str(out->gsup_roam_routes[idx].dest_host,
+                 sizeof(out->gsup_roam_routes[idx].dest_host), val);
+    else if (!strcmp(p, "diameter"))
+        out->gsup_roam_routes[idx].use_diameter = (atoi(val) != 0);
     else
         LOGW("config", "unknown key [roaming_hlr].%s", key);
 }
@@ -344,6 +391,7 @@ int iwf_config_load(const char *path, iwf_config_t *out)
         } else if (!strcmp(section, "diameter_s6d")) {
             if      (!strcmp(key, "peer_ip"))       copy_str(out->diam_peer_ip, sizeof(out->diam_peer_ip), val);
             else if (!strcmp(key, "peer_port"))     out->diam_peer_port = (uint16_t)atoi(val);
+            else if (!strcmp(key, "peers"))         diam_peers_split(out, val);
             else if (!strcmp(key, "local_ip"))      copy_str(out->diam_local_ip, sizeof(out->diam_local_ip), val);
             else if (!strcmp(key, "origin_host"))   copy_str(out->diam_origin_host, sizeof(out->diam_origin_host), val);
             else if (!strcmp(key, "origin_host_cs"))
@@ -409,6 +457,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
 
     fclose(fp);
 
+    diam_peers_finalize(out);
+
 #ifdef SMS_IWF_ENABLED
     for (int i = 0; i < out->sms_n_partners; i++)
         sms_partner_split_prefixes(out, i);
@@ -455,10 +505,9 @@ void iwf_config_dump(const iwf_config_t *c)
                  (unsigned)c->stp_routing_context,
                  (unsigned)c->stp_network_indicator);
         }
-        LOGI("config", "map_iwf: diameter peer=%s:%u local=%s origin=%s cs_origin=%s realm=%s "
+        LOGI("config", "map_iwf: diameter peers=%d local=%s origin=%s cs_origin=%s realm=%s "
                        "dest=%s/%s watchdog=%dms timeout=%dms",
-             c->diam_peer_ip[0] ? c->diam_peer_ip : "(unset)",
-             c->diam_peer_port,
+             c->diam_n_peers,
              c->diam_local_ip[0] ? c->diam_local_ip
                                    : (c->local_ip[0] ? c->local_ip : "(any)"),
              c->diam_origin_host[0]  ? c->diam_origin_host  : "(unset)",
@@ -467,6 +516,9 @@ void iwf_config_dump(const iwf_config_t *c)
              c->diam_dest_host[0]    ? c->diam_dest_host    : "(unset)",
              c->diam_dest_realm[0]   ? c->diam_dest_realm   : "(unset)",
              c->diam_watchdog_ms, c->diam_request_timeout_ms);
+        for (int i = 0; i < c->diam_n_peers; i++)
+            LOGI("config", "map_iwf: diameter peer[%d]=%s:%u",
+                 i, c->diam_peers[i].ip, (unsigned)c->diam_peers[i].port);
     } else {
         LOGI("config", "map_iwf: disabled (set [map_iwf].enabled = 1 to bring it up)");
     }

@@ -47,11 +47,26 @@ int  map_iwf_init(struct iwf_runtime *rt, int epfd);
 enum map_iwf_epoll_role {
     MAP_EPOLL_ROLE_BASE     = 0x100,
     MAP_EPOLL_ROLE_SS7      = 0x101, /* SCTP fd to osmo-stp (M3UA)        */
-    MAP_EPOLL_ROLE_DIAMETER = 0x102, /* TCP fd to PyHSS                   */
+    MAP_EPOLL_ROLE_DIAMETER = 0x102, /* legacy alias for peer 0            */
     MAP_EPOLL_ROLE_T_TIMER  = 0x103, /* TCAP dialogue T-timeout sweep     */
     MAP_EPOLL_ROLE_DWA_TIMER= 0x104, /* Diameter watchdog (DWR every Tw)  */
     MAP_EPOLL_ROLE_TEST_CMD = 0x105, /* UNIX /tmp/iwf_cmd.sock listener   */
+    MAP_EPOLL_ROLE_DIAMETER_PEER_BASE = 0x110, /* + peer index 0..7          */
 };
+
+#define MAP_EPOLL_DIAM_MAX_PEERS  8
+#define MAP_EPOLL_ROLE_DIAMETER_PEER(i) \
+    (MAP_EPOLL_ROLE_DIAMETER_PEER_BASE + (unsigned)(i))
+
+static inline int map_iwf_epoll_diameter_peer(uint64_t role)
+{
+    if (role >= MAP_EPOLL_ROLE_DIAMETER_PEER_BASE &&
+        role < MAP_EPOLL_ROLE_DIAMETER_PEER_BASE + MAP_EPOLL_DIAM_MAX_PEERS)
+        return (int)(role - MAP_EPOLL_ROLE_DIAMETER_PEER_BASE);
+    if (role == MAP_EPOLL_ROLE_DIAMETER)
+        return 0;
+    return -1;
+}
 
 /* Tell main.c which fds to add to the loop.  Each fd value is < 0 when the
  * subsystem is disabled in config; main.c MUST skip those. */
@@ -63,6 +78,7 @@ int  map_iwf_get_dwa_timer_fd(const struct iwf_runtime *rt);
 /* Per-epoll-event entry points.  Drain everything pending; never block. */
 void map_iwf_on_ss7_readable(struct iwf_runtime *rt);
 void map_iwf_on_diameter_readable(struct iwf_runtime *rt);
+void map_iwf_on_diameter_peer_readable(struct iwf_runtime *rt, int peer_idx);
 void map_iwf_on_ttimer_tick(struct iwf_runtime *rt);
 void map_iwf_on_dwa_timer_tick(struct iwf_runtime *rt);
 
@@ -102,11 +118,13 @@ void map_iwf_diameter_error(struct iwf_runtime *rt, struct map_session *s,
 /* Inbound HSS-initiated Cancel-Location-Request (Diameter CLR). */
 void map_iwf_on_clr(struct iwf_runtime *rt,
                     const uint8_t *body, size_t body_len,
-                    uint32_t hop_by_hop, uint32_t end_to_end);
+                    uint32_t hop_by_hop, uint32_t end_to_end,
+                    int peer_idx);
 
 /* Inbound HSS-initiated Insert-Subscriber-Data-Request (Diameter IDR). */
 void map_iwf_on_idr(struct iwf_runtime *rt,
                     const uint8_t *body, size_t body_len,
-                    uint32_t hop_by_hop, uint32_t end_to_end);
+                    uint32_t hop_by_hop, uint32_t end_to_end,
+                    int peer_idx);
 
 #endif /* IWF_MAP_IWF_H */

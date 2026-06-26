@@ -481,9 +481,15 @@ int main(int argc, char **argv)
                 sms_iwf_on_timer();
                 break;
 #endif
-            default:
+            default: {
+                int diam_peer = map_iwf_epoll_diameter_peer(role);
+                if (diam_peer >= 0) {
+                    map_iwf_on_diameter_peer_readable(&rt, diam_peer);
+                    break;
+                }
                 LOGW("iwf", "epoll event for unknown role=%lu", (unsigned long)role);
                 break;
+            }
             }
         }
 

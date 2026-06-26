@@ -33,31 +33,38 @@ typedef enum {
 
 #define DIAM_RX_BUF_CAP         8192
 #define DIAM_TX_BUF_CAP         8192
+#define DIAM_MAX_PEERS          8
 
 typedef struct {
+    char                 peer_ip[64];
+    uint16_t             peer_port;
     int                  fd;                       /* TCP socket; -1 closed     */
     diameter_conn_state_t state;
-    struct sockaddr_in   peer;                     /* PyHSS                     */
-    int                  watchdog_timerfd;         /* periodic DWR              */
+    struct sockaddr_in   peer;                     /* resolved peer address   */
     time_t               last_rx_at;
     time_t               last_dwr_at;
-    time_t               cer_sent_at;            /* CER sent, awaiting CEA       */
-    time_t               reconnect_not_before;   /* earliest retry after failure */
-
-    /* Per-process identifiers (RFC 6733 §5.3 / §6.6). */
-    uint32_t             origin_state_id;
-    uint32_t             hop_by_hop_seed;
-    uint32_t             end_to_end_seed;
-    uint32_t             reconnect_backoff_s;      /* doubles on failure */
+    time_t               cer_sent_at;              /* CER sent, awaiting CEA    */
+    time_t               reconnect_not_before;     /* earliest retry after fail */
+    uint32_t             reconnect_backoff_s;      /* doubles on failure        */
 
     /* Stream reassembly: partial Diameter message head/body. */
     uint8_t              rx[DIAM_RX_BUF_CAP];
     size_t               rx_used;
 
-    /* Buffered tx for short writes (rare on a single peer connection). */
+    /* Buffered tx for short writes. */
     uint8_t              tx[DIAM_TX_BUF_CAP];
     size_t               tx_used;
-} diameter_state_t;
+} diameter_peer_t;
+
+typedef struct {
+    int                  n_peers;
+    diameter_peer_t      peer[DIAM_MAX_PEERS];
+    int                  rr_next;                  /* round-robin load share    */
+    int                  watchdog_timerfd;         /* periodic DWR (all peers)  */
+    uint32_t             origin_state_id;
+    uint32_t             hop_by_hop_seed;
+    uint32_t             end_to_end_seed;
+} diameter_pool_t;
 
 /* ----- SS7 (M3UA/SCCP) side state ---------------------------------- */
 
@@ -75,7 +82,7 @@ typedef struct {
 
 typedef struct map_iwf_state {
     bool                 enabled;
-    diameter_state_t     diam;
+    diameter_pool_t      diam;
     ss7_state_t          ss7;
 
     /* epoll fd of the main event loop, set by main.c before init.  The

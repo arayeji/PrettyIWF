@@ -60,9 +60,15 @@ typedef struct {
      * STP cs7 instance (osmo-stp: network-indicator reserved = 3). */
     uint8_t     stp_network_indicator;
 
-    /* [diameter_s6d] */
-    char        diam_peer_ip[64];
+    /* [diameter_s6d] — up to DIAM_MAX_PEERS TCP peers (DRA load share). */
+    char        diam_peer_ip[64];   /* legacy single-peer (peers[] if unset) */
     uint16_t    diam_peer_port;
+#define DIAM_MAX_PEERS_CFG 8
+    struct {
+        char        ip[64];
+        uint16_t    port;
+    } diam_peers[DIAM_MAX_PEERS_CFG];
+    int         diam_n_peers;
     char        diam_local_ip[64];  /* optional TCP bind before connect (DRA ACL) */
     char        diam_origin_host[128];
     /* Optional CS/VLR identity for GSUP CN=CS (osmo-msc).  When set, ULR/AIR/PUR
@@ -99,7 +105,10 @@ typedef struct {
         uint8_t hlr_ssn;            /* default 6 (HLR) or 149 per partner */
         char    src_ip[64];         /* optional SCTP/source hint for this route */
         char    src_gt[24];         /* optional SCCP CallingParty GT override */
-        int     is_local;           /* 1 = PyHSS/Diameter path (no foreign GT) */
+        int     is_local;           /* 1 = home PLMN → local Diameter dest      */
+        int     use_diameter;       /* 1 = S6d via DRA (not MAP) for this MNC   */
+        char    dest_realm[128];    /* partner HSS realm (DRA routing)          */
+        char    dest_host[128];     /* optional pinned HSS Origin-Host          */
     } gsup_roam_routes[GSUP_MAX_ROAM_ROUTES];
     int         gsup_n_roam_routes;
 
