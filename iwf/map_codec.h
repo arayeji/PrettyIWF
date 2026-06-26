@@ -178,6 +178,8 @@ int  map_plmn_pack   (uint16_t mcc, uint16_t mnc, uint8_t out[3]);
 int  map_plmn_unpack (const uint8_t in[3], uint16_t *mcc, uint16_t *mnc);
 /* Home PLMN (MCC 432 + configured MNC) for Visited-PLMN-Id on S6d. */
 int  map_plmn_pack_home(const char *mnc_digits, uint8_t out[3]);
+/* 3GPP Diameter realm from PLMN: mncXXX.mccYYY.3gppnetwork.org */
+int  map_plmn_to_diam_realm(uint16_t mcc, uint16_t mnc, char *out, size_t cap);
 
 /* ----- AARQ/AARE dialogue portion helpers ------------------------- */
 

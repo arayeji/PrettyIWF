@@ -1097,7 +1097,8 @@ static int send_map_cl_begin(struct iwf_runtime *rt, const char *imsi,
 
 void map_iwf_on_clr(struct iwf_runtime *rt,
                     const uint8_t *body, size_t body_len,
-                    uint32_t hop_by_hop, uint32_t end_to_end)
+                    uint32_t hop_by_hop, uint32_t end_to_end,
+                    int peer_idx)
 {
     char sid[DIAMETER_SESSION_ID_MAX];
     char imsi[MAP_IMSI_STR_MAX];
@@ -1110,7 +1111,7 @@ void map_iwf_on_clr(struct iwf_runtime *rt,
     if (diameter_get_user_name(body, body_len, imsi, sizeof(imsi)) < 0) {
         LOGW("map", "CLR: missing User-Name");
         (void)diameter_send_cla_answer(rt, hop_by_hop, end_to_end, sid,
-                                       DIAM_RC_UNABLE_TO_DELIVER);
+                                       DIAM_RC_UNABLE_TO_DELIVER, peer_idx);
         return;
     }
 
@@ -1131,12 +1132,13 @@ void map_iwf_on_clr(struct iwf_runtime *rt,
         LOGW("map", "CLR: no GSUP/MAP downstream for imsi=%s", imsi);
 
     (void)diameter_send_cla_answer(rt, hop_by_hop, end_to_end, sid,
-                                   DIAM_RC_SUCCESS);
+                                   DIAM_RC_SUCCESS, peer_idx);
 }
 
 void map_iwf_on_idr(struct iwf_runtime *rt,
                     const uint8_t *body, size_t body_len,
-                    uint32_t hop_by_hop, uint32_t end_to_end)
+                    uint32_t hop_by_hop, uint32_t end_to_end,
+                    int peer_idx)
 {
     char sid[DIAMETER_SESSION_ID_MAX];
     char imsi[MAP_IMSI_STR_MAX];
@@ -1151,7 +1153,7 @@ void map_iwf_on_idr(struct iwf_runtime *rt,
     if (diameter_get_user_name(body, body_len, imsi, sizeof(imsi)) < 0) {
         LOGW("map", "IDR: missing User-Name");
         (void)diameter_send_ida_answer(rt, hop_by_hop, end_to_end, sid,
-                                       DIAM_RC_UNABLE_TO_DELIVER, NULL);
+                                       DIAM_RC_UNABLE_TO_DELIVER, NULL, peer_idx);
         return;
     }
 
@@ -1178,7 +1180,7 @@ void map_iwf_on_idr(struct iwf_runtime *rt,
         LOGW("map", "IDR: unsupported flags=0x%x for imsi=%s",
              (unsigned)idr_flags, imsi);
         (void)diameter_send_ida_answer(rt, hop_by_hop, end_to_end, sid,
-                                       DIAM_RC_UNABLE_TO_DELIVER, origin);
+                                       DIAM_RC_UNABLE_TO_DELIVER, origin, peer_idx);
         return;
     }
 
@@ -1186,7 +1188,7 @@ void map_iwf_on_idr(struct iwf_runtime *rt,
         LOGI("map", "IDR: Subscription-Data ack (no GSUP push) imsi=%s", imsi);
 
     (void)diameter_send_ida_answer(rt, hop_by_hop, end_to_end, sid,
-                                   DIAM_RC_SUCCESS, origin);
+                                   DIAM_RC_SUCCESS, origin, peer_idx);
 
     if (has_urrp) {
 #ifdef GSUP_PROXY_ENABLED
@@ -1265,7 +1267,15 @@ int map_iwf_get_dwa_timer_fd(const struct iwf_runtime *rt) {
 }
 
 void map_iwf_on_ss7_readable     (struct iwf_runtime *rt) { ss7_link_on_readable(rt); }
-void map_iwf_on_diameter_readable(struct iwf_runtime *rt) { diameter_on_readable(rt); }
+void map_iwf_on_diameter_readable(struct iwf_runtime *rt)
+{
+    diameter_on_readable(rt, 0);
+}
+
+void map_iwf_on_diameter_peer_readable(struct iwf_runtime *rt, int peer_idx)
+{
+    diameter_on_readable(rt, peer_idx);
+}
 void map_iwf_on_dwa_timer_tick   (struct iwf_runtime *rt) { diameter_on_dwa_tick(rt); }
 
 void map_iwf_on_ttimer_tick(struct iwf_runtime *rt)
@@ -1295,7 +1305,6 @@ int map_iwf_init(struct iwf_runtime *rt, int epfd)
     rt->map->enabled    = true;
     rt->map->epoll_fd   = epfd;
     rt->map->t_timer_fd = -1;
-    rt->map->diam.fd    = -1;
     rt->map->ss7.fd     = -1;
 
     map_sess_init();
@@ -1349,9 +1358,8 @@ int map_iwf_init(struct iwf_runtime *rt, int epfd)
     /* The Diameter socket itself is registered/unregistered by diameter.c
      * on each (re)connect via diameter_epoll_attach() below. */
 
-    LOGI("map", "MAP-IWF ready (SS7=M3UA via libosmo select pump; diameter peer=%s:%u "
-                "origin=%s realm=%s)",
-         rt->cfg.diam_peer_ip, rt->cfg.diam_peer_port,
+    LOGI("map", "MAP-IWF ready (SS7=M3UA; diameter peers=%d origin=%s realm=%s)",
+         rt->cfg.diam_n_peers,
          rt->cfg.diam_origin_host, rt->cfg.diam_origin_realm);
 
     if (test_cmd_init(rt, epfd) < 0) {

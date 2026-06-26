@@ -259,14 +259,37 @@ static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
     return 0;
 }
 
-/* LOCAL route: Diameter S6d toward DRA/HSS (no PyHSS GSUP relay on port 4222). */
-static int start_local_diameter(gsup_route_t *route, gsup_parsed_t *req,
-                                int conn_id, map_op_t op, uint8_t gsup_req_type)
+/* Diameter S6d toward DRA/HSS (home or roaming partner realm). */
+static void session_set_diam_dest(map_session_t *s, gsup_route_t *route,
+                                  const iwf_config_t *cfg)
+{
+    if (!s || !route || !cfg) return;
+    s->diam_dest_realm[0] = '\0';
+    s->diam_dest_host[0]  = '\0';
+    if (route->kind == GSUP_ROUTE_DIAM_HSS) {
+        if (route->dest_realm[0])
+            strncpy(s->diam_dest_realm, route->dest_realm,
+                    sizeof(s->diam_dest_realm) - 1);
+        if (route->dest_host[0])
+            strncpy(s->diam_dest_host, route->dest_host,
+                    sizeof(s->diam_dest_host) - 1);
+    } else if (route->kind == GSUP_ROUTE_LOCAL) {
+        if (cfg->diam_dest_realm[0])
+            strncpy(s->diam_dest_realm, cfg->diam_dest_realm,
+                    sizeof(s->diam_dest_realm) - 1);
+        if (cfg->diam_dest_host[0])
+            strncpy(s->diam_dest_host, cfg->diam_dest_host,
+                    sizeof(s->diam_dest_host) - 1);
+    }
+}
+
+static int start_diameter(gsup_route_t *route, gsup_parsed_t *req,
+                          int conn_id, map_op_t op, uint8_t gsup_req_type)
 {
     if (!g_rt || !route)
         return -1;
     if (!diameter_is_open(g_rt)) {
-        LOGW("gsup", "LOCAL→Diameter imsi=%s: peer not open (check [diameter_s6d])",
+        LOGW("gsup", "Diameter imsi=%s: no peer open (check [diameter_s6d])",
              route->imsi);
         return -1;
     }
@@ -282,6 +305,8 @@ static int start_local_diameter(gsup_route_t *route, gsup_parsed_t *req,
     s->gsup_req_type   = gsup_req_type;
     s->gsup_cn_domain  = (req && req->have_cn_domain)
                          ? req->cn_domain : GSUP_CN_DOMAIN_PS;
+    s->diam_peer_idx   = -1;
+    session_set_diam_dest(s, route, &g_rt->cfg);
     if (req && req->have_num_vectors)
         s->gsup_num_vectors = req->num_vectors;
     if (req && gsup_parsed_have_resync(req)) {
@@ -312,12 +337,15 @@ static int start_local_diameter(gsup_route_t *route, gsup_parsed_t *req,
 
     int rc;
     if (op == MAP_OP_SAI) {
-        LOGI("gsup", "LOCAL→Diameter AIR imsi=%s conn=%d%s",
+        LOGI("gsup", "Diameter AIR imsi=%s conn=%d realm=%s%s",
              route->imsi, conn_id,
+             s->diam_dest_realm[0] ? s->diam_dest_realm : g_rt->cfg.diam_dest_realm,
              s->have_resync ? " resync=1" : "");
         rc = diameter_send_air(g_rt, s);
     } else {
-        LOGI("gsup", "LOCAL→Diameter ULR imsi=%s conn=%d", route->imsi, conn_id);
+        LOGI("gsup", "Diameter ULR imsi=%s conn=%d realm=%s",
+             route->imsi, conn_id,
+             s->diam_dest_realm[0] ? s->diam_dest_realm : g_rt->cfg.diam_dest_realm);
         rc = diameter_send_ulr(g_rt, s);
     }
     if (rc < 0) {
@@ -416,9 +444,8 @@ static int handle_sai(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
                        GSUP_CAUSE_IMSI_UNKNOWN);
         return 0;
     }
-    if (route->kind == GSUP_ROUTE_LOCAL)
-        return start_local_diameter(route, req, conn_id, MAP_OP_SAI,
-                                    GSUP_MSG_SAI_REQ);
+    if (route->kind == GSUP_ROUTE_LOCAL || route->kind == GSUP_ROUTE_DIAM_HSS)
+        return start_diameter(route, req, conn_id, MAP_OP_SAI, GSUP_MSG_SAI_REQ);
 
     uint8_t arg[128];
     uint8_t nv = req->have_num_vectors ? req->num_vectors : 3;
@@ -438,9 +465,8 @@ static int handle_ul(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
                        GSUP_CAUSE_IMSI_UNKNOWN);
         return 0;
     }
-    if (route->kind == GSUP_ROUTE_LOCAL)
-        return start_local_diameter(route, req, conn_id, MAP_OP_UGL,
-                                    GSUP_MSG_UL_REQ);
+    if (route->kind == GSUP_ROUTE_LOCAL || route->kind == GSUP_ROUTE_DIAM_HSS)
+        return start_diameter(route, req, conn_id, MAP_OP_UGL, GSUP_MSG_UL_REQ);
 
     uint8_t sn_bcd[8];
     int snl = sgsn_number_bcd(g_rt, sn_bcd, sizeof(sn_bcd));

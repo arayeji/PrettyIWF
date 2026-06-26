@@ -105,6 +105,14 @@ int map_plmn_pack_home(const char *mnc_digits, uint8_t out[3])
     return map_plmn_pack(432, (uint16_t)atoi(mnc_digits), out);
 }
 
+int map_plmn_to_diam_realm(uint16_t mcc, uint16_t mnc, char *out, size_t cap)
+{
+    if (!out || cap < 8) return -1;
+    int n = snprintf(out, cap, "mnc%03u.mcc%03u.3gppnetwork.org",
+                     (unsigned)mnc, (unsigned)mcc);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
 int map_plmn_unpack(const uint8_t in[3], uint16_t *mcc, uint16_t *mnc)
 {
     uint8_t mcc1 =  in[0]       & 0x0f;

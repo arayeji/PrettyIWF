@@ -1,5 +1,6 @@
 #include "gsup_router.h"
 #include "config.h"
+#include "map_codec.h"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -49,6 +50,20 @@ static int find_roam_route(const iwf_config_t *cfg, const char *mnc_key)
     return -1;
 }
 
+static void fill_diam_dest(gsup_route_t *out, const iwf_config_t *cfg, int idx)
+{
+    if (idx < 0 || idx >= cfg->gsup_n_roam_routes)
+        return;
+    const typeof(cfg->gsup_roam_routes[0]) *r = &cfg->gsup_roam_routes[idx];
+    if (r->dest_realm[0])
+        strncpy(out->dest_realm, r->dest_realm, sizeof(out->dest_realm) - 1);
+    else if (r->use_diameter)
+        (void)map_plmn_to_diam_realm(out->mcc, out->mnc,
+                                     out->dest_realm, sizeof(out->dest_realm));
+    if (r->dest_host[0])
+        strncpy(out->dest_host, r->dest_host, sizeof(out->dest_host) - 1);
+}
+
 static void fill_route_meta(gsup_route_t *out, const iwf_config_t *cfg, int idx)
 {
     out->route_idx = idx;
@@ -64,6 +79,15 @@ static void fill_route_meta(gsup_route_t *out, const iwf_config_t *cfg, int idx)
         strncpy(out->src_gt, r->src_gt, sizeof(out->src_gt) - 1);
     else if (cfg->map_local_gt[0])
         strncpy(out->src_gt, cfg->map_local_gt, sizeof(out->src_gt) - 1);
+    fill_diam_dest(out, cfg, idx);
+}
+
+static bool roam_route_is_diameter(const iwf_config_t *cfg, int idx)
+{
+    if (idx < 0 || idx >= cfg->gsup_n_roam_routes)
+        return false;
+    const typeof(cfg->gsup_roam_routes[0]) *r = &cfg->gsup_roam_routes[idx];
+    return r->use_diameter || r->dest_realm[0] != '\0' || r->dest_host[0] != '\0';
 }
 
 int gsup_router_lookup(const iwf_config_t *cfg,
@@ -117,6 +141,8 @@ int gsup_router_lookup(const iwf_config_t *cfg,
     }
     if (cfg->gsup_roam_routes[idx].is_local) {
         out->kind = GSUP_ROUTE_LOCAL;
+    } else if (roam_route_is_diameter(cfg, idx)) {
+        out->kind = GSUP_ROUTE_DIAM_HSS;
     } else if (cfg->gsup_roam_routes[idx].hlr_gt[0]) {
         out->kind = GSUP_ROUTE_MAP_HLR;
     } else {

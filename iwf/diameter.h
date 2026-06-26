@@ -168,7 +168,7 @@ void diameter_shutdown(struct iwf_runtime *rt);
 int  diameter_get_fd(const struct iwf_runtime *rt);
 int  diameter_get_dwa_timer_fd(const struct iwf_runtime *rt);
 
-void diameter_on_readable(struct iwf_runtime *rt);
+void diameter_on_readable(struct iwf_runtime *rt, int peer_idx);
 void diameter_on_dwa_tick(struct iwf_runtime *rt);
 
 bool diameter_is_open(const struct iwf_runtime *rt);
@@ -222,13 +222,14 @@ int  diameter_get_uint32_avp   (const uint8_t *body, size_t len,
 /* Answer an inbound Cancel-Location-Request (HSS -> IWF). */
 int  diameter_send_cla_answer  (struct iwf_runtime *rt,
                                 uint32_t hop_by_hop, uint32_t end_to_end,
-                                const char *session_id, uint32_t result_code);
+                                const char *session_id, uint32_t result_code,
+                                int peer_idx);
 
 /* Answer an inbound Insert-Subscriber-Data-Request (HSS -> IWF). */
 int  diameter_send_ida_answer (struct iwf_runtime *rt,
                                uint32_t hop_by_hop, uint32_t end_to_end,
                                const char *session_id, uint32_t result_code,
-                               const char *origin_host);
+                               const char *origin_host, int peer_idx);
 
 /* Notify HSS that a UE became reachable (S6a NOR after URRP-MME). */
 int  diameter_send_nor        (struct iwf_runtime *rt,

@@ -97,6 +97,9 @@ typedef struct map_session {
     char                diameter_session_id[DIAMETER_SESSION_ID_MAX];
     uint32_t            diameter_hop_by_hop;
     uint32_t            diameter_end_to_end;
+    int                 diam_peer_idx;          /* load-shared DRA peer (-1 unset) */
+    char                diam_dest_realm[128];   /* per-subscriber DRA realm (roam) */
+    char                diam_dest_host[128];    /* optional pinned HSS host       */
 
     map_op_t            map_op;
     map_sess_state_t    state;
