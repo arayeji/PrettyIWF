@@ -18,6 +18,7 @@
 #include "gtpv1.h"
 #include "gtpv2.h"
 #include "session.h"
+#include "subscr_cache.h"
 #include "translate.h"
 #include "map_iwf.h"
 #include "test_cmd.h"
@@ -243,6 +244,7 @@ int main(int argc, char **argv)
     iwf_config_dump(&rt.cfg);
 
     sess_init();
+    subscr_cache_init();
 
     /* Resolve local IPv4 (network order) for GTP F-TEID / GSN Address IEs. */
     if (rt.cfg.local_ip[0]) {
@@ -441,6 +443,7 @@ int main(int argc, char **argv)
                 ssize_t r = read(tfd, &exp, sizeof(exp));
                 (void)r;
                 sess_sweep(time(NULL), IWF_SESSION_TIMEOUT_S);
+                subscr_cache_sweep(time(NULL), IWF_SESSION_TIMEOUT_S);
                 break;
             }
             case MAP_EPOLL_ROLE_SS7:
@@ -517,6 +520,7 @@ int main(int argc, char **argv)
     close(tfd);
     close(rt.v1_sock);
     sess_shutdown();
+    subscr_cache_shutdown();
     iwf_log_close();
     return 0;
 }

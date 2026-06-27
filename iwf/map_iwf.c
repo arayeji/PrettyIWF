@@ -57,6 +57,7 @@
 #include "runtime.h"
 #include "logging.h"
 #include "test_cmd.h"
+#include "subscr_cache.h"
 #ifdef GSUP_PROXY_ENABLED
 #include "gsup_map_proxy.h"
 #include "gsup_proto.h"
@@ -682,6 +683,52 @@ static int ula_parse_served_party_ip(const uint8_t *data, size_t len,
     return -1;
 }
 
+/* Parse the serving PGW (IPv4 and/or FQDN) from MIP6-Agent-Info (RFC 5447)
+ * inside one APN-Configuration. The PGW IPv4 is MIP-Home-Agent-Address (334,
+ * Address: 2-byte family + addr, family 1 = IPv4); the PGW FQDN is
+ * Destination-Host (293) inside MIP-Home-Agent-Host (348). These are IETF
+ * AVPs carried without a vendor flag, so look them up with vendor_id 0.
+ * PDN-GW-Allocation-Type (1438, 3GPP) records static vs dynamic. */
+static void ula_parse_pgw_from_apnc(const diameter_avp_t *apnc,
+                                    map_ula_apn_entry_t *e)
+{
+    diameter_avp_t mip6;
+    if (diameter_avp_find(apnc->data, apnc->data_len,
+                          AVP_MIP6_AGENT_INFO, 0, &mip6) == 0) {
+        diameter_avp_t haa;
+        if (diameter_avp_find(mip6.data, mip6.data_len,
+                              AVP_MIP_HOME_AGENT_ADDRESS, 0, &haa) == 0 &&
+            haa.data_len >= 6) {
+            uint16_t fam = (uint16_t)((haa.data[0] << 8) | haa.data[1]);
+            if (fam == 1) {                 /* IANA address family IPv4 */
+                memcpy(e->pgw_ipv4, haa.data + 2, 4);
+                e->has_pgw_ipv4 = true;
+            }
+        }
+        diameter_avp_t hah;
+        if (diameter_avp_find(mip6.data, mip6.data_len,
+                              AVP_MIP_HOME_AGENT_HOST, 0, &hah) == 0) {
+            diameter_avp_t dh;
+            if (diameter_avp_find(hah.data, hah.data_len,
+                                  AVP_DESTINATION_HOST, 0, &dh) == 0 &&
+                dh.data_len > 0) {
+                size_t n = dh.data_len < sizeof(e->pgw_fqdn) - 1
+                               ? dh.data_len : sizeof(e->pgw_fqdn) - 1;
+                memcpy(e->pgw_fqdn, dh.data, n);
+                e->pgw_fqdn[n] = '\0';
+            }
+        }
+    }
+
+    diameter_avp_t alloc;
+    if (diameter_avp_find(apnc->data, apnc->data_len,
+                          AVP_3GPP_PDN_GW_ALLOCATION_TYPE,
+                          DIAMETER_VENDOR_3GPP, &alloc) == 0 &&
+        alloc.data_len >= 4) {
+        e->pgw_alloc_dynamic = (iwf_be32(alloc.data) == 1) ? 1 : 0;
+    }
+}
+
 static int ula_add_apn_entry(map_session_t *s, const diameter_avp_t *apnc)
 {
     if (!s || !apnc || s->n_ula_apns >= MAP_MAX_ULA_APN)
@@ -768,6 +815,8 @@ static int ula_add_apn_entry(map_session_t *s, const diameter_avp_t *apnc)
                 break;
         }
     }
+
+    ula_parse_pgw_from_apnc(apnc, e);
 
     s->n_ula_apns++;
     return 0;
@@ -890,6 +939,24 @@ static void extract_ula_subdata(map_session_t *s,
         s->ula_ambr_dl_bps = (uint64_t)def->ambr_dl_kbps * 1000ull;
     }
 
+    /* Bridge the HSS-advertised PGW into the GTP path. The Gn Create PDP
+     * Context arrives later, after this MAP/Diameter session is gone, so the
+     * cache (keyed by IMSI+APN) lets translate.c anchor the S5/S8 session at
+     * the PGW the subscriber's HSS selected — home PGW for home-routed
+     * roamers, local PGW for home subscribers (no static [smf] required). */
+    for (uint8_t i = 0; i < s->n_ula_apns; i++) {
+        const map_ula_apn_entry_t *a = &s->ula_apns[i];
+        if (!a->apn[0])
+            continue;
+        uint32_t pgw = a->has_pgw_ipv4
+            ? ((uint32_t)a->pgw_ipv4[0] << 24 | (uint32_t)a->pgw_ipv4[1] << 16 |
+               (uint32_t)a->pgw_ipv4[2] << 8  | (uint32_t)a->pgw_ipv4[3])
+            : 0;
+        if (pgw || a->pgw_fqdn[0])
+            subscr_cache_put_pgw(s->imsi_str, a->apn, pgw,
+                                 a->pgw_fqdn, a->pgw_alloc_dynamic);
+    }
+
     if (s->n_ula_apns <= 1) {
         LOGI("map", "ULA imsi=%s msisdn=%s apn=%s ambr=%lu/%lu bps",
              s->imsi_str,
@@ -907,16 +974,23 @@ static void extract_ula_subdata(map_session_t *s,
              (unsigned long)s->ula_ambr_dl_bps);
         for (uint8_t i = 0; i < s->n_ula_apns; i++) {
             const map_ula_apn_entry_t *a = &s->ula_apns[i];
+            char pgw[64] = "";
+            if (a->has_pgw_ipv4)
+                snprintf(pgw, sizeof(pgw), " pgw=%u.%u.%u.%u",
+                         (unsigned)a->pgw_ipv4[0], (unsigned)a->pgw_ipv4[1],
+                         (unsigned)a->pgw_ipv4[2], (unsigned)a->pgw_ipv4[3]);
+            else if (a->pgw_fqdn[0])
+                snprintf(pgw, sizeof(pgw), " pgw_fqdn=%s", a->pgw_fqdn);
             if (a->has_ue_ipv4) {
-                LOGI("map", "  ULA APN[%u] ctx=%u apn=%s pdp=0x%02x static_v4=%u.%u.%u.%u",
+                LOGI("map", "  ULA APN[%u] ctx=%u apn=%s pdp=0x%02x static_v4=%u.%u.%u.%u%s",
                      (unsigned)i, (unsigned)a->context_id, a->apn,
                      (unsigned)a->pdn_type_nr,
                      (unsigned)a->ue_ipv4[0], (unsigned)a->ue_ipv4[1],
-                     (unsigned)a->ue_ipv4[2], (unsigned)a->ue_ipv4[3]);
+                     (unsigned)a->ue_ipv4[2], (unsigned)a->ue_ipv4[3], pgw);
             } else {
-                LOGI("map", "  ULA APN[%u] ctx=%u apn=%s pdp=0x%02x",
+                LOGI("map", "  ULA APN[%u] ctx=%u apn=%s pdp=0x%02x%s",
                      (unsigned)i, (unsigned)a->context_id, a->apn,
-                     (unsigned)a->pdn_type_nr);
+                     (unsigned)a->pdn_type_nr, pgw);
             }
         }
     }

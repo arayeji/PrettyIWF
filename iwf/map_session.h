@@ -51,6 +51,7 @@ typedef enum {
 #define MAP_MSISDN_STR_MAX      24
 #define DIAMETER_SESSION_ID_MAX 128
 #define MAP_APN_MAX             64
+#define MAP_PGW_FQDN_MAX        256    /* PGW Destination-Host FQDN from MIP6-Agent-Info */
 #define MAP_MAX_ULA_APN         8      /* PyHSS apn_list practical max */
 #define MAP_AUTH_VECTOR_MAX     5      /* TS 29.272 max for AIA */
 
@@ -65,6 +66,13 @@ typedef struct {
     uint8_t     ue_ipv4[4];
     bool        has_ue_ipv6;
     uint8_t     ue_ipv6[16];
+    /* PGW identity from MIP6-Agent-Info (home-routed roaming / PGW selection).
+     * pgw_ipv4 = MIP-Home-Agent-Address; pgw_fqdn = Destination-Host inside
+     * MIP-Home-Agent-Host. pgw_alloc_dynamic mirrors PDN-GW-Allocation-Type. */
+    bool        has_pgw_ipv4;
+    uint8_t     pgw_ipv4[4];
+    char        pgw_fqdn[MAP_PGW_FQDN_MAX];
+    int         pgw_alloc_dynamic;
 } map_ula_apn_entry_t;
 
 /* One authentication vector parsed out of AIA, kept verbatim for repacking

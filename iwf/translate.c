@@ -4,6 +4,7 @@
 #include "gtpv2.h"
 #include "logging.h"
 #include "session.h"
+#include "subscr_cache.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -1534,22 +1535,92 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
                          s->iwf_s4_c_teid, ntohl(rt->local_ipv4_be));
 
     /* PGW/SMF S5/S8-C F-TEID (instance 1) — Open5GS SGWC requires this IE or
-     * rejects with cause 103 ("No PGW IP" in sgwc logs). */
-    if (rt->cfg.smf_ip[0]) {
+     * rejects with cause 103 ("No PGW IP" in sgwc logs).
+     *
+     * PGW selection order:
+     *   1. The PGW the home HSS advertised for this (IMSI, APN) in ULA
+     *      Subscription-Data (MIP6-Agent-Info), cached at Update Location.
+     *      This anchors home-routed roamers at their home PGW and lets local
+     *      subscribers work with no static [smf] address at all.
+     *   2. A preconfigured per-roaming-partner PGW ([roaming_hlr] mncNNN_pgw_*)
+     *      when the HSS sent no PGW (IP and/or DNS-resolved FQDN).
+     *   3. The static [smf] address from config (global last resort).
+     *
+     * For 1 and 2, the F-TEID TEID is 0 on an initial Create Session: the PGW
+     * allocates and returns its own S5/S8-C TEID. We keep cfg.smf_teid for the
+     * [smf] path to preserve any explicitly configured peer TEID. */
+    uint32_t    pgw_ipv4 = 0;          /* host order */
+    uint32_t    pgw_teid = 0;
+    const char *pgw_src  = NULL;
+    char        pgw_fqdn[256] = { 0 };
+
+    if (rt->cfg.pgw_from_subscription &&
+        subscr_cache_get_pgw(imsi, s->apn, &pgw_ipv4,
+                             pgw_fqdn, sizeof(pgw_fqdn), NULL)) {
+        pgw_teid = 0;
+        pgw_src  = "subscription";
+    }
+
+    /* No PGW in subscription data — fall back to a preconfigured PGW for the
+     * subscriber's roaming partner (IP first, else DNS-resolve the FQDN). */
+    if (!pgw_ipv4) {
+        const char *cip = NULL, *cfqdn = NULL;
+        if (iwf_config_roam_pgw(&rt->cfg, imsi, &cip, &cfqdn)) {
+            if (cip && cip[0]) {
+                struct in_addr a;
+                if (inet_pton(AF_INET, cip, &a) == 1)
+                    pgw_ipv4 = ntohl(a.s_addr);
+                else
+                    LOGW("translate",
+                         "invalid [roaming_hlr] pgw_ip=%s for imsi=%s", cip, imsi);
+            }
+            if (!pgw_ipv4 && cfqdn && cfqdn[0]) {
+                pgw_ipv4 = subscr_resolve_fqdn_ipv4(cfqdn);
+                if (pgw_ipv4) {
+                    strncpy(pgw_fqdn, cfqdn, sizeof(pgw_fqdn) - 1);
+                    pgw_fqdn[sizeof(pgw_fqdn) - 1] = '\0';
+                } else {
+                    LOGW("translate",
+                         "could not resolve [roaming_hlr] pgw_fqdn=%s for imsi=%s",
+                         cfqdn, imsi);
+                }
+            }
+            if (pgw_ipv4) {
+                pgw_teid = 0;
+                pgw_src  = "roaming_hlr";
+            }
+        }
+    }
+
+    if (!pgw_ipv4 && rt->cfg.smf_ip[0]) {
         struct in_addr smf;
         if (inet_pton(AF_INET, rt->cfg.smf_ip, &smf) != 1) {
             LOGE("translate", "invalid [smf] ip=%s", rt->cfg.smf_ip);
             sess_remove(s);
             return -1;
         }
+        pgw_ipv4 = ntohl(smf.s_addr);
+        pgw_teid = rt->cfg.smf_teid;
+        pgw_src  = "config";
+    }
+
+    if (pgw_ipv4) {
         gtpv2_enc_fteid_ipv4(&e, 1, FTEID_IFACE_S5S8_PGW_GTPC,
-                             rt->cfg.smf_teid, ntohl(smf.s_addr));
+                             pgw_teid, pgw_ipv4);
+        LOGI("translate",
+             "PGW imsi=%s apn=%s = %u.%u.%u.%u teid=0x%08x src=%s%s%s",
+             imsi, s->apn[0] ? s->apn : "(none)",
+             (pgw_ipv4 >> 24) & 0xff, (pgw_ipv4 >> 16) & 0xff,
+             (pgw_ipv4 >> 8) & 0xff, pgw_ipv4 & 0xff,
+             pgw_teid, pgw_src,
+             pgw_fqdn[0] ? " fqdn=" : "", pgw_fqdn[0] ? pgw_fqdn : "");
     } else {
-        static int warned_no_smf_fteid;
-        if (!warned_no_smf_fteid) {
-            warned_no_smf_fteid = 1;
+        static int warned_no_pgw;
+        if (!warned_no_pgw) {
+            warned_no_pgw = 1;
             LOGW("translate",
-                 "Create Session: [smf] ip not set (config file: %s) — Open5GS SGWC rejects CSReq (cause 103). Add: [smf] ip=<SMF GTP-C IPv4> teid=<S5/S8 F-TEID>",
+                 "Create Session: no PGW for imsi=%s apn=%s — none of HSS subscription (ULA MIP6-Agent-Info), [roaming_hlr] mncNNN_pgw_ip/pgw_fqdn, or [smf] ip is set (config file: %s). Open5GS SGWC rejects CSReq (cause 103). Provide PGW in HSS APN-Configuration, a per-partner pgw_ip/pgw_fqdn, or [smf] ip=<PGW/SMF GTP-C IPv4>.",
+                 imsi, s->apn[0] ? s->apn : "(none)",
                  rt->cfg.cfg_path[0] ? rt->cfg.cfg_path : "iwf.conf");
         }
     }

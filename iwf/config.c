@@ -24,6 +24,8 @@ static void defaults(iwf_config_t *c)
     strncpy(c->log_level, "info", sizeof(c->log_level) - 1);
     strncpy(c->log_file, "-", sizeof(c->log_file) - 1);
     c->synthetic_uli_no_rai = 0;
+    /* Prefer the HSS-advertised PGW (ULA MIP6-Agent-Info) over static [smf]. */
+    c->pgw_from_subscription = 1;
     /* Open5GS SMF only accepts EUTRAN (6) and WLAN (3); UTRAN (1) is rejected
      * with "Unknown RAT Type" -> SGW-C surfaces it as GTP cause 70.
      * Default to EUTRAN so the IWF works against vanilla Open5GS out of the box. */
@@ -290,6 +292,12 @@ static void gsup_roam_key(iwf_config_t *out, const char *key, const char *val)
                  sizeof(out->gsup_roam_routes[idx].dest_host), val);
     else if (!strcmp(p, "diameter"))
         out->gsup_roam_routes[idx].use_diameter = (atoi(val) != 0);
+    else if (!strcmp(p, "pgw_ip"))
+        copy_str(out->gsup_roam_routes[idx].pgw_ip,
+                 sizeof(out->gsup_roam_routes[idx].pgw_ip), val);
+    else if (!strcmp(p, "pgw_fqdn"))
+        copy_str(out->gsup_roam_routes[idx].pgw_fqdn,
+                 sizeof(out->gsup_roam_routes[idx].pgw_fqdn), val);
     else
         LOGW("config", "unknown key [roaming_hlr].%s", key);
 }
@@ -347,6 +355,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
                 out->synthetic_uli_no_rai = (atoi(val) != 0);
             else if (!strcmp(key, "rat_type"))
                 out->rat_type = parse_rat_type(val);
+            else if (!strcmp(key, "pgw_from_subscription"))
+                out->pgw_from_subscription = (atoi(val) != 0);
             else LOGW("config", "unknown key [iwf].%s", key);
         } else if (!strcmp(section, "sgsn")) {
             if      (!strcmp(key, "ip"))   copy_str(out->sgsn_ip, sizeof(out->sgsn_ip), val);
@@ -474,7 +484,7 @@ void iwf_config_dump(const iwf_config_t *c)
 {
     LOGI("config",
          "file=%s listen=%s:%u local_ip=%s rat_type=%u synthetic_uli_no_rai=%d "
-         "sgsn=%s:%u mme=%s:%u sgwc=%s:%u smf=%s teid=%u log=%s/%s",
+         "sgsn=%s:%u mme=%s:%u sgwc=%s:%u smf=%s teid=%u pgw_from_subscription=%d log=%s/%s",
          c->cfg_path[0] ? c->cfg_path : "-",
          c->listen_ip, c->listen_port,
          c->local_ip[0] ? c->local_ip : "(unset)",
@@ -483,6 +493,7 @@ void iwf_config_dump(const iwf_config_t *c)
          c->mme_ip, (unsigned)c->mme_port,
          c->sgwc_ip, c->sgwc_port,
          c->smf_ip[0] ? c->smf_ip : "(unset)", (unsigned)c->smf_teid,
+         c->pgw_from_subscription,
          c->log_level, c->log_file);
 
     if (c->map_iwf_enabled) {
@@ -534,4 +545,47 @@ void iwf_config_dump(const iwf_config_t *c)
         LOGI("config", "sms_iwf: disabled (set [sms_iwf].enabled = 1; build SMS_IWF_ENABLED=1)");
     }
 #endif
+}
+
+/* Find a [roaming_hlr] route by 3-digit MNC string key. */
+static int roam_route_by_mnc_key(const iwf_config_t *cfg, const char *mnc_key)
+{
+    for (int i = 0; i < cfg->gsup_n_roam_routes; i++)
+        if (!strcmp(cfg->gsup_roam_routes[i].mnc, mnc_key))
+            return i;
+    return -1;
+}
+
+int iwf_config_roam_pgw(const iwf_config_t *cfg, const char *imsi,
+                        const char **out_ip, const char **out_fqdn)
+{
+    if (out_ip)   *out_ip   = NULL;
+    if (out_fqdn) *out_fqdn = NULL;
+    if (!cfg || !imsi || strlen(imsi) < 5)
+        return 0;
+
+    /* Match the IMSI PLMN against configured routes. Try the 2-digit MNC
+     * first, then the 3-digit interpretation — same precedence as the GSUP
+     * router so PS data and signalling agree on the partner. */
+    char key[4];
+    snprintf(key, sizeof(key), "%03u",
+             (unsigned)((imsi[3] - '0') * 10 + (imsi[4] - '0')));
+    int idx = roam_route_by_mnc_key(cfg, key);
+    if (idx < 0 && strlen(imsi) >= 6 &&
+        imsi[5] >= '0' && imsi[5] <= '9') {
+        snprintf(key, sizeof(key), "%03u",
+                 (unsigned)((imsi[3] - '0') * 100 + (imsi[4] - '0') * 10 +
+                            (imsi[5] - '0')));
+        idx = roam_route_by_mnc_key(cfg, key);
+    }
+    if (idx < 0)
+        return 0;
+
+    const char *ip   = cfg->gsup_roam_routes[idx].pgw_ip;
+    const char *fqdn = cfg->gsup_roam_routes[idx].pgw_fqdn;
+    if (!ip[0] && !fqdn[0])
+        return 0;
+    if (out_ip)   *out_ip   = ip;
+    if (out_fqdn) *out_fqdn = fqdn;
+    return 1;
 }

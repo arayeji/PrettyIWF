@@ -107,6 +107,16 @@ struct map_session;
 #define AVP_3GPP_ALL_APN_CONFIGS_INCLUDED       1428
 #define AVP_3GPP_PDN_TYPE                       1456
 #define AVP_3GPP_SERVED_PARTY_IP_ADDRESS        848
+#define AVP_3GPP_PDN_GW_ALLOCATION_TYPE         1438   /* TS 29.272 §7.3.44: 0=static,1=dynamic */
+/* PGW identity in APN-Configuration for home-routed roaming / PGW selection.
+ * MIP6-Agent-Info (RFC 5447) and its children are IETF AVPs: no vendor flag
+ * (vendor_id 0). MIP-Home-Agent-Address carries the PGW IPv4/IPv6; the PGW
+ * FQDN is Destination-Host inside MIP-Home-Agent-Host. */
+#define AVP_MIP6_AGENT_INFO                     486
+#define AVP_MIP_HOME_AGENT_ADDRESS              334
+#define AVP_MIP_HOME_AGENT_HOST                 348
+#define AVP_DESTINATION_HOST                    293
+#define AVP_DESTINATION_REALM                   283
 #define AVP_3GPP_SERVICE_SELECTION              493
 #define AVP_3GPP_AMBR                           1435
 #define AVP_3GPP_MAX_REQUESTED_BANDWIDTH_UL     516
