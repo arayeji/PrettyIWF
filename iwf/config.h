@@ -24,9 +24,17 @@ typedef struct {
     char        sgwc_ip[64];
     uint16_t    sgwc_port;
 
-    /* [smf] PGW-C / SMF GTP-C (S5/S8) — F-TEID IE instance 1 in Create Session Request */
+    /* [smf] PGW-C / SMF GTP-C (S5/S8) — F-TEID IE instance 1 in Create Session Request.
+     * Used as the PGW when the HSS does not advertise one (or when
+     * pgw_from_subscription = 0). Optional if every subscriber's HSS returns
+     * a PGW in ULA Subscription-Data (MIP6-Agent-Info). */
     char        smf_ip[64];
     uint32_t    smf_teid;         /* host byte order; SGW uses this toward SMF */
+
+    /* [iwf] pgw_from_subscription — when set (default), prefer the PGW the
+     * home HSS advertised per (IMSI, APN) in ULA over the static [smf]. This
+     * enables home-routed roaming and lets local users skip [smf]. */
+    int         pgw_from_subscription;
 
     /* [logging] */
     char        log_level[16];
@@ -109,6 +117,11 @@ typedef struct {
         int     use_diameter;       /* 1 = S6d via DRA (not MAP) for this MNC   */
         char    dest_realm[128];    /* partner HSS realm (DRA routing)          */
         char    dest_host[128];     /* optional pinned HSS Origin-Host          */
+        /* Preconfigured PGW for this partner, used as the Create Session PGW
+         * (S5/S8-C F-TEID) when the HSS sends no PGW in ULA. IP and/or FQDN
+         * (FQDN is DNS-resolved). Falls through to global [smf] when unset. */
+        char    pgw_ip[64];
+        char    pgw_fqdn[256];
     } gsup_roam_routes[GSUP_MAX_ROAM_ROUTES];
     int         gsup_n_roam_routes;
 
@@ -149,5 +162,13 @@ typedef struct {
 
 int  iwf_config_load(const char *path, iwf_config_t *out);
 void iwf_config_dump(const iwf_config_t *c);
+
+/* Look up the preconfigured per-roaming-partner PGW for an IMSI (matches the
+ * IMSI PLMN against [roaming_hlr] mncNNN_pgw_ip / mncNNN_pgw_fqdn). Returns 1
+ * and points *out_ip / *out_fqdn at the matched route's strings (either may be
+ * empty) when a route with a configured PGW matches; 0 otherwise. Out pointers
+ * may be NULL. Always compiled (no GSUP/MAP dependency). */
+int  iwf_config_roam_pgw(const iwf_config_t *cfg, const char *imsi,
+                         const char **out_ip, const char **out_fqdn);
 
 #endif /* IWF_CONFIG_H */
