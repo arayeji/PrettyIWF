@@ -41,6 +41,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>      /* strcasecmp */
 #include <stdio.h>
 #include <errno.h>
 #include <unistd.h>
@@ -352,7 +353,17 @@ static const char *sess_dest_realm(const map_session_t *s, const iwf_config_t *c
 
 static const char *sess_dest_host(const map_session_t *s, const iwf_config_t *c)
 {
+    /* A session-specific host (roaming route that pinned mncNNN_dest_host)
+     * always wins. */
     if (s && s->diam_dest_host[0]) return s->diam_dest_host;
+    /* Never inherit the global (home) Destination-Host for a session routed to
+     * a different realm: a Destination-Host that lives in another realm makes
+     * the DRA answer 3002 (UNABLE_TO_DELIVER). Only use the global host when the
+     * effective Destination-Realm is the home realm; otherwise omit it and let
+     * the DRA route by realm. */
+    if (s && s->diam_dest_realm[0] && c->diam_dest_realm[0] &&
+        strcasecmp(s->diam_dest_realm, c->diam_dest_realm) != 0)
+        return NULL;
     return c->diam_dest_host;
 }
 
