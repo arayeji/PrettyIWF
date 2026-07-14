@@ -1,0 +1,29 @@
+# Redact production deployment data from entire git history (git filter-repo --replace-text).
+# Longest / most specific literals first.
+
+literal:10.234.241.50==>10.0.0.50
+literal:10.234.241.42==>10.0.0.42
+literal:10.234.241.40==>10.0.0.40
+literal:10.234.241.33==>10.0.0.33
+literal:10.234.241.30==>10.0.0.30
+literal:10.234.241.21==>10.0.0.21
+literal:10.234.241.20==>10.0.0.20
+literal:10.234.241.10==>10.0.0.5
+literal:10.234.241.9==>10.0.0.9
+literal:10.234.241.x==>10.0.0.x
+literal:989350020001==>1234567890123
+literal:989110020001==>1234567890123
+literal:98921000000==>1234567890
+literal:989000002006==>1234567890006
+literal:989000002000==>1234567890000
+literal:iwfsms==>changeme
+literal:THR1EPC01==>lab-epc01
+literal:THR1MSC01==>lab-msc01
+literal:superadmin==>deploy-user
+literal:98910,98911,98912,98913,98914,98919==>12345,12346,12347
+literal:98935,98936,98937,98938,98941,98930==>22345,22346,22347
+literal:partner.mci==>partner.example
+literal:partner.mtni==>partner.example2
+literal:FILL_IN_MCI_HLR_GT==>FILL_IN_PARTNER_HLR_GT
+literal:FILL_IN_MTNI_HLR_GT==>FILL_IN_PARTNER2_HLR_GT
+literal:Irancell route via `as-mtni`==>roaming partner route via `as-roam`
