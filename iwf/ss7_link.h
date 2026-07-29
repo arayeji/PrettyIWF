@@ -86,6 +86,10 @@ void ss7_link_set_hlr_recv_cb(struct iwf_runtime *rt, ss7_recv_cb_t cb);
 int  ss7_link_bind_hlr_ssn(struct iwf_runtime *rt, uint8_t ssn);
 #endif
 
+/* Bind an extra SCCP SSN that shares the main MAP recv callback (e.g. VLR=7
+ * for MAP-C CSFB replies when [gsup_server] cs_backend=map). */
+int  ss7_link_bind_extra_ssn(struct iwf_runtime *rt, uint8_t ssn, const char *name);
+
 /* Outbound MAP with explicit CallingParty (e.g. per-route src GT).
  * If `calling` is NULL, uses [map_iwf] local address. */
 int  ss7_link_send_tcap_ex(struct iwf_runtime *rt,

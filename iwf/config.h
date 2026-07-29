@@ -104,6 +104,15 @@ typedef struct {
     int         gsup_n_listen_ips;
     char        gsup_local_mnc[4];        /* home PLMN MNC digits, default 012 */
     int         gsup_timeout_ms;
+    /* CN-domain eastbound backends for GSUP combine mode (CSFB vs PS):
+     *   cs_backend = map|diameter   (default diameter)
+     *   ps_backend = map|diameter   (default diameter)
+     * CS=map uses MAP-C updateLocation toward [roaming_hlr] hlr_gt (or home
+     * mncNNN_hlr_gt). PS=diameter keeps S6d AIR/ULR. */
+#define GSUP_BACKEND_DIAMETER 0
+#define GSUP_BACKEND_MAP      1
+    int         gsup_cs_backend;
+    int         gsup_ps_backend;
 
     /* [roaming_hlr] per-partner MAP route (foreign HLR GT + optional src IP/GT). */
 #define GSUP_MAX_ROAM_ROUTES 8

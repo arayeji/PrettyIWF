@@ -16,13 +16,29 @@
 #include <string.h>
 #include <time.h>
 
+typedef enum {
+    GPEND_WAIT_MAP      = 0,  /* awaiting MAP ReturnResult / ISD Invoke */
+    GPEND_WAIT_GSUP_ISD = 1,  /* sent GSUP ISD_REQ; wait MSC ISD_RES     */
+} gsup_pend_state_t;
+
 typedef struct gsup_pending {
-    uint32_t    tcap_tid;
+    uint32_t    tcap_tid;           /* our OTID / peer DTID */
+    uint32_t    peer_otid;          /* HLR OTID (for CONTINUE) */
+    int         have_peer_otid;
     int         conn_id;
     char        imsi[16];
     map_op_t    map_op;
-    uint8_t     invoke_id;
+    uint8_t     invoke_id;          /* our outbound Invoke id */
+    uint8_t     isd_invoke_id;      /* HLR ISD Invoke id to ack */
+    uint8_t     cn_domain;
+    gsup_pend_state_t state;
+    char        msisdn[24];
+    char        hlr_digits[24];
     char        src_gt[24];
+    ss7_sccp_addr_t peer_addr;      /* HLR calling address for CONTINUE */
+    int         have_peer_addr;
+    uint8_t     deferred_ul_res[256];
+    size_t      deferred_ul_res_len;
     time_t      created;
     int         timeout_ms;
     UT_hash_handle hh;
@@ -139,7 +155,8 @@ static void pending_remove(gsup_pending_t *p)
 }
 
 static gsup_pending_t *pending_add(uint32_t tid, int conn_id, map_op_t op,
-                                   const char *imsi, const char *src_gt)
+                                   const char *imsi, const char *src_gt,
+                                   uint8_t cn_domain)
 {
     gsup_pending_t *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
@@ -147,6 +164,8 @@ static gsup_pending_t *pending_add(uint32_t tid, int conn_id, map_op_t op,
     p->conn_id    = conn_id;
     p->map_op     = op;
     p->invoke_id  = 1;
+    p->cn_domain  = cn_domain;
+    p->state      = GPEND_WAIT_MAP;
     p->created    = time(NULL);
     p->timeout_ms = g_rt && g_rt->cfg.gsup_timeout_ms > 0
                     ? g_rt->cfg.gsup_timeout_ms : 10000;
@@ -162,6 +181,34 @@ static gsup_pending_t *pending_find(uint32_t tid)
     gsup_pending_t *p = NULL;
     HASH_FIND(hh, g_pending, &tid, sizeof(tid), p);
     return p;
+}
+
+static gsup_pending_t *pending_find_isd_wait(const char *imsi)
+{
+    gsup_pending_t *p, *tmp;
+    if (!imsi || !imsi[0]) return NULL;
+    HASH_ITER(hh, g_pending, p, tmp) {
+        if (p->state == GPEND_WAIT_GSUP_ISD && !strcmp(p->imsi, imsi))
+            return p;
+    }
+    return NULL;
+}
+
+static int map_pending_ack_isd(gsup_pending_t *p);
+
+static int gsup_backend_for_cn(uint8_t cn)
+{
+    if (!g_rt) return GSUP_BACKEND_DIAMETER;
+    if (cn == GSUP_CN_DOMAIN_CS)
+        return g_rt->cfg.gsup_cs_backend;
+    return g_rt->cfg.gsup_ps_backend;
+}
+
+static const char *vlr_gt_digits(void)
+{
+    if (g_rt && g_rt->cfg.map_local_gt[0])
+        return g_rt->cfg.map_local_gt;
+    return NULL;
 }
 
 static void reply_gsup_err(int conn_id, const char *imsi,
@@ -209,14 +256,25 @@ static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
              map_op_str(op), route->imsi);
         return -1;
     }
+    if (!route->hlr_gt[0]) {
+        LOGW("gsup", "MAP %s imsi=%s: no hlr_gt (set [roaming_hlr] mncNNN_hlr_gt)",
+             map_op_str(op), route->imsi);
+        return -1;
+    }
 
     uint32_t tid = map_sess_new_tid();
-    map_app_ctx_t ac = (op == MAP_OP_SAI)
-                       ? MAP_AC_INFO_RETRIEVAL_V3
-                       : MAP_AC_GPRS_LOCATION_UPDATE_V3;
-    int opcode = (op == MAP_OP_SAI)
-                 ? MAP_OP_CODE_SEND_AUTH_INFO
-                 : MAP_OP_CODE_UPDATE_GPRS_LOCATION;
+    map_app_ctx_t ac;
+    int opcode;
+    if (op == MAP_OP_SAI) {
+        ac = MAP_AC_INFO_RETRIEVAL_V3;
+        opcode = MAP_OP_CODE_SEND_AUTH_INFO;
+    } else if (op == MAP_OP_UL) {
+        ac = MAP_AC_NETWORK_LOC_UP_V3;
+        opcode = MAP_OP_CODE_UPDATE_LOCATION;
+    } else {
+        ac = MAP_AC_GPRS_LOCATION_UPDATE_V3;
+        opcode = MAP_OP_CODE_UPDATE_GPRS_LOCATION;
+    }
 
     uint8_t cmp[1200];
     size_t co = 0;
@@ -236,26 +294,30 @@ static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
     ss7_sccp_addr_t called, calling;
     ss7_gt_from_digits(route->hlr_gt, route->hlr_ssn, &called);
     memset(&calling, 0, sizeof(calling));
+    /* MAP-C networkLocUp is VLR↔HLR; CS auth also from VLR. PS uses SGSN SSN. */
     uint8_t orig_ssn = (cn_domain == GSUP_CN_DOMAIN_CS)
-                       ? SS7_SSN_MSC : g_rt->cfg.map_local_ssn;
+                       ? SS7_SSN_VLR : g_rt->cfg.map_local_ssn;
     if (route->src_gt[0])
         ss7_gt_from_digits(route->src_gt, orig_ssn, &calling);
     else
         ss7_link_make_local_addr(g_rt, &calling);
     if (cn_domain == GSUP_CN_DOMAIN_CS)
-        calling.ssn = SS7_SSN_MSC;
+        calling.ssn = orig_ssn;
 
     if (ss7_link_send_tcap_ex(g_rt, &called,
                               calling.have_gt ? &calling : NULL,
                               out, (size_t)n) < 0)
         return -1;
 
-    if (!pending_add(tid, conn_id, op, route->imsi, route->src_gt))
+    if (!pending_add(tid, conn_id, op, route->imsi, route->src_gt, cn_domain))
         return -1;
 
-    LOGI("gsup", "TX MAP %s imsi=%s tid=0x%08x hlr_gt=%s src_gt=%s",
-         map_op_str(op), route->imsi, tid, route->hlr_gt,
-         route->src_gt[0] ? route->src_gt : g_rt->cfg.map_local_gt);
+    LOGI("gsup", "TX MAP %s imsi=%s cn=%s tid=0x%08x hlr_gt=%s src_gt=%s ssn=%u",
+         map_op_str(op), route->imsi,
+         cn_domain == GSUP_CN_DOMAIN_CS ? "CS" : "PS",
+         tid, route->hlr_gt,
+         route->src_gt[0] ? route->src_gt : g_rt->cfg.map_local_gt,
+         (unsigned)orig_ssn);
     return 0;
 }
 
@@ -439,19 +501,32 @@ int gsup_map_proxy_send_isd(iwf_runtime_t *rt, map_session_t *s)
 static int handle_sai(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
                       const uint8_t *raw_gsup, size_t raw_len)
 {
+    (void)raw_gsup;
+    (void)raw_len;
     if (route->kind == GSUP_ROUTE_REJECT) {
         reply_gsup_err(conn_id, route->imsi, GSUP_MSG_SAI_REQ,
                        GSUP_CAUSE_IMSI_UNKNOWN);
         return 0;
     }
-    if (route->kind == GSUP_ROUTE_LOCAL || route->kind == GSUP_ROUTE_DIAM_HSS)
+    uint8_t cn = (req && req->have_cn_domain) ? req->cn_domain : GSUP_CN_DOMAIN_PS;
+    int want_map = (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && route->hlr_gt[0]);
+    if (!want_map) {
+        if (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && !route->hlr_gt[0])
+            LOGI("gsup", "SAI imsi=%s cn=%s: no hlr_gt, falling back to Diameter",
+                 route->imsi, cn == GSUP_CN_DOMAIN_CS ? "CS" : "PS");
+        if (route->kind == GSUP_ROUTE_MAP_HLR &&
+            !route->dest_realm[0] && !g_rt->cfg.diam_dest_realm[0]) {
+            LOGW("gsup", "SAI imsi=%s cn=%s wants Diameter but no dest_realm",
+                 route->imsi, cn == GSUP_CN_DOMAIN_CS ? "CS" : "PS");
+            return -1;
+        }
         return start_diameter(route, req, conn_id, MAP_OP_SAI, GSUP_MSG_SAI_REQ);
+    }
 
     uint8_t arg[128];
     uint8_t nv = req->have_num_vectors ? req->num_vectors : 3;
     int an = map_encode_sai_arg(route->imsi, nv, arg, sizeof(arg));
     if (an < 0) return -1;
-    uint8_t cn = (req && req->have_cn_domain) ? req->cn_domain : GSUP_CN_DOMAIN_PS;
     return send_map_to_hlr(route, MAP_OP_SAI, arg, (size_t)an, conn_id, cn);
 }
 
@@ -465,8 +540,34 @@ static int handle_ul(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
                        GSUP_CAUSE_IMSI_UNKNOWN);
         return 0;
     }
-    if (route->kind == GSUP_ROUTE_LOCAL || route->kind == GSUP_ROUTE_DIAM_HSS)
+    uint8_t cn = (req && req->have_cn_domain) ? req->cn_domain : GSUP_CN_DOMAIN_PS;
+    int want_map = (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && route->hlr_gt[0]);
+
+    if (!want_map) {
+        if (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && !route->hlr_gt[0])
+            LOGI("gsup", "UL imsi=%s cn=%s: no hlr_gt, falling back to Diameter",
+                 route->imsi, cn == GSUP_CN_DOMAIN_CS ? "CS" : "PS");
+        if (route->kind == GSUP_ROUTE_MAP_HLR &&
+            !route->dest_realm[0] && !g_rt->cfg.diam_dest_realm[0]) {
+            LOGW("gsup", "UL imsi=%s cn=%s wants Diameter but no dest_realm",
+                 route->imsi, cn == GSUP_CN_DOMAIN_CS ? "CS" : "PS");
+            return -1;
+        }
         return start_diameter(route, req, conn_id, MAP_OP_UGL, GSUP_MSG_UL_REQ);
+    }
+
+    /* MAP backend (CS → MAP-C updateLocation; PS → Gr UGL) */
+    if (cn == GSUP_CN_DOMAIN_CS) {
+        const char *gt = vlr_gt_digits();
+        if (!gt) {
+            LOGW("gsup", "CS MAP-C UL imsi=%s: set [map_iwf].local_gt", route->imsi);
+            return -1;
+        }
+        uint8_t arg[256];
+        int an = map_encode_ul_arg(route->imsi, gt, gt, arg, sizeof(arg));
+        if (an < 0) return -1;
+        return send_map_to_hlr(route, MAP_OP_UL, arg, (size_t)an, conn_id, cn);
+    }
 
     uint8_t sn_bcd[8];
     int snl = sgsn_number_bcd(g_rt, sn_bcd, sizeof(sn_bcd));
@@ -478,7 +579,6 @@ static int handle_ul(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
                                 sal > 0 ? saddr : NULL, sal > 0 ? (size_t)sal : 0,
                                 arg, sizeof(arg));
     if (an < 0) return -1;
-    uint8_t cn = (req && req->have_cn_domain) ? req->cn_domain : GSUP_CN_DOMAIN_PS;
     return send_map_to_hlr(route, MAP_OP_UGL, arg, (size_t)an, conn_id, cn);
 }
 
@@ -516,8 +616,29 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
          (req.msg_type == GSUP_MSG_SAI_REQ && gsup_parsed_have_resync(&req))
              ? " resync=1" : "");
 
-    /* ISD result completes a Diameter UL transaction. */
+    /* ISD result completes a Diameter UL or MAP-C UL (CSFB) transaction. */
     if (req.msg_type == GSUP_MSG_ISD_RES || req.msg_type == GSUP_MSG_ISD_ERR) {
+        gsup_pending_t *mp = pending_find_isd_wait(req.imsi);
+        if (mp) {
+            if (req.msg_type == GSUP_MSG_ISD_ERR) {
+                reply_gsup_err(mp->conn_id, mp->imsi, GSUP_MSG_UL_REQ,
+                               GSUP_CAUSE_IMSI_UNKNOWN);
+                pending_remove(mp);
+                return;
+            }
+            if (conn_id != mp->conn_id) {
+                LOGW("gsup", "MAP ISD_RES conn mismatch imsi=%s expect=%d got=%d",
+                     req.imsi, mp->conn_id, conn_id);
+                return;
+            }
+            LOGI("gsup", "RX ISD_RES (MAP-C) imsi=%s conn=%d", req.imsi, conn_id);
+            if (map_pending_ack_isd(mp) < 0) {
+                reply_gsup_err(mp->conn_id, mp->imsi, GSUP_MSG_UL_REQ,
+                               GSUP_CAUSE_IMSI_UNKNOWN);
+                pending_remove(mp);
+            }
+            return;
+        }
         map_session_t *s = map_sess_find_gsup_pending(req.imsi, MAP_OP_UGL);
         if (!s) {
             LOGD("gsup", "ISD response for unknown imsi=%s", req.imsi);
@@ -703,31 +824,140 @@ static void map_to_gsup_sai(gsup_pending_t *p, const uint8_t *params, size_t ple
     }
 }
 
-static void map_to_gsup_ugl(gsup_pending_t *p, const uint8_t *params, size_t plen)
+static void map_to_gsup_ul_res(gsup_pending_t *p, const uint8_t *params, size_t plen)
 {
-    (void)params;
-    (void)plen;
-    uint8_t gsup[128];
-    int gn = gsup_build_ul_res(p->imsi, NULL, NULL, 0,
-                               GSUP_CN_DOMAIN_PS, NULL,
-                               gsup, sizeof(gsup));
+    char hlr_digits[24] = {0};
+    (void)map_decode_ul_res(params, plen, NULL, 0, NULL,
+                            hlr_digits, sizeof(hlr_digits));
+    if (hlr_digits[0])
+        strncpy(p->hlr_digits, hlr_digits, sizeof(p->hlr_digits) - 1);
+
+    const char *hlr = p->hlr_digits[0] ? p->hlr_digits
+                     : (g_rt && g_rt->cfg.map_local_gt[0] ? g_rt->cfg.map_local_gt
+                                                          : NULL);
+    /* CS: MSISDN already via ISD; UL_RES is IMSI + CN (+ optional HLR). */
+    const char *msisdn = NULL;
+    if (p->cn_domain != GSUP_CN_DOMAIN_CS && p->msisdn[0])
+        msisdn = p->msisdn;
+
+    uint8_t gsup[256];
+    int gn = gsup_build_ul_res(p->imsi, msisdn, NULL, 0,
+                               p->cn_domain, hlr, gsup, sizeof(gsup));
     if (gn > 0) {
         (void)proxy_send_gsup(p->conn_id, gsup, (size_t)gn);
-        LOGI("gsup", "TX UL_RES (MAP) imsi=%s conn=%d", p->imsi, p->conn_id);
+        LOGI("gsup", "TX UL_RES (MAP) imsi=%s cn=%s msisdn=%s hlr=%s conn=%d",
+             p->imsi,
+             p->cn_domain == GSUP_CN_DOMAIN_CS ? "CS" : "PS",
+             msisdn ? msisdn : "(none)",
+             hlr ? hlr : "(none)", p->conn_id);
     }
+}
+
+static int map_pending_send_isd_gsup(gsup_pending_t *p)
+{
+    if (!p || !p->msisdn[0]) return -1;
+    const char *hlr = g_rt && g_rt->cfg.map_local_gt[0] ? g_rt->cfg.map_local_gt
+                                                        : NULL;
+    uint8_t gsup[512];
+    int n = gsup_build_isd_req(p->imsi, p->msisdn, NULL, 0,
+                               p->cn_domain, hlr, gsup, sizeof(gsup));
+    if (n <= 0) return -1;
+    if (proxy_send_gsup(p->conn_id, gsup, (size_t)n) < 0) return -1;
+    p->state = GPEND_WAIT_GSUP_ISD;
+    LOGI("gsup", "TX ISD_REQ (MAP-C) imsi=%s msisdn=%s cn=CS conn=%d",
+         p->imsi, p->msisdn, p->conn_id);
+    return 0;
+}
+
+/* After MSC ISD_RES: ReturnResult ISD toward HLR, keep dialogue open for UL Res. */
+static int map_pending_ack_isd(gsup_pending_t *p)
+{
+    if (!p || !p->have_peer_otid || !p->have_peer_addr) return -1;
+
+    uint8_t cmp[64];
+    size_t co = 0;
+    if (tcap_enc_return_result(cmp, sizeof(cmp), &co, p->isd_invoke_id,
+                               MAP_OP_CODE_INSERT_SUBSCRIBER_DATA,
+                               NULL, 0) < 0)
+        return -1;
+
+    uint8_t out[512];
+    int n = tcap_encode_message(TCAP_MSG_CONTINUE,
+                                p->tcap_tid, true,
+                                p->peer_otid, true,
+                                NULL, 0, cmp, co,
+                                out, sizeof(out));
+    if (n < 0) return -1;
+
+    ss7_sccp_addr_t calling;
+    memset(&calling, 0, sizeof(calling));
+    uint8_t ssn = SS7_SSN_VLR;
+    if (p->src_gt[0])
+        ss7_gt_from_digits(p->src_gt, ssn, &calling);
+    else if (g_rt)
+        ss7_link_make_local_addr(g_rt, &calling);
+    calling.ssn = ssn;
+
+    if (ss7_link_send_tcap_ex(g_rt, &p->peer_addr,
+                              calling.have_gt ? &calling : NULL,
+                              out, (size_t)n) < 0)
+        return -1;
+
+    p->state = GPEND_WAIT_MAP;
+    LOGI("gsup", "TX MAP ISD ReturnResult imsi=%s tid=0x%08x peer=0x%08x",
+         p->imsi, p->tcap_tid, p->peer_otid);
+    if (p->deferred_ul_res_len) {
+        map_to_gsup_ul_res(p, p->deferred_ul_res, p->deferred_ul_res_len);
+        p->deferred_ul_res_len = 0;
+        pending_remove(p);
+        return 0;
+    }
+    return 0;
+}
+
+static int map_pending_on_isd_invoke(gsup_pending_t *p,
+                                     const ss7_sccp_addr_t *calling,
+                                     const tcap_msg_t *tmsg,
+                                     const tcap_component_t *c)
+{
+    char msisdn[24] = {0};
+    if (map_decode_isd_arg(c->parameters, c->parameters_len,
+                           NULL, 0, msisdn, sizeof(msisdn)) < 0 || !msisdn[0]) {
+        LOGW("gsup", "MAP ISD Invoke without MSISDN imsi=%s", p->imsi);
+        return -1;
+    }
+    strncpy(p->msisdn, msisdn, sizeof(p->msisdn) - 1);
+    p->isd_invoke_id = c->invoke_id;
+    if (tmsg->have_otid) {
+        p->peer_otid = tmsg->otid;
+        p->have_peer_otid = 1;
+    }
+    if (calling) {
+        p->peer_addr = *calling;
+        p->have_peer_addr = 1;
+    }
+    return map_pending_send_isd_gsup(p);
 }
 
 bool gsup_map_proxy_on_tcap(iwf_runtime_t *rt,
                             const ss7_sccp_addr_t *calling,
                             const tcap_msg_t *tmsg)
 {
-    (void)calling;
     if (!rt || !tmsg || !tmsg->have_dtid)
         return false;
 
     gsup_pending_t *p = pending_find(tmsg->dtid);
     if (!p)
         return false;
+
+    if (tmsg->have_otid) {
+        p->peer_otid = tmsg->otid;
+        p->have_peer_otid = 1;
+    }
+    if (calling) {
+        p->peer_addr = *calling;
+        p->have_peer_addr = 1;
+    }
 
     if (tmsg->type == TCAP_MSG_ABORT) {
         reply_gsup_err(p->conn_id, p->imsi,
@@ -741,29 +971,65 @@ bool gsup_map_proxy_on_tcap(iwf_runtime_t *rt,
         return true;
 
     if (tmsg->n_components == 0) {
-        pending_remove(p);
+        if (tmsg->type == TCAP_MSG_END)
+            pending_remove(p);
         return true;
     }
 
-    const tcap_component_t *c = &tmsg->components[0];
-    if (c->kind == TCAP_CMP_KIND_ERR) {
-        reply_gsup_err(p->conn_id, p->imsi,
-                       p->map_op == MAP_OP_SAI ? GSUP_MSG_SAI_REQ : GSUP_MSG_UL_REQ,
-                       GSUP_CAUSE_IMSI_UNKNOWN);
-        pending_remove(p);
-        return true;
-    }
-    if (c->kind != TCAP_CMP_KIND_RES) {
-        pending_remove(p);
-        return true;
+    /* Process all components: ISD Invoke(s) then UL/SAI Result. */
+    int finished = 0;
+    int saw_isd = 0;
+    for (size_t i = 0; i < tmsg->n_components; i++) {
+        const tcap_component_t *c = &tmsg->components[i];
+        if (c->kind == TCAP_CMP_KIND_ERR) {
+            reply_gsup_err(p->conn_id, p->imsi,
+                           p->map_op == MAP_OP_SAI ? GSUP_MSG_SAI_REQ
+                                                   : GSUP_MSG_UL_REQ,
+                           GSUP_CAUSE_IMSI_UNKNOWN);
+            pending_remove(p);
+            return true;
+        }
+        if (c->kind == TCAP_CMP_KIND_INVOKE &&
+            c->opcode == MAP_OP_CODE_INSERT_SUBSCRIBER_DATA) {
+            if (map_pending_on_isd_invoke(p, calling, tmsg, c) < 0) {
+                reply_gsup_err(p->conn_id, p->imsi, GSUP_MSG_UL_REQ,
+                               GSUP_CAUSE_IMSI_UNKNOWN);
+                pending_remove(p);
+                return true;
+            }
+            saw_isd = 1;
+            continue;
+        }
+        if (c->kind != TCAP_CMP_KIND_RES)
+            continue;
+
+        if (p->map_op == MAP_OP_SAI) {
+            map_to_gsup_sai(p, c->parameters, c->parameters_len);
+            finished = 1;
+        } else if (p->map_op == MAP_OP_UL || p->map_op == MAP_OP_UGL) {
+            /* Defer UL_RES until after MSC ISD_RES when ISD was in this PDU. */
+            if (saw_isd || p->state == GPEND_WAIT_GSUP_ISD) {
+                size_t copy = c->parameters_len;
+                if (copy > sizeof(p->deferred_ul_res))
+                    copy = sizeof(p->deferred_ul_res);
+                if (c->parameters && copy) {
+                    memcpy(p->deferred_ul_res, c->parameters, copy);
+                    p->deferred_ul_res_len = copy;
+                }
+                LOGI("gsup", "defer MAP UL Res until after GSUP ISD imsi=%s len=%zu",
+                     p->imsi, copy);
+                continue;
+            }
+            map_to_gsup_ul_res(p, c->parameters, c->parameters_len);
+            finished = 1;
+        }
     }
 
-    if (p->map_op == MAP_OP_SAI)
-        map_to_gsup_sai(p, c->parameters, c->parameters_len);
-    else
-        map_to_gsup_ugl(p, c->parameters, c->parameters_len);
-
-    pending_remove(p);
+    if (finished && p->state != GPEND_WAIT_GSUP_ISD)
+        pending_remove(p);
+    else if (tmsg->type == TCAP_MSG_END && p->state != GPEND_WAIT_GSUP_ISD &&
+             !finished && !saw_isd)
+        pending_remove(p);
     return true;
 }
 
@@ -805,7 +1071,18 @@ void gsup_map_proxy_on_conn_closed(int conn_id)
 void gsup_map_proxy_init(iwf_runtime_t *rt)
 {
     g_rt = rt;
-    /* LOCAL auth/UL uses Diameter S6d; no PyHSS GSUP client relay. */
+    /* LOCAL auth/UL uses Diameter S6d unless cs_backend/ps_backend override. */
+    if (rt && rt->cfg.gsup_cs_backend == GSUP_BACKEND_MAP) {
+        /* HLR replies to VLR SSN on networkLocUp; bind so CONTINUE/END arrive. */
+        if (ss7_link_bind_extra_ssn(rt, SS7_SSN_VLR, "iwf-vlr") < 0)
+            LOGW("gsup", "CS MAP-C: failed to bind VLR SSN %u",
+                 (unsigned)SS7_SSN_VLR);
+        if (ss7_link_bind_extra_ssn(rt, SS7_SSN_MSC, "iwf-msc") < 0)
+            LOGW("gsup", "CS MAP-C: failed to bind MSC SSN %u",
+                 (unsigned)SS7_SSN_MSC);
+        LOGI("gsup", "combine mode: cs_backend=map ps_backend=%s",
+             rt->cfg.gsup_ps_backend == GSUP_BACKEND_MAP ? "map" : "diameter");
+    }
 }
 
 void gsup_map_proxy_shutdown(void)

@@ -2,8 +2,8 @@
 #include "logging.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <errno.h>
 
@@ -52,6 +52,8 @@ static void defaults(iwf_config_t *c)
     c->gsup_listen_port      = 4222;
     strncpy(c->gsup_local_mnc, "012", sizeof(c->gsup_local_mnc) - 1);
     c->gsup_timeout_ms       = 10000;
+    c->gsup_cs_backend       = GSUP_BACKEND_DIAMETER;
+    c->gsup_ps_backend       = GSUP_BACKEND_DIAMETER;
 
 #ifdef SMS_IWF_ENABLED
     c->sms_iwf_enabled       = 0;
@@ -69,6 +71,19 @@ static void defaults(iwf_config_t *c)
     strncpy(c->smpp_system_id, "iwf", sizeof(c->smpp_system_id) - 1);
     strncpy(c->smpp_password, "changeme", sizeof(c->smpp_password) - 1);
 #endif
+}
+
+static int parse_gsup_backend(const char *val)
+{
+    if (!val || !*val) return GSUP_BACKEND_DIAMETER;
+    if (!strcasecmp(val, "map") || !strcasecmp(val, "map-c") ||
+        !strcasecmp(val, "ss7"))
+        return GSUP_BACKEND_MAP;
+    if (!strcasecmp(val, "diameter") || !strcasecmp(val, "s6d") ||
+        !strcasecmp(val, "s6a"))
+        return GSUP_BACKEND_DIAMETER;
+    LOGW("config", "unknown gsup backend '%s' (use map|diameter)", val);
+    return GSUP_BACKEND_DIAMETER;
 }
 
 static uint8_t parse_network_indicator(const char *val)
@@ -421,6 +436,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "listen_ips"))     gsup_listen_ips_split(out, val);
             else if (!strcmp(key, "local_mnc"))      copy_str(out->gsup_local_mnc, sizeof(out->gsup_local_mnc), val);
             else if (!strcmp(key, "timeout_ms"))     out->gsup_timeout_ms = atoi(val);
+            else if (!strcmp(key, "cs_backend"))     out->gsup_cs_backend = parse_gsup_backend(val);
+            else if (!strcmp(key, "ps_backend"))     out->gsup_ps_backend = parse_gsup_backend(val);
             else LOGW("config", "unknown key [gsup_server].%s", key);
         } else if (!strcmp(section, "roaming_hlr")) {
             gsup_roam_key(out, key, val);
@@ -532,6 +549,15 @@ void iwf_config_dump(const iwf_config_t *c)
                  i, c->diam_peers[i].ip, (unsigned)c->diam_peers[i].port);
     } else {
         LOGI("config", "map_iwf: disabled (set [map_iwf].enabled = 1 to bring it up)");
+    }
+    if (c->gsup_server_enabled) {
+        LOGI("config", "gsup_server: listen_port=%u local_mnc=%s timeout=%dms "
+                       "cs_backend=%s ps_backend=%s",
+             (unsigned)c->gsup_listen_port,
+             c->gsup_local_mnc[0] ? c->gsup_local_mnc : "(unset)",
+             c->gsup_timeout_ms,
+             c->gsup_cs_backend == GSUP_BACKEND_MAP ? "map" : "diameter",
+             c->gsup_ps_backend == GSUP_BACKEND_MAP ? "map" : "diameter");
     }
 #ifdef SMS_IWF_ENABLED
     if (c->sms_iwf_enabled) {

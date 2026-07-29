@@ -207,6 +207,8 @@ struct ss7_impl_ctx {
     struct osmo_ss7_instance *ss7;
     struct osmo_sccp_instance *sccp;
     struct osmo_sccp_user *user;
+    struct osmo_sccp_user *user_extra[4]; /* VLR/MSC/etc. same recv_cb */
+    int                    n_user_extra;
 #ifdef SMS_IWF_ENABLED
     struct osmo_sccp_user *user_hlr;
     ss7_recv_cb_t          recv_cb_hlr;
@@ -439,6 +441,35 @@ int ss7_link_bind_hlr_ssn(struct iwf_runtime *rt, uint8_t ssn)
 }
 #endif /* SMS_IWF_ENABLED */
 
+int ss7_link_bind_extra_ssn(struct iwf_runtime *rt, uint8_t ssn, const char *name)
+{
+    if (!rt || !rt->map || !rt->map->ss7.opaque || !ssn) return -1;
+    struct ss7_impl_ctx *ctx = rt->map->ss7.opaque;
+    if (ssn == rt->cfg.map_local_ssn)
+        return 0; /* already bound as primary user */
+    for (int i = 0; i < ctx->n_user_extra; i++) {
+        /* Dedup by slot occupancy only; libosmo rejects duplicate SSN binds. */
+        (void)i;
+    }
+    if (ctx->n_user_extra >= (int)(sizeof(ctx->user_extra) / sizeof(ctx->user_extra[0]))) {
+        LOGE("ss7", "extra SSN bind table full (ssn=%u)", (unsigned)ssn);
+        return -1;
+    }
+    char uname[32];
+    snprintf(uname, sizeof(uname), "%s", name && name[0] ? name : "iwf-extra");
+    struct osmo_sccp_user *u = osmo_sccp_user_bind(ctx->sccp, uname,
+                                                   sccp_prim_cb, ssn);
+    if (!u) {
+        LOGE("ss7", "sccp_user_bind failed for extra ssn=%u name=%s",
+             (unsigned)ssn, uname);
+        return -1;
+    }
+    osmo_sccp_user_set_priv(u, rt);
+    ctx->user_extra[ctx->n_user_extra++] = u;
+    LOGI("ss7", "bound SCCP user %s for SSN %u (MAP-C CSFB)", uname, (unsigned)ssn);
+    return 0;
+}
+
 int ss7_link_init(struct iwf_runtime *rt)
 {
     if (!rt || !rt->cfg.map_iwf_enabled) return -1;
@@ -659,6 +690,10 @@ void ss7_link_shutdown(struct iwf_runtime *rt)
     struct ss7_impl_ctx *ctx = (struct ss7_impl_ctx *)rt->map->ss7.opaque;
     if (!ctx) return;
     if (ctx->user)  osmo_sccp_user_unbind(ctx->user);
+    for (int i = 0; i < ctx->n_user_extra; i++) {
+        if (ctx->user_extra[i])
+            osmo_sccp_user_unbind(ctx->user_extra[i]);
+    }
 #ifdef SMS_IWF_ENABLED
     if (ctx->user_hlr) osmo_sccp_user_unbind(ctx->user_hlr);
 #endif
@@ -703,6 +738,12 @@ int ss7_link_send_tcap_ex(struct iwf_runtime *rt,
                           const uint8_t *tcap, size_t tcap_len)
 {
     (void)rt; (void)called; (void)calling; (void)tcap; (void)tcap_len;
+    return -1;
+}
+
+int ss7_link_bind_extra_ssn(struct iwf_runtime *rt, uint8_t ssn, const char *name)
+{
+    (void)rt; (void)ssn; (void)name;
     return -1;
 }
 

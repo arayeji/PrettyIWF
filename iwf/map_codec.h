@@ -35,6 +35,7 @@
 #include "map_session.h"
 
 /* MAP operation codes (TS 29.002 §17.5 - "local value" form). */
+#define MAP_OP_CODE_UPDATE_LOCATION         2
 #define MAP_OP_CODE_CANCEL_LOCATION         3
 #define MAP_OP_CODE_INSERT_SUBSCRIBER_DATA  7
 #define MAP_OP_CODE_UPDATE_GPRS_LOCATION    23
@@ -132,6 +133,22 @@ int map_decode_sai_res(const uint8_t *p, size_t n,
 int map_encode_sai_res(const map_auth_vector_t *vec, size_t n_vec,
                        uint8_t *out, size_t out_cap);
 
+/* MAP UpdateLocation Invoke (IWF/VLR -> foreign HLR, MAP-C).
+ * msc_gt / vlr_gt are E.164 digit strings (ISDN-AddressString with 0x91). */
+int map_encode_ul_arg(const char *imsi_str,
+                      const char *msc_gt_digits,
+                      const char *vlr_gt_digits,
+                      uint8_t *out, size_t out_cap);
+/* UpdateLocationRes — same hlr-Number shape as UGL Res. */
+int map_decode_ul_res(const uint8_t *p, size_t n,
+                      uint8_t *hlr_bcd, size_t hlr_cap, size_t *hlr_len,
+                      char *hlr_digits, size_t hlr_digits_cap);
+
+/* MAP InsertSubscriberData Invoke from HLR (inbound on networkLocUp). */
+int map_decode_isd_arg(const uint8_t *p, size_t n,
+                       char *imsi_out, size_t imsi_cap,
+                       char *msisdn_out, size_t msisdn_cap);
+
 /* MAP UpdateGprsLocation Invoke (IWF -> foreign HLR). */
 int map_encode_ugl_arg(const char *imsi_str,
                        const uint8_t *sgsn_number_bcd, size_t sgsn_num_len,
@@ -191,6 +208,7 @@ typedef enum {
     MAP_AC_SUBSCRIBER_DATA_MGMT_V3  = 3, /* insertSubscriberData           */
     MAP_AC_GPRS_LOCATION_CANCEL_V3  = 4, /* cancelLocation over Gr         */
     MAP_AC_MS_PURGING_V3            = 5, /* purgeMS                        */
+    MAP_AC_NETWORK_LOC_UP_V3        = 6, /* updateLocation (MAP-C)         */
 } map_app_ctx_t;
 
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap);
