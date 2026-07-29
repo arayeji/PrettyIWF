@@ -35,6 +35,7 @@ typedef enum {
     MAP_OP_ISD              = 3,   /* insertSubscriberData    - op 7  (we INVOKE)    */
     MAP_OP_CL               = 4,   /* cancelLocation          - op 3                 */
     MAP_OP_PURGE_MS         = 5,   /* purgeMS                 - op 67                */
+    MAP_OP_UL               = 6,   /* updateLocation (MAP-C)  - op 2                 */
 } map_op_t;
 
 typedef enum {

@@ -83,6 +83,7 @@ static map_app_ctx_t ac_for_op(map_op_t op)
 {
     switch (op) {
     case MAP_OP_SAI:      return MAP_AC_INFO_RETRIEVAL_V3;
+    case MAP_OP_UL:       return MAP_AC_NETWORK_LOC_UP_V3;
     case MAP_OP_UGL:      return MAP_AC_GPRS_LOCATION_UPDATE_V3;
     case MAP_OP_ISD:      return MAP_AC_SUBSCRIBER_DATA_MGMT_V3;
     case MAP_OP_CL:       return MAP_AC_GPRS_LOCATION_CANCEL_V3;

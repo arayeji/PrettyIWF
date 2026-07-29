@@ -481,6 +481,133 @@ int map_decode_ugl_res(const uint8_t *p, size_t n,
     return 0;
 }
 
+/* Encode ISDN-AddressString: nature/plan 0x91 + TBCD digits. */
+static int enc_isdn_addr(const char *digits, uint8_t *buf, size_t cap)
+{
+    if (!digits || !digits[0] || cap < 2) return -1;
+    buf[0] = 0x91;
+    int n = map_str_to_bcd(digits, buf + 1, cap - 1);
+    if (n < 0) return -1;
+    return n + 1;
+}
+
+/* Decode ISDN-AddressString (optional leading nature/plan) into digit string. */
+static void dec_isdn_addr_digits(const uint8_t *v, size_t l,
+                                 char *out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!v || l == 0) return;
+    /* Skip nature/plan if present (high nibble typically 9 for international). */
+    if (l >= 2 && (v[0] & 0xf0) == 0x90) {
+        map_bcd_to_str(v + 1, l - 1, out, cap);
+    } else {
+        map_bcd_to_str(v, l, out, cap);
+    }
+}
+
+int map_encode_ul_arg(const char *imsi_str,
+                      const char *msc_gt_digits,
+                      const char *vlr_gt_digits,
+                      uint8_t *out, size_t out_cap)
+{
+    /* UpdateLocationArg ::= SEQUENCE {
+     *   imsi       [0] IMSI,
+     *   msc-Number [1] ISDN-AddressString,
+     *   vlr-Number     ISDN-AddressString,
+     *   ... } */
+    if (!imsi_str || !out) return -1;
+    uint8_t imsi_bcd[8];
+    int bl = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
+    if (bl < 0) return -1;
+
+    const char *msc = (msc_gt_digits && msc_gt_digits[0]) ? msc_gt_digits
+                                                          : vlr_gt_digits;
+    const char *vlr = (vlr_gt_digits && vlr_gt_digits[0]) ? vlr_gt_digits
+                                                          : msc_gt_digits;
+    if (!msc || !msc[0] || !vlr || !vlr[0]) return -1;
+
+    uint8_t msc_buf[16], vlr_buf[16];
+    int ml = enc_isdn_addr(msc, msc_buf, sizeof(msc_buf));
+    int vl = enc_isdn_addr(vlr, vlr_buf, sizeof(vlr_buf));
+    if (ml < 0 || vl < 0) return -1;
+
+    uint8_t inner[128];
+    size_t io = 0;
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x80 /* [0] imsi */,
+                    imsi_bcd, (size_t)bl) < 0)
+        return -1;
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x81 /* [1] msc-Number */,
+                    msc_buf, (size_t)ml) < 0)
+        return -1;
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x04 /* vlr-Number */,
+                    vlr_buf, (size_t)vl) < 0)
+        return -1;
+
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x30, inner, io) < 0) return -1;
+    return (int)off;
+}
+
+int map_decode_ul_res(const uint8_t *p, size_t n,
+                      uint8_t *hlr_bcd, size_t hlr_cap, size_t *hlr_len,
+                      char *hlr_digits, size_t hlr_digits_cap)
+{
+    uint8_t tmp[16];
+    size_t len = 0;
+    uint8_t *dst = hlr_bcd ? hlr_bcd : tmp;
+    size_t cap = hlr_bcd ? hlr_cap : sizeof(tmp);
+    if (map_decode_ugl_res(p, n, dst, cap, &len) < 0)
+        return -1;
+    if (hlr_len) *hlr_len = len;
+    if (hlr_digits && hlr_digits_cap) {
+        hlr_digits[0] = '\0';
+        if (len)
+            dec_isdn_addr_digits(dst, len, hlr_digits, hlr_digits_cap);
+    }
+    return 0;
+}
+
+int map_decode_isd_arg(const uint8_t *p, size_t n,
+                       char *imsi_out, size_t imsi_cap,
+                       char *msisdn_out, size_t msisdn_cap)
+{
+    if (imsi_out && imsi_cap) imsi_out[0] = '\0';
+    if (msisdn_out && msisdn_cap) msisdn_out[0] = '\0';
+    if (!p || n == 0) return -1;
+
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && p[0] == 0x30) {
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    }
+
+    size_t off = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *v;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &v, &l) < 0) break;
+
+        if ((tag == 0x80 || tag == 0x04) && imsi_out && imsi_cap && !imsi_out[0] &&
+            l >= 3 && l <= 8 && !(l >= 2 && (v[0] & 0xf0) == 0x90)) {
+            /* IMSI: plain TBCD, usually no nature/plan. Prefer [0]/0x80. */
+            if (tag == 0x80 || !msisdn_out || !msisdn_out[0])
+                map_bcd_to_str(v, l, imsi_out, imsi_cap);
+            continue;
+        }
+        if (msisdn_out && msisdn_cap && !msisdn_out[0]) {
+            if (tag == 0x81 || tag == 0x04) {
+                if (l >= 2 && ((v[0] & 0xf0) == 0x90 || tag == 0x81)) {
+                    dec_isdn_addr_digits(v, l, msisdn_out, msisdn_cap);
+                    continue;
+                }
+            }
+        }
+    }
+    return (msisdn_out && msisdn_out[0]) ? 0 : -1;
+}
+
 /* ====================================================================== */
 /* Encoders                                                               */
 /* ====================================================================== */
@@ -761,12 +888,14 @@ int map_encode_systemfailure_diag(uint8_t network_resource,
  * Encoded: 04 00 00 01 00 <ctx> <ver>
  *
  * Concrete OIDs we emit (version 3):
+ *   networkLocUpContext-v3               0.4.0.0.1.0. 1.3 -> 04 00 00 01 00 01 03
  *   infoRetrievalContext-v3              0.4.0.0.1.0.14.3 -> 04 00 00 01 00 0e 03
  *   gprsLocationUpdateContext-v3         0.4.0.0.1.0.32.3 -> 04 00 00 01 00 20 03
  *   subscriberDataMngtContext-v3         0.4.0.0.1.0.16.3 -> 04 00 00 01 00 10 03
  *   gprsLocationCancellationCtx-v3       0.4.0.0.1.0. 7.3 -> 04 00 00 01 00 07 03
  *   msPurgingContext-v3                  0.4.0.0.1.0.27.3 -> 04 00 00 01 00 1b 03
  */
+static const uint8_t AC_NETWORK_LOC_UP_V3[]      = { 0x04,0x00,0x00,0x01,0x00,0x01,0x03 };
 static const uint8_t AC_INFO_RETRIEVAL_V3[]      = { 0x04,0x00,0x00,0x01,0x00,0x0e,0x03 };
 static const uint8_t AC_GPRS_LOC_UPDATE_V3[]     = { 0x04,0x00,0x00,0x01,0x00,0x20,0x03 };
 static const uint8_t AC_SUBSCRIBER_DATA_MGMT_V3[]= { 0x04,0x00,0x00,0x01,0x00,0x10,0x03 };
@@ -776,6 +905,8 @@ static const uint8_t AC_MS_PURGING_V3[]          = { 0x04,0x00,0x00,0x01,0x00,0x
 static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
 {
     switch (ac) {
+    case MAP_AC_NETWORK_LOC_UP_V3:
+        *out = AC_NETWORK_LOC_UP_V3;       *out_len = sizeof(AC_NETWORK_LOC_UP_V3);       break;
     case MAP_AC_INFO_RETRIEVAL_V3:
         *out = AC_INFO_RETRIEVAL_V3;       *out_len = sizeof(AC_INFO_RETRIEVAL_V3);       break;
     case MAP_AC_GPRS_LOCATION_UPDATE_V3:
@@ -1008,6 +1139,10 @@ int map_decode_aarq_ac(const uint8_t *p, size_t n, map_app_ctx_t *out)
             const uint8_t *oid = p + i + 4;
             size_t oid_len = p[i + 3];
             if (i + 4 + oid_len > n) continue;
+            if (oid_len == sizeof(AC_NETWORK_LOC_UP_V3) &&
+                !memcmp(oid, AC_NETWORK_LOC_UP_V3, oid_len)) {
+                *out = MAP_AC_NETWORK_LOC_UP_V3; return 0;
+            }
             if (oid_len == sizeof(AC_INFO_RETRIEVAL_V3) &&
                 !memcmp(oid, AC_INFO_RETRIEVAL_V3, oid_len)) {
                 *out = MAP_AC_INFO_RETRIEVAL_V3; return 0;
