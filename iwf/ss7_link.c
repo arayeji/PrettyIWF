@@ -403,13 +403,19 @@ static int sccp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
 #ifdef SMS_IWF_ENABLED
 static int sccp_prim_cb_hlr(struct osmo_prim_hdr *oph, void *priv)
 {
+    /* Match sccp_prim_cb: do not touch ss7.opaque except on UNITDATA.
+     * PCSTATE/DUNA is broadcast to every SCCP user; loading opaque here
+     * SIGSEGV'd (coredump in sccp_prim_cb_hlr during sccp_lbcs_local_bcast_pcstate). */
     struct iwf_runtime *rt = (struct iwf_runtime *)priv;
-    struct ss7_impl_ctx *ctx = rt && rt->map ? rt->map->ss7.opaque : NULL;
-    if (!ctx) return 0;
+    if (!oph || !rt || !rt->map)
+        return 0;
 
     if (oph->sap == SCCP_SAP_USER &&
         oph->primitive == (unsigned int)OSMO_SCU_PRIM_N_UNITDATA &&
         oph->operation == PRIM_OP_INDICATION) {
+        struct ss7_impl_ctx *ctx = rt->map->ss7.opaque;
+        if (!ctx)
+            return 0;
         struct osmo_scu_prim *scu = (struct osmo_scu_prim *)oph;
         deliver_unitdata(rt, ctx->recv_cb_hlr,
                          &scu->u.unitdata.calling_addr, oph->msg);
