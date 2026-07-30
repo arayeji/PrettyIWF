@@ -129,25 +129,15 @@ void ss7_gt_from_digits(const char *digits, uint8_t ssn, ss7_sccp_addr_t *out)
     memset(out, 0, sizeof(*out));
     if (!digits || !out) return;
     out->ssn = ssn;
-    /* TBCD digits only — osmo_sccp_addr carries NAI/NPI separately in ss7_to_osmo_addr. */
-    int di = 0;
-    for (size_t i = 0; digits[i] && di < 30; i++) {
+    /* libosmo osmo_sccp_gt.digits[] is a NUL-terminated ASCII digit string
+     * (not packed TBCD). Copying TBCD here truncated GTs at embedded 0x00
+     * (e.g. ...00... in 1234567890123) → wire digits like "0900"/"00". */
+    size_t di = 0;
+    for (size_t i = 0; digits[i] && di + 1 < sizeof(out->gt_digits); i++) {
         if (digits[i] < '0' || digits[i] > '9') continue;
-        uint8_t d = (uint8_t)(digits[i] - '0');
-        size_t off = (size_t)(di / 2);
-        if (off >= sizeof(out->gt_bcd)) break;
-        if ((di & 1) == 0)
-            out->gt_bcd[off] = d;
-        else
-            out->gt_bcd[off] = (uint8_t)(out->gt_bcd[off] | (d << 4));
-        di++;
+        out->gt_digits[di++] = digits[i];
     }
-    if (di & 1) {
-        size_t off = (size_t)(di / 2);
-        if (off < sizeof(out->gt_bcd))
-            out->gt_bcd[off] = (uint8_t)((out->gt_bcd[off] & 0x0f) | 0xf0);
-    }
-    out->gt_bcd_len = (uint8_t)((size_t)(di + 1) / 2);
+    out->gt_digits[di] = '\0';
     out->have_gt = (di > 0);
 }
 
@@ -168,18 +158,10 @@ void ss7_link_make_local_addr(const struct iwf_runtime *rt,
             ((a & 0x7u) << 11) | ((b & 0xffu) << 3) | (c & 0x7u);
 
     if (rt->cfg.map_local_gt[0]) {
-        int n = 0;
-        const char *gt = rt->cfg.map_local_gt;
-        for (size_t i = 0; gt[i] && i < sizeof(out->gt_bcd) * 2; i++) {
-            if (gt[i] < '0' || gt[i] > '9') continue;
-            uint8_t d = (uint8_t)(gt[i] - '0');
-            if ((n & 1) == 0) out->gt_bcd[n / 2] = d;
-            else              out->gt_bcd[n / 2] |= (uint8_t)(d << 4);
-            n++;
-        }
-        if (n & 1) out->gt_bcd[n / 2] |= 0xf0; /* odd-digit fill */
-        out->gt_bcd_len = (uint8_t)((n + 1) / 2);
-        out->have_gt = (n > 0);
+        ss7_sccp_addr_t tmp;
+        ss7_gt_from_digits(rt->cfg.map_local_gt, out->ssn, &tmp);
+        memcpy(out->gt_digits, tmp.gt_digits, sizeof(out->gt_digits));
+        out->have_gt = tmp.have_gt;
     }
 }
 
@@ -240,11 +222,9 @@ static void osmo_addr_to_ss7(const struct osmo_sccp_addr *in, ss7_sccp_addr_t *o
     if (!in || !out) return;
     out->ssn = in->ssn;
     out->point_code = in->pc;
-    if (in->presence & OSMO_SCCP_ADDR_T_GT) {
-        size_t n = sizeof(in->gt.digits);
-        if (n > sizeof(out->gt_bcd)) n = sizeof(out->gt_bcd);
-        memcpy(out->gt_bcd, in->gt.digits, n);
-        out->gt_bcd_len = (uint8_t)n;
+    if (in->presence & OSMO_SCCP_ADDR_T_GT && in->gt.digits[0]) {
+        strncpy(out->gt_digits, in->gt.digits, sizeof(out->gt_digits) - 1);
+        out->gt_digits[sizeof(out->gt_digits) - 1] = '\0';
         out->have_gt = true;
     }
 }
@@ -256,7 +236,8 @@ static void ss7_put_gt_in_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_
     out->gt.tt  = 0;
     out->gt.npi = OSMO_SCCP_NPI_E164_ISDN;
     out->gt.nai = OSMO_SCCP_NAI_INTL;
-    memcpy(out->gt.digits, in->gt_bcd, in->gt_bcd_len);
+    strncpy(out->gt.digits, in->gt_digits, sizeof(out->gt.digits) - 1);
+    out->gt.digits[sizeof(out->gt.digits) - 1] = '\0';
 }
 
 static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *out)

@@ -44,9 +44,8 @@ struct iwf_runtime;
 typedef struct {
     uint8_t  ssn;
     uint32_t point_code;     /* ITU 14-bit or ANSI 24-bit, low bits */
-    /* Optional Global Title (E.164, BCD, with leading nature-of-address). */
-    uint8_t  gt_bcd[16];
-    uint8_t  gt_bcd_len;
+    /* Optional Global Title: ASCII E.164 digits for osmo_sccp_gt.digits[]. */
+    char     gt_digits[32];
     bool     have_gt;
 } ss7_sccp_addr_t;
 
