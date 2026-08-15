@@ -36,9 +36,21 @@ bool gsup_map_proxy_on_tcap(struct iwf_runtime *rt,
 
 void gsup_map_proxy_sweep(struct iwf_runtime *rt, time_t now);
 
-/* HSS-initiated Diameter CLR -> GSUP Location-Cancel toward osmo-sgsn. */
+/* HSS-initiated Diameter CLR -> GSUP Location-Cancel.
+ * cn_domain: GSUP_CN_DOMAIN_CS, GSUP_CN_DOMAIN_PS, or 0 = both.
+ * Returns true if at least one LOC-CANCEL was sent. */
 bool gsup_map_proxy_hss_clr(struct iwf_runtime *rt, const char *imsi,
-                            uint8_t cancel_type);
+                            uint8_t cancel_type, uint8_t cn_domain);
+
+/* HSS-initiated Diameter IDR Subscription-Data -> GSUP ISD toward MSC/SGSN.
+ * cn_domain must be CS or PS. Returns true if ISD_REQ was sent. */
+bool gsup_map_proxy_hss_idr(struct iwf_runtime *rt, const char *imsi,
+                            uint8_t cn_domain, const char *msisdn,
+                            const map_ula_apn_entry_t *apns, size_t n_apns);
+
+/* True if IMSI has a live tracked GSUP connection for cn_domain (or either
+ * if cn_domain == 0). */
+bool gsup_map_proxy_imsi_known(const char *imsi, uint8_t cn_domain);
 
 /* HSS IDR(URRP-MME): report UE reachability via S6a NOR. */
 void gsup_map_proxy_on_urrp(struct iwf_runtime *rt, const char *imsi,

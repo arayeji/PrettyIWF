@@ -26,6 +26,13 @@ static void defaults(iwf_config_t *c)
     c->synthetic_uli_no_rai = 0;
     /* Prefer the HSS-advertised PGW (ULA MIP6-Agent-Info) over static [smf]. */
     c->pgw_from_subscription = 1;
+    c->pgw_select[0] = IWF_PGW_SRC_MIP;
+    c->pgw_select[1] = IWF_PGW_SRC_DNS;
+    c->pgw_select[2] = IWF_PGW_SRC_STATIC;
+    c->pgw_select[3] = IWF_PGW_SRC_SMF;
+    c->pgw_n_select = 4;
+    c->pgw_select_explicit = 0;
+    c->pgw_cache_ttl_s = 300;
     /* Open5GS SMF only accepts EUTRAN (6) and WLAN (3); UTRAN (1) is rejected
      * with "Unknown RAT Type" -> SGW-C surfaces it as GTP cause 70.
      * Default to EUTRAN so the IWF works against vanilla Open5GS out of the box. */
@@ -38,6 +45,10 @@ static void defaults(iwf_config_t *c)
     c->map_iwf_enabled    = 0;
     c->map_local_ssn      = 149;
     c->map_t_dialogue_ms  = 10000;
+    c->map_msrn_ttl_sec   = 30;
+    c->map_msrn_consume_on_lookup = 1;
+    c->map_msrn_n_pools   = 0;
+    c->map_msrn_n_msc_map = 0;
     strncpy(c->stp_ip,   "127.0.0.1", sizeof(c->stp_ip)   - 1);
     c->stp_port           = 2905;
     c->stp_routing_context = 1u;
@@ -268,6 +279,46 @@ static int gsup_roam_route_index(iwf_config_t *out, const char *mnc, int is_loca
     return idx;
 }
 
+/* Parse comma-separated PGW source order: mip,dns,static,smf.
+ * Returns count written to out[] (0 on empty/invalid). Dedupes tokens. */
+static int parse_pgw_select(const char *val, uint8_t out[IWF_PGW_SELECT_MAX])
+{
+    if (!val || !*val)
+        return 0;
+    char buf[128];
+    copy_str(buf, sizeof(buf), val);
+    int n = 0;
+    int seen = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ", \t", &save); tok;
+         tok = strtok_r(NULL, ", \t", &save)) {
+        tok = trim(tok);
+        if (!*tok) continue;
+        uint8_t src = 0;
+        if (!strcasecmp(tok, "mip") || !strcasecmp(tok, "subscription"))
+            src = IWF_PGW_SRC_MIP;
+        else if (!strcasecmp(tok, "dns") || !strcasecmp(tok, "apn") ||
+                 !strcasecmp(tok, "fqdn"))
+            src = IWF_PGW_SRC_DNS;
+        else if (!strcasecmp(tok, "static") || !strcasecmp(tok, "pgw_ip"))
+            src = IWF_PGW_SRC_STATIC;
+        else if (!strcasecmp(tok, "smf") || !strcasecmp(tok, "config"))
+            src = IWF_PGW_SRC_SMF;
+        else {
+            LOGW("config", "unknown pgw_select token '%s' "
+                 "(expected mip,dns,static,smf)", tok);
+            continue;
+        }
+        if (seen & (1 << src))
+            continue;
+        if (n >= IWF_PGW_SELECT_MAX)
+            break;
+        seen |= (1 << src);
+        out[n++] = src;
+    }
+    return n;
+}
+
 /* Parse [roaming_hlr] keys: mnc035_hlr_gt, mnc035_ssn, mnc035_src_ip, ... */
 static void gsup_roam_key(iwf_config_t *out, const char *key, const char *val)
 {
@@ -313,7 +364,11 @@ static void gsup_roam_key(iwf_config_t *out, const char *key, const char *val)
     else if (!strcmp(p, "pgw_fqdn"))
         copy_str(out->gsup_roam_routes[idx].pgw_fqdn,
                  sizeof(out->gsup_roam_routes[idx].pgw_fqdn), val);
-    else
+    else if (!strcmp(p, "pgw_select")) {
+        int n = parse_pgw_select(val, out->gsup_roam_routes[idx].pgw_select);
+        if (n > 0)
+            out->gsup_roam_routes[idx].pgw_n_select = n;
+    } else
         LOGW("config", "unknown key [roaming_hlr].%s", key);
 }
 
@@ -372,7 +427,16 @@ int iwf_config_load(const char *path, iwf_config_t *out)
                 out->rat_type = parse_rat_type(val);
             else if (!strcmp(key, "pgw_from_subscription"))
                 out->pgw_from_subscription = (atoi(val) != 0);
-            else LOGW("config", "unknown key [iwf].%s", key);
+            else if (!strcmp(key, "pgw_select")) {
+                int n = parse_pgw_select(val, out->pgw_select);
+                if (n > 0) {
+                    out->pgw_n_select = n;
+                    out->pgw_select_explicit = 1;
+                }
+            } else if (!strcmp(key, "pgw_cache_ttl_s")) {
+                int ttl = atoi(val);
+                out->pgw_cache_ttl_s = (ttl > 0) ? ttl : 300;
+            } else LOGW("config", "unknown key [iwf].%s", key);
         } else if (!strcmp(section, "sgsn")) {
             if      (!strcmp(key, "ip"))   copy_str(out->sgsn_ip, sizeof(out->sgsn_ip), val);
             else if (!strcmp(key, "port")) out->sgsn_port = (uint16_t)atoi(val);
@@ -401,7 +465,60 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "t_dialogue_ms"))  out->map_t_dialogue_ms = atoi(val);
             else if (!strcmp(key, "cmd_sock"))
                 copy_str(out->map_cmd_sock_path, sizeof(out->map_cmd_sock_path), val);
-            else LOGW("config", "unknown key [map_iwf].%s", key);
+            else if (!strcmp(key, "msrn_ttl_sec")) {
+                int ttl = atoi(val);
+                out->map_msrn_ttl_sec = ttl > 0 ? ttl : 30;
+            } else if (!strcmp(key, "msrn_consume_on_lookup")) {
+                out->map_msrn_consume_on_lookup = (atoi(val) != 0);
+            } else if (!strcmp(key, "msrn_pool")) {
+                /* msrn_pool = start-end:name  e.g. 989950090000-989950099999:thr1 */
+                if (out->map_msrn_n_pools >= IWF_MSRN_MAX_POOLS) {
+                    LOGW("config", "too many msrn_pool lines (max %d)", IWF_MSRN_MAX_POOLS);
+                } else {
+                    char buf[96];
+                    copy_str(buf, sizeof(buf), val);
+                    char *dash = strchr(buf, '-');
+                    char *colon = dash ? strrchr(dash + 1, ':') : NULL;
+                    if (!dash || !colon || colon <= dash + 1) {
+                        LOGW("config", "bad msrn_pool '%s' (want start-end:name)", val);
+                    } else {
+                        *dash = '\0';
+                        *colon = '\0';
+                        const char *start = buf;
+                        const char *end = dash + 1;
+                        const char *name = colon + 1;
+                        int i = out->map_msrn_n_pools++;
+                        copy_str(out->map_msrn_pools[i].start,
+                                 sizeof(out->map_msrn_pools[i].start), start);
+                        copy_str(out->map_msrn_pools[i].end,
+                                 sizeof(out->map_msrn_pools[i].end), end);
+                        copy_str(out->map_msrn_pools[i].name,
+                                 sizeof(out->map_msrn_pools[i].name),
+                                 name[0] ? name : "default");
+                    }
+                }
+            } else if (!strcmp(key, "msrn_msc_map")) {
+                /* msrn_msc_map = msc_gt:pool_name */
+                if (out->map_msrn_n_msc_map >= IWF_MSRN_MAX_MSC_MAPS) {
+                    LOGW("config", "too many msrn_msc_map lines (max %d)",
+                         IWF_MSRN_MAX_MSC_MAPS);
+                } else {
+                    char buf[64];
+                    copy_str(buf, sizeof(buf), val);
+                    char *colon = strchr(buf, ':');
+                    if (!colon || colon == buf || !colon[1]) {
+                        LOGW("config", "bad msrn_msc_map '%s' (want msc:pool)", val);
+                    } else {
+                        *colon = '\0';
+                        int i = out->map_msrn_n_msc_map++;
+                        copy_str(out->map_msrn_msc_map[i].msc_gt,
+                                 sizeof(out->map_msrn_msc_map[i].msc_gt), buf);
+                        copy_str(out->map_msrn_msc_map[i].pool_name,
+                                 sizeof(out->map_msrn_msc_map[i].pool_name),
+                                 colon + 1);
+                    }
+                }
+            } else LOGW("config", "unknown key [map_iwf].%s", key);
         } else if (!strcmp(section, "stp")) {
             if      (!strcmp(key, "local_ip"))   copy_str(out->stp_local_ip, sizeof(out->stp_local_ip), val);
             else if (!strcmp(key, "local_port")) out->stp_local_port = (uint16_t)atoi(val);
@@ -494,14 +611,55 @@ int iwf_config_load(const char *path, iwf_config_t *out)
     if (out->local_ip[0] == '\0' && strcmp(out->listen_ip, "0.0.0.0") != 0) {
         copy_str(out->local_ip, sizeof(out->local_ip), out->listen_ip);
     }
+
+    /* Legacy pgw_from_subscription=0 without explicit pgw_select: skip ULA MIP. */
+    if (!out->pgw_select_explicit && !out->pgw_from_subscription) {
+        out->pgw_select[0] = IWF_PGW_SRC_STATIC;
+        out->pgw_select[1] = IWF_PGW_SRC_DNS;
+        out->pgw_select[2] = IWF_PGW_SRC_SMF;
+        out->pgw_n_select = 3;
+    }
+    if (out->pgw_n_select <= 0) {
+        out->pgw_select[0] = IWF_PGW_SRC_MIP;
+        out->pgw_select[1] = IWF_PGW_SRC_DNS;
+        out->pgw_select[2] = IWF_PGW_SRC_STATIC;
+        out->pgw_select[3] = IWF_PGW_SRC_SMF;
+        out->pgw_n_select = 4;
+    }
+    if (out->pgw_cache_ttl_s <= 0)
+        out->pgw_cache_ttl_s = 300;
+
     return 0;
+}
+
+static const char *pgw_src_name(uint8_t src)
+{
+    switch (src) {
+    case IWF_PGW_SRC_MIP:    return "mip";
+    case IWF_PGW_SRC_DNS:    return "dns";
+    case IWF_PGW_SRC_STATIC: return "static";
+    case IWF_PGW_SRC_SMF:    return "smf";
+    default:                 return "?";
+    }
 }
 
 void iwf_config_dump(const iwf_config_t *c)
 {
+    char sel[64];
+    size_t off = 0;
+    sel[0] = '\0';
+    for (int i = 0; i < c->pgw_n_select && i < IWF_PGW_SELECT_MAX; i++) {
+        int n = snprintf(sel + off, sizeof(sel) - off, "%s%s",
+                         i ? "," : "", pgw_src_name(c->pgw_select[i]));
+        if (n < 0 || (size_t)n >= sizeof(sel) - off)
+            break;
+        off += (size_t)n;
+    }
+
     LOGI("config",
          "file=%s listen=%s:%u local_ip=%s rat_type=%u synthetic_uli_no_rai=%d "
-         "sgsn=%s:%u mme=%s:%u sgwc=%s:%u smf=%s teid=%u pgw_from_subscription=%d log=%s/%s",
+         "sgsn=%s:%u mme=%s:%u sgwc=%s:%u smf=%s teid=%u "
+         "pgw_select=%s pgw_cache_ttl_s=%d log=%s/%s",
          c->cfg_path[0] ? c->cfg_path : "-",
          c->listen_ip, c->listen_port,
          c->local_ip[0] ? c->local_ip : "(unset)",
@@ -510,7 +668,8 @@ void iwf_config_dump(const iwf_config_t *c)
          c->mme_ip, (unsigned)c->mme_port,
          c->sgwc_ip, c->sgwc_port,
          c->smf_ip[0] ? c->smf_ip : "(unset)", (unsigned)c->smf_teid,
-         c->pgw_from_subscription,
+         sel[0] ? sel : "-",
+         c->pgw_cache_ttl_s,
          c->log_level, c->log_file);
 
     if (c->map_iwf_enabled) {
@@ -519,6 +678,12 @@ void iwf_config_dump(const iwf_config_t *c)
              c->map_local_pc[0] ? c->map_local_pc : "(unset)",
              (unsigned)c->map_local_ssn, c->map_t_dialogue_ms,
              c->map_cmd_sock_path[0] ? c->map_cmd_sock_path : "(default)");
+        if (c->map_msrn_n_pools > 0) {
+            LOGI("config",
+                 "map_iwf: msrn pools=%d msc_maps=%d ttl=%ds consume_on_lookup=%d",
+                 c->map_msrn_n_pools, c->map_msrn_n_msc_map,
+                 c->map_msrn_ttl_sec, c->map_msrn_consume_on_lookup);
+        }
         {
             char lports[24];
             if (c->stp_local_port)
@@ -614,4 +779,50 @@ int iwf_config_roam_pgw(const iwf_config_t *cfg, const char *imsi,
     if (out_ip)   *out_ip   = ip;
     if (out_fqdn) *out_fqdn = fqdn;
     return 1;
+}
+
+/* Resolve [roaming_hlr] route index for an IMSI PLMN (2- then 3-digit MNC). */
+static int roam_route_idx_for_imsi(const iwf_config_t *cfg, const char *imsi)
+{
+    if (!cfg || !imsi || strlen(imsi) < 5)
+        return -1;
+    char key[4];
+    snprintf(key, sizeof(key), "%03u",
+             (unsigned)((imsi[3] - '0') * 10 + (imsi[4] - '0')));
+    int idx = roam_route_by_mnc_key(cfg, key);
+    if (idx < 0 && strlen(imsi) >= 6 &&
+        imsi[5] >= '0' && imsi[5] <= '9') {
+        snprintf(key, sizeof(key), "%03u",
+                 (unsigned)((imsi[3] - '0') * 100 + (imsi[4] - '0') * 10 +
+                            (imsi[5] - '0')));
+        idx = roam_route_by_mnc_key(cfg, key);
+    }
+    return idx;
+}
+
+int iwf_config_pgw_select(const iwf_config_t *cfg, const char *imsi,
+                          uint8_t out[IWF_PGW_SELECT_MAX])
+{
+    if (!cfg || !out)
+        return 0;
+    int idx = roam_route_idx_for_imsi(cfg, imsi);
+    if (idx >= 0 && cfg->gsup_roam_routes[idx].pgw_n_select > 0) {
+        int n = cfg->gsup_roam_routes[idx].pgw_n_select;
+        if (n > IWF_PGW_SELECT_MAX)
+            n = IWF_PGW_SELECT_MAX;
+        memcpy(out, cfg->gsup_roam_routes[idx].pgw_select, (size_t)n);
+        return n;
+    }
+    int n = cfg->pgw_n_select;
+    if (n <= 0) {
+        out[0] = IWF_PGW_SRC_MIP;
+        out[1] = IWF_PGW_SRC_DNS;
+        out[2] = IWF_PGW_SRC_STATIC;
+        out[3] = IWF_PGW_SRC_SMF;
+        return 4;
+    }
+    if (n > IWF_PGW_SELECT_MAX)
+        n = IWF_PGW_SELECT_MAX;
+    memcpy(out, cfg->pgw_select, (size_t)n);
+    return n;
 }

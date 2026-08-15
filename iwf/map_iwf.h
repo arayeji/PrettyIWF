@@ -32,6 +32,8 @@
 #include <stdbool.h>
 #include <time.h>
 
+#include "ss7_link.h"
+
 struct iwf_runtime;
 struct map_session;
 
@@ -81,6 +83,11 @@ void map_iwf_on_diameter_readable(struct iwf_runtime *rt);
 void map_iwf_on_diameter_peer_readable(struct iwf_runtime *rt, int peer_idx);
 void map_iwf_on_ttimer_tick(struct iwf_runtime *rt);
 void map_iwf_on_dwa_timer_tick(struct iwf_runtime *rt);
+
+/* Deliver SCCP UNITDATA/TCAP into MAP-IWF (HLR SSN demux from SMS-IWF). */
+void map_iwf_on_sccp_unitdata(struct iwf_runtime *rt,
+                              const ss7_sccp_addr_t *calling,
+                              const uint8_t *tcap, size_t tcap_len);
 
 /* Graceful teardown: DPR toward PyHSS, ASP-DOWN to osmo-stp, drop dialogues. */
 void map_iwf_shutdown(struct iwf_runtime *rt);

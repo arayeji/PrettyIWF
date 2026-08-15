@@ -22,6 +22,7 @@
 #define IWF_MAP_SESSION_H
 
 #include "iwf.h"
+#include "ss7_link.h"
 #include "uthash.h"
 
 #include <netinet/in.h>
@@ -36,6 +37,7 @@ typedef enum {
     MAP_OP_CL               = 4,   /* cancelLocation          - op 3                 */
     MAP_OP_PURGE_MS         = 5,   /* purgeMS                 - op 67                */
     MAP_OP_UL               = 6,   /* updateLocation (MAP-C)  - op 2                 */
+    MAP_OP_PRN              = 7,   /* provideRoamingNumber    - op 4                 */
 } map_op_t;
 
 typedef enum {
@@ -96,6 +98,7 @@ typedef struct map_session {
     uint32_t            tcap_dialogue_id;       /* our originating TID         */
     uint32_t            peer_tcap_dialogue_id;  /* SGSN-allocated peer TID     */
     bool                have_peer_tid;
+    uint8_t             peer_invoke_id;         /* Invoke ID to echo in Result */
 
     uint8_t             imsi_bcd[MAP_IMSI_BCD_MAX];
     uint8_t             imsi_bcd_len;
@@ -116,6 +119,15 @@ typedef struct map_session {
     /* Originating SGSN identity (only IP/SCCP today; SS7 PC tracked in ss7_link). */
     struct in_addr      sgsn_ip;
     uint32_t            sccp_conn_id;
+
+    /* SCCP Calling Party of the inbound BEGIN — used as CdPA on MAP answers. */
+    ss7_sccp_addr_t     peer_sccp;
+    bool                have_peer_sccp;
+
+    /* AARE already sent (e.g. on UL CONTINUE with ISD); omit on later END. */
+    bool                aare_sent;
+    /* ISD invoke id used on UL CONTINUE (echoed by VLR ReturnResult). */
+    uint8_t             isd_invoke_id;
 
     /* PLMN of the SGSN, used to populate Visited-PLMN-Id AVP. BCD encoded
      * (TS 24.008 §10.5.1.3) - 3 octets [MCC2|MCC1, MNC3|MCC3, MNC2|MNC1]. */

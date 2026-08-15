@@ -74,7 +74,8 @@ map_session_t *map_sess_create(uint32_t tid)
 void map_sess_remove(map_session_t *s)
 {
     if (!s) return;
-    LOGD("map_sess", "remove imsi=%s tid=0x%08x state=%s op=%s",
+    LOGD("map_sess",
+         "[%s] remove tid=0x%08x state=%s op=%s",
          s->imsi_str[0] ? s->imsi_str : "?",
          s->tcap_dialogue_id,
          map_sess_state_str(s->state),
@@ -159,6 +160,7 @@ const char *map_op_str(map_op_t op)
     case MAP_OP_CL:       return "CL";
     case MAP_OP_PURGE_MS: return "PurgeMS";
     case MAP_OP_UL:       return "UL";
+    case MAP_OP_PRN:      return "PRN";
     }
     return "?";
 }
@@ -170,12 +172,13 @@ int map_sess_sweep(time_t now, map_sess_timeout_hook_t hook, void *hook_ctx)
     HASH_ITER(hh_tid, g_by_tid, s, tmp) {
         time_t age_ms = (now - s->last_activity) * 1000;
         if (s->t_dialogue_ms > 0 && age_ms > s->t_dialogue_ms) {
-            LOGW("map_sess", "timeout imsi=%s tid=0x%08x state=%s op=%s idle=%lds",
-                 s->imsi_str[0] ? s->imsi_str : "?",
-                 s->tcap_dialogue_id,
-                 map_sess_state_str(s->state),
-                 map_op_str(s->map_op),
-                 (long)(now - s->last_activity));
+            LOGW("map_sess",
+         "[%s] timeout tid=0x%08x state=%s op=%s idle=%lds",
+         s->imsi_str[0] ? s->imsi_str : "?",
+         s->tcap_dialogue_id,
+         map_sess_state_str(s->state),
+         map_op_str(s->map_op),
+         (long)(now - s->last_activity));
             s->state = MAP_SESS_ABORTED;
             if (hook)
                 hook(s, hook_ctx);

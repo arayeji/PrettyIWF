@@ -95,6 +95,15 @@ int ber_enc_integer_u32(uint8_t *buf, size_t cap, size_t *off,
     return ber_enc_tlv(buf, cap, off, tag, bytes + start, (size_t)n);
 }
 
+/* Q.773 InvokeId ::= INTEGER (-128..127). Encode the raw octet so that
+ * echoing a peer's high-bit ID (e.g. 0x9c = -100) stays 02 01 9c, not
+ * 02 02 00 9c (= +156), which fails TCAP correlation. */
+static int ber_enc_invoke_id(uint8_t *buf, size_t cap, size_t *off,
+                             uint8_t invoke_id)
+{
+    return ber_enc_tlv(buf, cap, off, TCAP_TAG_INVOKE_ID, &invoke_id, 1);
+}
+
 int ber_dec_length(const uint8_t *buf, size_t len, size_t *off, size_t *out_len)
 {
     if (*off >= len) return -1;
@@ -361,8 +370,7 @@ static int enc_component(uint8_t comp_tag,
     /* Build inner body into a scratch area first so we know its length. */
     uint8_t inner[1024];
     size_t io = 0;
-    if (ber_enc_integer_u32(inner, sizeof(inner), &io,
-                            TCAP_TAG_INVOKE_ID, invoke_id) < 0) return -1;
+    if (ber_enc_invoke_id(inner, sizeof(inner), &io, invoke_id) < 0) return -1;
     if (op_tag) {
         if (ber_enc_integer_u32(inner, sizeof(inner), &io,
                                 op_tag, (uint32_t)op_value) < 0) return -1;
@@ -393,8 +401,7 @@ int tcap_enc_return_result(uint8_t *buf, size_t cap, size_t *off,
      *    result SEQUENCE { opCode ..., parameter ANY } OPTIONAL }       */
     uint8_t inner[1024];
     size_t io = 0;
-    if (ber_enc_integer_u32(inner, sizeof(inner), &io,
-                            TCAP_TAG_INVOKE_ID, invoke_id) < 0) return -1;
+    if (ber_enc_invoke_id(inner, sizeof(inner), &io, invoke_id) < 0) return -1;
 
     /* Inner SEQUENCE for "result" present iff parameters is non-empty. */
     if (parameters || local_opcode >= 0) {

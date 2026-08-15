@@ -424,9 +424,12 @@ without emitting MAP/TCAP toward the SGSN.
 | **Default path** | `/tmp/iwf_cmd.sock` |
 | **Config** | `[map_iwf] cmd_sock = /path/to/sock` (optional; parent directory is created when possible) |
 | **Startup log** | `test_cmd listening on <path> (fd=…)` |
-| **Protocol** | One line per accepted connection, newline-terminated: `sai <IMSI>` (digits only, 10–15 length). |
-| **Success reply** | `OK vectors=<n> rand=<hex> autn=<hex>` (first quintuplet; up to `n` vectors from HSS). |
-| **Error reply** | `ERR <reason>` — e.g. `timeout`, `diameter_<Result-Code>`, `air_send_failed`, or validation text. |
+| **Protocol** | One line per accepted connection, newline-terminated. Commands: |
+| | `sai <IMSI>` — Diameter AIR (digits only, 10–15 length). |
+| | `msrn_lookup <MSRN>` — resolve MSRN↔IMSI binding for SIP ingress (outside-repo glue). |
+| | `msrn_show` — dump active MSRN bindings. |
+| **Success reply** | `sai`: `OK vectors=<n> rand=<hex> autn=<hex>`. `msrn_lookup`: `OK imsi=… msisdn=… pool=… msc=… tid=…`. `msrn_show`: `OK` then a multi-line dump. |
+| **Error reply** | `ERR <reason>` — e.g. `timeout`, `diameter_<Result-Code>`, `not_found`, `expired`, or validation text. |
 | **SIGUSR1** | Sends the same test for IMSI `432120000000001` with **no** UNIX reply (log only). Timeout is controlled like other dialogues (`t_dialogue_ms`, default 10s). |
 
 **systemd:** If the unit uses `PrivateTmp=yes`, the daemon’s `/tmp` is not the
@@ -436,10 +439,18 @@ in the unit) or adjust `PrivateTmp` for debugging.
 
 ```bash
 printf 'sai 432120000000001\n' | socat - UNIX-CONNECT:/tmp/iwf_cmd.sock
+printf 'msrn_lookup 989950090123\n' | socat - UNIX-CONNECT:/tmp/iwf_cmd.sock
+printf 'msrn_show\n' | socat - UNIX-CONNECT:/tmp/iwf_cmd.sock
 ```
 
-Sources: `test_cmd.c`, `test_cmd.h`; MAP hook `map_iwf_cmd_test_sai()` in
-`map_iwf.c`.
+**SIP glue (outside repo):** After MAP ProvideRoamingNumber allocates an MSRN,
+SIP ingress asks IWF via `msrn_lookup` to obtain the IMSI (and optional MSISDN).
+With `[map_iwf] msrn_consume_on_lookup = 1` (default) the binding is freed on
+successful lookup. Configure pools with `msrn_pool=start-end:name` and optional
+`msrn_msc_map=msc:pool`. SRI remains out of scope.
+
+Sources: `test_cmd.c`, `test_cmd.h`, `msrn_pool.c`; MAP hook
+`map_iwf_cmd_test_sai()` / `handle_begin_prn` in `map_iwf.c`.
 
 ### Per-dialogue state
 
