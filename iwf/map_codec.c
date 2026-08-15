@@ -398,7 +398,8 @@ int map_decode_sai_res(const uint8_t *p, size_t n,
     *n_vec = 0;
     const uint8_t *body = p;
     size_t blen = n;
-    if (n >= 2 && p[0] == 0x30) {
+    /* MAP v3: [3] IMPLICIT SEQUENCE (0xA3). Older/broken peers may use 0x30. */
+    if (n >= 2 && (p[0] == 0xA3 || p[0] == 0x30)) {
         if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
     }
     const uint8_t *list = NULL;
@@ -506,16 +507,122 @@ static void dec_isdn_addr_digits(const uint8_t *v, size_t l,
     }
 }
 
+int map_decode_ul_arg(const uint8_t *p, size_t n, map_ul_req_t *out)
+{
+    /* UpdateLocationArg ::= SEQUENCE {
+     *   imsi           IMSI,                      -- untagged OCTET STRING
+     *   msc-Number [1] ISDN-AddressString,
+     *   vlr-Number     ISDN-AddressString,
+     *   ... } */
+    if (!p || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && (p[0] == 0x30 || (p[0] & 0x20))) {
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    }
+
+    size_t off = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *v;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &v, &l) < 0) return -1;
+
+        if ((tag == 0x04 || tag == 0x80) && !out->imsi_bcd_len &&
+            l >= 3 && l <= 8 && !(l >= 1 && (v[0] & 0xf0) == 0x90)) {
+            /* Spec: untagged IMSI (0x04). Accept legacy [0]/0x80 too. */
+            if (l > sizeof(out->imsi_bcd)) l = sizeof(out->imsi_bcd);
+            memcpy(out->imsi_bcd, v, l);
+            out->imsi_bcd_len = (uint8_t)l;
+            map_bcd_to_str(v, l, out->imsi_str, sizeof(out->imsi_str));
+        } else if (tag == 0x81) {
+            dec_isdn_addr_digits(v, l, out->msc_number, sizeof(out->msc_number));
+        } else if (tag == 0x04 && out->imsi_bcd_len && !out->vlr_number[0]) {
+            dec_isdn_addr_digits(v, l, out->vlr_number, sizeof(out->vlr_number));
+        }
+    }
+    return out->imsi_bcd_len ? 0 : -1;
+}
+
+int map_decode_prn_arg(const uint8_t *p, size_t n, map_prn_req_t *out)
+{
+    /* ProvideRoamingNumberArg ::= SEQUENCE {
+     *   imsi                      [0] IMSI OPTIONAL,
+     *   msc-Number                    ISDN-AddressString,
+     *   msisdn                    [1] ISDN-AddressString OPTIONAL,
+     *   lmsi                      [2] LMSI OPTIONAL,
+     *   gsm-BearerCapability      [3] ExternalSignalInfo OPTIONAL,
+     *   networkSignalInfo         [4] ExternalSignalInfo OPTIONAL,
+     *   suppressionOfAnnouncement [5] NULL OPTIONAL,
+     *   ... } */
+    if (!p || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && (p[0] == 0x30 || (p[0] & 0x20))) {
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    }
+
+    size_t off = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *v;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &v, &l) < 0) return -1;
+
+        if (tag == 0x80 && !out->imsi_bcd_len && l >= 3 && l <= 8) {
+            if (l > sizeof(out->imsi_bcd)) l = sizeof(out->imsi_bcd);
+            memcpy(out->imsi_bcd, v, l);
+            out->imsi_bcd_len = (uint8_t)l;
+            map_bcd_to_str(v, l, out->imsi_str, sizeof(out->imsi_str));
+        } else if (tag == 0x04 && !out->msc_number[0]) {
+            /* Untagged msc-Number (ISDN-AddressString). */
+            dec_isdn_addr_digits(v, l, out->msc_number, sizeof(out->msc_number));
+        } else if (tag == 0x81) {
+            dec_isdn_addr_digits(v, l, out->msisdn, sizeof(out->msisdn));
+        } else if (tag == 0x85) {
+            out->suppression_of_announcement = true;
+        } else if (tag == 0xA3 || tag == 0x83) {
+            out->have_gsm_bearer_cap = true;
+        }
+        /* Ignore LMSI / networkSignalInfo / extensionContainer / etc. */
+    }
+    /* msc-Number is mandatory for a usable PRN; IMSI is optional in ASN.1
+     * but required for our MSRN binding — callers check imsi_str. */
+    return out->msc_number[0] ? 0 : -1;
+}
+
+int map_encode_prn_res(const char *msrn_digits, uint8_t *out, size_t out_cap)
+{
+    /* ProvideRoamingNumberRes ::= SEQUENCE {
+     *   roamingNumber ISDN-AddressString,
+     *   ... } */
+    if (!msrn_digits || !msrn_digits[0] || !out) return -1;
+    uint8_t addr[16];
+    int al = enc_isdn_addr(msrn_digits, addr, sizeof(addr));
+    if (al < 0) return -1;
+
+    uint8_t inner[32];
+    size_t io = 0;
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x04, addr, (size_t)al) < 0)
+        return -1;
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x30, inner, io) < 0) return -1;
+    return (int)off;
+}
+
 int map_encode_ul_arg(const char *imsi_str,
                       const char *msc_gt_digits,
                       const char *vlr_gt_digits,
                       uint8_t *out, size_t out_cap)
 {
     /* UpdateLocationArg ::= SEQUENCE {
-     *   imsi       [0] IMSI,
+     *   imsi           IMSI,                      -- untagged OCTET STRING
      *   msc-Number [1] ISDN-AddressString,
      *   vlr-Number     ISDN-AddressString,
-     *   ... } */
+     *   ... }
+     * Do NOT encode IMSI as [0]/0x80 — that is InsertSubscriberDataArg only. */
     if (!imsi_str || !out) return -1;
     uint8_t imsi_bcd[8];
     int bl = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
@@ -534,7 +641,7 @@ int map_encode_ul_arg(const char *imsi_str,
 
     uint8_t inner[128];
     size_t io = 0;
-    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x80 /* [0] imsi */,
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x04 /* IMSI */,
                     imsi_bcd, (size_t)bl) < 0)
         return -1;
     if (ber_enc_tlv(inner, sizeof(inner), &io, 0x81 /* [1] msc-Number */,
@@ -645,12 +752,13 @@ static int enc_triplet(const map_auth_vector_t *v,
 int map_encode_sai_res(const map_auth_vector_t *vec, size_t n_vec,
                        uint8_t *out, size_t out_cap)
 {
-    /* SendAuthenticationInfoRes-v3 ::= SEQUENCE {
+    /* SendAuthenticationInfoRes ::= [3] SEQUENCE {   (MAP v3 / TS 29.002)
      *   authenticationSetList AuthenticationSetList OPTIONAL,
      *   ... }
      * AuthenticationSetList ::= CHOICE {
      *   tripletList   [0] IMPLICIT TripletList,
-     *   quintupletList[1] IMPLICIT QuintupletList }                       */
+     *   quintupletList[1] IMPLICIT QuintupletList }
+     * Outer tag must be CONTEXT [3] (0xA3), not UNIVERSAL SEQUENCE (0x30). */
     uint8_t outer[2048];
     size_t oo = 0;
     uint8_t list[2048];
@@ -677,7 +785,7 @@ int map_encode_sai_res(const map_auth_vector_t *vec, size_t n_vec,
     }
 
     size_t off = 0;
-    if (ber_enc_tlv(out, out_cap, &off, 0x30 /* SEQUENCE */, outer, oo) < 0)
+    if (ber_enc_tlv(out, out_cap, &off, 0xA3 /* [3] IMPLICIT SEQUENCE */, outer, oo) < 0)
         return -1;
     return (int)off;
 }
@@ -710,23 +818,29 @@ int map_encode_isd_arg(const char *imsi_str,
                        uint8_t *out, size_t out_cap)
 {
     /* InsertSubscriberDataArg ::= SEQUENCE {
-     *   imsi                       IMSI                     OPTIONAL,
-     *   msisdn                     ISDN-AddressString       OPTIONAL,
-     *   ...
-     *   gprsSubscriptionData       [16] GPRSSubscriptionData OPTIONAL,
+     *   imsi                 [0] IMSI OPTIONAL,
+     *   COMPONENTS OF SubscriberData,   -- msisdn[1], category[2], ...
+     *   extensionContainer   [14] ...
+     *   gprsSubscriptionData [16] GPRSSubscriptionData OPTIONAL,
      *   ... }
-     *
-     * GPRSSubscriptionData carries a gprsDataList of PDP-Context entries
-     * (one per subscribed APN).  This is what osmo-sgsn expects on Gr for
-     * Activate-PDP APN authorization (TS 29.002 §17.7.1).                */
+     * SubscriberData ::= SEQUENCE {
+     *   msisdn           [1] ISDN-AddressString OPTIONAL,
+     *   category         [2] Category OPTIONAL,
+     *   subscriberStatus [3] SubscriberStatus OPTIONAL,
+     *   bearerServiceList[4] ...
+     *   teleserviceList  [6] TeleserviceList OPTIONAL,
+     *   ... }
+     * MAP uses IMPLICIT TAGS — universal 0x04 for IMSI/MSISDN is wrong. */
     uint8_t inner[4096];
     size_t io = 0;
+    const bool cs_only = !(apns && n_apns > 0);
 
     if (imsi_str && *imsi_str) {
         uint8_t bcd[8];
         int n = map_str_to_bcd(imsi_str, bcd, sizeof(bcd));
         if (n > 0)
-            if (ber_enc_tlv(inner, sizeof(inner), &io, 0x04, bcd, (size_t)n) < 0)
+            if (ber_enc_tlv(inner, sizeof(inner), &io, 0x80 /* [0] IMSI */,
+                            bcd, (size_t)n) < 0)
                 return -1;
     }
     if (msisdn_str && *msisdn_str) {
@@ -734,8 +848,31 @@ int map_encode_isd_arg(const char *imsi_str,
         buf[0] = 0x91;
         int n = map_str_to_bcd(msisdn_str, buf + 1, sizeof(buf) - 1);
         if (n > 0)
-            if (ber_enc_tlv(inner, sizeof(inner), &io, 0x04, buf, (size_t)(n + 1)) < 0)
+            if (ber_enc_tlv(inner, sizeof(inner), &io, 0x81 /* [1] MSISDN */,
+                            buf, (size_t)(n + 1)) < 0)
                 return -1;
+    }
+
+    /* CS networkLocUp: VLR needs status + basic teleservices, not only MSISDN. */
+    if (cs_only && msisdn_str && *msisdn_str) {
+        static const uint8_t category_ordinary = 0x0A; /* Q.763 ordinary */
+        if (ber_enc_tlv(inner, sizeof(inner), &io, 0x82 /* [2] category */,
+                        &category_ordinary, 1) < 0)
+            return -1;
+        /* subscriberStatus [3] ENUMERATED { serviceGranted(0), ... } */
+        static const uint8_t status_granted = 0x00;
+        if (ber_enc_tlv(inner, sizeof(inner), &io, 0x83 /* [3] */,
+                        &status_granted, 1) < 0)
+            return -1;
+        /* teleserviceList [6]: speech + SMS MT/MO */
+        static const uint8_t ts_list[] = {
+            0x04, 0x01, 0x11, /* allSpeechTransmissionServices */
+            0x04, 0x01, 0x21, /* shortMessageMT-PP */
+            0x04, 0x01, 0x22, /* shortMessageMO-PP */
+        };
+        if (ber_enc_tlv(inner, sizeof(inner), &io, 0xA6 /* [6] */,
+                        ts_list, sizeof(ts_list)) < 0)
+            return -1;
     }
 
     if (apns && n_apns > 0) {
@@ -889,6 +1026,7 @@ int map_encode_systemfailure_diag(uint8_t network_resource,
  *
  * Concrete OIDs we emit (version 3):
  *   networkLocUpContext-v3               0.4.0.0.1.0. 1.3 -> 04 00 00 01 00 01 03
+ *   roamingNumberEnquiryContext-v3       0.4.0.0.1.0. 3.3 -> 04 00 00 01 00 03 03
  *   infoRetrievalContext-v3              0.4.0.0.1.0.14.3 -> 04 00 00 01 00 0e 03
  *   gprsLocationUpdateContext-v3         0.4.0.0.1.0.32.3 -> 04 00 00 01 00 20 03
  *   subscriberDataMngtContext-v3         0.4.0.0.1.0.16.3 -> 04 00 00 01 00 10 03
@@ -896,6 +1034,7 @@ int map_encode_systemfailure_diag(uint8_t network_resource,
  *   msPurgingContext-v3                  0.4.0.0.1.0.27.3 -> 04 00 00 01 00 1b 03
  */
 static const uint8_t AC_NETWORK_LOC_UP_V3[]      = { 0x04,0x00,0x00,0x01,0x00,0x01,0x03 };
+static const uint8_t AC_ROAMING_NUMBER_ENQ_V3[]  = { 0x04,0x00,0x00,0x01,0x00,0x03,0x03 };
 static const uint8_t AC_INFO_RETRIEVAL_V3[]      = { 0x04,0x00,0x00,0x01,0x00,0x0e,0x03 };
 static const uint8_t AC_GPRS_LOC_UPDATE_V3[]     = { 0x04,0x00,0x00,0x01,0x00,0x20,0x03 };
 static const uint8_t AC_SUBSCRIBER_DATA_MGMT_V3[]= { 0x04,0x00,0x00,0x01,0x00,0x10,0x03 };
@@ -907,6 +1046,8 @@ static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
     switch (ac) {
     case MAP_AC_NETWORK_LOC_UP_V3:
         *out = AC_NETWORK_LOC_UP_V3;       *out_len = sizeof(AC_NETWORK_LOC_UP_V3);       break;
+    case MAP_AC_ROAMING_NUMBER_ENQUIRY_V3:
+        *out = AC_ROAMING_NUMBER_ENQ_V3;   *out_len = sizeof(AC_ROAMING_NUMBER_ENQ_V3);   break;
     case MAP_AC_INFO_RETRIEVAL_V3:
         *out = AC_INFO_RETRIEVAL_V3;       *out_len = sizeof(AC_INFO_RETRIEVAL_V3);       break;
     case MAP_AC_GPRS_LOCATION_UPDATE_V3:
@@ -1142,6 +1283,10 @@ int map_decode_aarq_ac(const uint8_t *p, size_t n, map_app_ctx_t *out)
             if (oid_len == sizeof(AC_NETWORK_LOC_UP_V3) &&
                 !memcmp(oid, AC_NETWORK_LOC_UP_V3, oid_len)) {
                 *out = MAP_AC_NETWORK_LOC_UP_V3; return 0;
+            }
+            if (oid_len == sizeof(AC_ROAMING_NUMBER_ENQ_V3) &&
+                !memcmp(oid, AC_ROAMING_NUMBER_ENQ_V3, oid_len)) {
+                *out = MAP_AC_ROAMING_NUMBER_ENQUIRY_V3; return 0;
             }
             if (oid_len == sizeof(AC_INFO_RETRIEVAL_V3) &&
                 !memcmp(oid, AC_INFO_RETRIEVAL_V3, oid_len)) {

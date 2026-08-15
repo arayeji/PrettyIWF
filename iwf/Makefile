@@ -42,11 +42,11 @@ LDLIBS  ?=
 SRCS    := main.c gtpv1.c gtpv2.c session.c translate.c config.c logging.c \
            subscr_cache.c \
            map_iwf.c map_session.c tcap.c map_codec.c diameter.c ss7_link.c \
-           test_cmd.c
+           test_cmd.c msrn_pool.c
 HDRS    := iwf.h gtpv1.h gtpv2.h session.h translate.h config.h logging.h \
            runtime.h uthash.h subscr_cache.h \
            map_iwf.h map_iwf_priv.h map_session.h tcap.h map_codec.h \
-           diameter.h ss7_link.h test_cmd.h
+           diameter.h ss7_link.h test_cmd.h msrn_pool.h
 
 BIN     := iwf
 

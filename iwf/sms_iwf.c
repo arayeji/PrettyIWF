@@ -436,14 +436,25 @@ static void on_hlr_sccp(struct iwf_runtime *rt,
     tcap_msg_t tmsg;
     if (tcap_decode(tcap, len, &tmsg) < 0) return;
 
+    /* SRI-SM is SMS-IWF only; everything else on HLR SSN goes to MAP-IWF
+     * (SAI, purgeMS, UGL, …). Without this demux those ops were dropped
+     * silently when CdPA SSN=6 (route-on-SSN after GTT). */
     if (tmsg.type == TCAP_MSG_BEGIN && tmsg.n_components > 0 &&
         tmsg.components[0].kind == TCAP_CMP_KIND_INVOKE &&
         tmsg.components[0].opcode == MAP_OP_CODE_SEND_ROUTING_INFO_SM) {
         handle_inbound_begin(cp, &tmsg, &tmsg.components[0]);
         return;
     }
-    if (tmsg.type == TCAP_MSG_END || tmsg.type == TCAP_MSG_CONTINUE)
-        handle_outbound_tcap(&tmsg);
+    if ((tmsg.type == TCAP_MSG_END || tmsg.type == TCAP_MSG_CONTINUE) &&
+        tmsg.have_dtid) {
+        sms_session_t *s = sms_sess_find(tmsg.dtid);
+        if (s && s->direction == SMS_DIR_OUTBOUND) {
+            handle_outbound_tcap(&tmsg);
+            return;
+        }
+    }
+
+    map_iwf_on_sccp_unitdata(rt, cp, tcap, len);
 }
 
 void sms_iwf_on_smpp_srv_readable(void) { smpp_server_on_listen_readable(); }

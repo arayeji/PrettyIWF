@@ -1,9 +1,9 @@
 /*
  * logging.h - structured logging for IWF
  *
- * Each log line is single-line, prefixed with timestamp/level/component,
- * and includes IMSI + sequence number when available so an operator can
- * grep -F "imsi=001010000000001" /var/log/iwf.log and follow a session.
+ * Each log line is single-line, prefixed with timestamp/level/component.
+ * When an IMSI is known, the message must start with [IMSI] (no "imsi="),
+ * e.g. grep -F "[001010000000002]" /var/log/iwf.log
  */
 
 #ifndef IWF_LOGGING_H

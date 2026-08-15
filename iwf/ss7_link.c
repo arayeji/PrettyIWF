@@ -246,22 +246,30 @@ static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *o
     if (!in || !out) return;
     out->ssn = in->ssn;
     out->pc  = in->point_code;
-    /* libosmo SCRC does not implement RI=GT ("GT Routing not implemented yet").
-     * Always use PC+SSN; keep GT in CDPA for the STP to translate. */
-    out->ri = OSMO_SCCP_RI_SSN_PC;
     out->presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
-    if (in->have_gt)
+    if (in->have_gt) {
+        /* osmo-stp GTT (libosmo-sigtran feature/sccp-gtt) dispatches on the
+         * called-party RI: RI=SSN+PC does a local-subsystem lookup and fails
+         * with UNEQUIPPED_USER before translation. Route on GT when present. */
         ss7_put_gt_in_osmo_addr(in, out);
+        out->ri = OSMO_SCCP_RI_GT;
+    } else {
+        out->ri = OSMO_SCCP_RI_SSN_PC;
+    }
 }
 
 static void ss7_encode_outbound_called(const ss7_sccp_addr_t *in,
                                        struct osmo_sccp_addr *out,
                                        uint32_t stp_dpc)
 {
-    /* RI=SSN+PC; CDPA PC=[stp] remote_pc (STP own MTP PC). PC=0 makes osmo-stp
-     * try MTP route 0.0.0 → DUNA/no route; local STP PC triggers SCCP GTT. */
+    /* CDPA PC=[stp] remote_pc so MTP delivers to the STP; with have_gt,
+     * ss7_to_osmo_addr sets RI=GT so the STP runs GTT on the GT digits. */
     ss7_to_osmo_addr(in, out);
     out->pc = osmo_ss7_pc_is_valid(stp_dpc) ? stp_dpc : 0;
+    if (in && in->have_gt) {
+        out->ri = OSMO_SCCP_RI_GT;
+        out->presence |= OSMO_SCCP_ADDR_T_GT;
+    }
 }
 
 /* libosmo keeps struct osmo_ss7_instance opaque; cfg layout varies between
@@ -368,8 +376,13 @@ static void deliver_unitdata(struct iwf_runtime *rt, ss7_recv_cb_t cb,
 
 static int sccp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
 {
-    struct iwf_runtime *rt = (struct iwf_runtime *)priv;
-    if (!rt || !rt->map) return 0;
+    /* libosmo passes the osmo_sccp_user* as priv — NOT set_priv(). */
+    struct osmo_sccp_user *scu_user = (struct osmo_sccp_user *)priv;
+    struct iwf_runtime *rt = scu_user ? osmo_sccp_user_get_priv(scu_user) : NULL;
+    if (!oph || !rt || !rt->map) {
+        if (oph && oph->msg) msgb_free(oph->msg);
+        return 0;
+    }
 
     if (oph->sap == SCCP_SAP_USER &&
         oph->primitive == (unsigned int)OSMO_SCU_PRIM_N_UNITDATA &&
@@ -377,30 +390,38 @@ static int sccp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
         struct osmo_scu_prim *scu = (struct osmo_scu_prim *)oph;
         deliver_unitdata(rt, rt->map->ss7.recv_cb,
                          &scu->u.unitdata.calling_addr, oph->msg);
+        return 0;
     }
+    if (oph->msg) msgb_free(oph->msg);
     return 0;
 }
 
 #ifdef SMS_IWF_ENABLED
 static int sccp_prim_cb_hlr(struct osmo_prim_hdr *oph, void *priv)
 {
-    /* Match sccp_prim_cb: do not touch ss7.opaque except on UNITDATA.
-     * PCSTATE/DUNA is broadcast to every SCCP user; loading opaque here
-     * SIGSEGV'd (coredump in sccp_prim_cb_hlr during sccp_lbcs_local_bcast_pcstate). */
-    struct iwf_runtime *rt = (struct iwf_runtime *)priv;
-    if (!oph || !rt || !rt->map)
+    /* libosmo passes osmo_sccp_user*; set_priv() holds iwf_runtime.
+     * Casting priv to iwf_runtime* silently dropped all inbound HLR MAP. */
+    struct osmo_sccp_user *scu_user = (struct osmo_sccp_user *)priv;
+    struct iwf_runtime *rt = scu_user ? osmo_sccp_user_get_priv(scu_user) : NULL;
+    if (!oph || !rt || !rt->map) {
+        if (oph && oph->msg) msgb_free(oph->msg);
         return 0;
+    }
 
     if (oph->sap == SCCP_SAP_USER &&
         oph->primitive == (unsigned int)OSMO_SCU_PRIM_N_UNITDATA &&
         oph->operation == PRIM_OP_INDICATION) {
         struct ss7_impl_ctx *ctx = rt->map->ss7.opaque;
-        if (!ctx)
+        if (!ctx) {
+            msgb_free(oph->msg);
             return 0;
+        }
         struct osmo_scu_prim *scu = (struct osmo_scu_prim *)oph;
         deliver_unitdata(rt, ctx->recv_cb_hlr,
                          &scu->u.unitdata.calling_addr, oph->msg);
+        return 0;
     }
+    if (oph->msg) msgb_free(oph->msg);
     return 0;
 }
 
@@ -423,7 +444,8 @@ int ss7_link_bind_hlr_ssn(struct iwf_runtime *rt, uint8_t ssn)
         return -1;
     }
     osmo_sccp_user_set_priv(ctx->user_hlr, rt);
-    LOGI("ss7", "bound SCCP user for HLR SSN %u (MAP SMS)", (unsigned)ssn);
+    LOGI("ss7", "bound SCCP user for HLR SSN %u (MAP SMS + MAP-IWF demux)",
+         (unsigned)ssn);
     return 0;
 }
 #endif /* SMS_IWF_ENABLED */
@@ -637,6 +659,12 @@ static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
     ss7_to_osmo_addr(calling, &calling_addr);
     if (osmo_ss7_pc_is_valid(ctx->local_pc))
         calling_addr.pc = ctx->local_pc;
+    /* Partners copy CgPA into the CdPA of their answer — RI=GT makes the
+     * return path GT-routed (local_gt already in CgPA when have_gt). */
+    if (calling && calling->have_gt) {
+        calling_addr.ri = OSMO_SCCP_RI_GT;
+        calling_addr.presence |= OSMO_SCCP_ADDR_T_GT;
+    }
 
     int rc = osmo_sccp_tx_unitdata_msg(user, &calling_addr, &called_addr, msg);
     if (rc < 0)

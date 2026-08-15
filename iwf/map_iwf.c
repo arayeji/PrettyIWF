@@ -23,12 +23,26 @@
  *   IWF  -> SGSN: TCAP-End on the original UGL dialogue
  *                 (ReturnResult: hlr-Number)
  *
+ * UL (Update Location, MAP-C)
+ * ---------------------------
+ *   VLR -> IWF: TCAP-Begin (AARQ=networkLocUpContext-v3, Invoke updateLocation)
+ *   IWF -> HSS: Diameter ULR (CS flags, SGSN-Number = VLR GT)
+ *   HSS -> IWF: Diameter ULA + MSISDN
+ *   IWF -> VLR: TCAP-Continue (AARE + Invoke ISD) on the same dialogue
+ *   VLR -> IWF: TCAP-Continue/End (ISD ReturnResult)
+ *   IWF -> VLR: TCAP-End (updateLocation ReturnResult)
+ *
  * CL (Cancel Location, HSS-initiated)
  * -----------------------------------
- *   HSS  -> IWF: Diameter CLR
- *   IWF  -> SGSN: TCAP-Begin (Invoke CancelLocation)
- *   SGSN -> IWF: TCAP-End   (ReturnResult)
- *   IWF  -> HSS: Diameter CLA Result-Code=2001
+ *   HSS  -> IWF: Diameter CLR (Dest-Host = iwf or iwf-vlr)
+ *   IWF  -> MSC/SGSN: GSUP Location-Cancel (CN from Dest-Host)
+ *   IWF  -> HSS: Diameter CLA (Origin-Host matches Dest-Host)
+ *
+ * IDR (Insert Subscriber Data, HSS-initiated)
+ * ------------------------------------------
+ *   HSS  -> IWF: Diameter IDR + Subscription-Data
+ *   IWF  -> MSC/SGSN: GSUP ISD_REQ (CN from Dest-Host)
+ *   IWF  -> HSS: Diameter IDA
  *
  * PurgeMS
  * -------
@@ -36,6 +50,15 @@
  *   IWF  -> HSS: Diameter PUR
  *   HSS  -> IWF: Diameter PUA
  *   IWF  -> SGSN: TCAP-End (ReturnResult)
+ *
+ * PRN (Provide Roaming Number)
+ * ----------------------------
+ *   HLR/GMSC -> IWF: TCAP-Begin (AARQ=roamingNumberEnquiryContext-v3,
+ *                               Invoke provideRoamingNumber)
+ *   IWF allocates MSRN from configured pool, binds to IMSI (TTL),
+ *   replies TCAP-End ReturnResult(roamingNumber). On pool miss/exhaustion
+ *   replies ReturnError(noRoamingNumberAvailable) — never silent drop.
+ *   SIP (outside repo) resolves inbound calls via cmd_sock msrn_lookup.
  *
  * Error paths
  * -----------
@@ -51,6 +74,7 @@
 #include "map_iwf_priv.h"
 #include "map_session.h"
 #include "map_codec.h"
+#include "msrn_pool.h"
 #include "tcap.h"
 #include "diameter.h"
 #include "ss7_link.h"
@@ -58,14 +82,15 @@
 #include "logging.h"
 #include "test_cmd.h"
 #include "subscr_cache.h"
+#include "gsup_proto.h"
 #ifdef GSUP_PROXY_ENABLED
 #include "gsup_map_proxy.h"
-#include "gsup_proto.h"
 #endif
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <errno.h>
@@ -88,6 +113,7 @@ static map_app_ctx_t ac_for_op(map_op_t op)
     case MAP_OP_ISD:      return MAP_AC_SUBSCRIBER_DATA_MGMT_V3;
     case MAP_OP_CL:       return MAP_AC_GPRS_LOCATION_CANCEL_V3;
     case MAP_OP_PURGE_MS: return MAP_AC_MS_PURGING_V3;
+    case MAP_OP_PRN:      return MAP_AC_ROAMING_NUMBER_ENQUIRY_V3;
     default: return MAP_AC_INFO_RETRIEVAL_V3;
     }
 }
@@ -104,6 +130,9 @@ static int send_tcap_end_with_result(struct iwf_runtime *rt,
                                      int local_opcode,
                                      const uint8_t *params, size_t params_len);
 
+static int encode_loc_up_res(struct iwf_runtime *rt,
+                             uint8_t *params, size_t params_cap);
+
 /* UNIX / SIGUSR1 test session: never send TCAP toward SS7; use cmd_test_abort. */
 static void cmd_test_abort(map_session_t *s, const char *reason)
 {
@@ -114,8 +143,10 @@ static void cmd_test_abort(map_session_t *s, const char *reason)
         close(s->cmd_test_reply_fd);
         s->cmd_test_reply_fd = -1;
     } else {
-        LOGW("map", "cmd-test SAI failed imsi=%s: %s",
-             s->imsi_str[0] ? s->imsi_str : "?", r);
+        LOGW("map",
+         "[%s] cmd-test SAI failed: %s",
+         s->imsi_str[0] ? s->imsi_str : "?",
+         r);
     }
     s->cmd_test = false;
     map_sess_remove(s);
@@ -142,6 +173,33 @@ static void map_sess_timeout_hook_cmd(map_session_t *s, void *hook_ctx)
 
 /* ----- Begin handlers ---------------------------------------------- */
 
+static void map_sess_store_peer(map_session_t *s, const ss7_sccp_addr_t *calling)
+{
+    if (!s || !calling) return;
+    s->peer_sccp = *calling;
+    s->have_peer_sccp = true;
+}
+
+/* Reply CdPA = inbound CgPA; CgPA = local GT, HLR SSN when peer is VLR/MSC. */
+static int map_send_tcap_to_peer(struct iwf_runtime *rt, map_session_t *s,
+                                 const uint8_t *out, size_t n)
+{
+    ss7_sccp_addr_t called = {0};
+    ss7_sccp_addr_t calling;
+
+    if (s->have_peer_sccp)
+        called = s->peer_sccp;
+    else
+        called.ssn = SS7_SSN_SGSN;
+
+    ss7_link_make_local_addr(rt, &calling);
+    if (s->have_peer_sccp &&
+        (s->peer_sccp.ssn == SS7_SSN_VLR || s->peer_sccp.ssn == SS7_SSN_MSC))
+        calling.ssn = SS7_SSN_HLR;
+
+    return ss7_link_send_tcap_ex(rt, &called, &calling, out, n);
+}
+
 static void handle_begin_sai(struct iwf_runtime *rt,
                              const ss7_sccp_addr_t *calling,
                              const tcap_msg_t *tmsg,
@@ -161,8 +219,10 @@ static void handle_begin_sai(struct iwf_runtime *rt,
     s->state  = MAP_SESS_WAIT_DIAMETER;
     s->peer_tcap_dialogue_id = tmsg->otid;
     s->have_peer_tid         = tmsg->have_otid;
+    s->peer_invoke_id        = cmp->invoke_id;
     s->t_dialogue_ms         = rt->cfg.map_t_dialogue_ms > 0
                                  ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
+    map_sess_store_peer(s, calling);
     memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
     s->imsi_bcd_len = req.imsi_bcd_len;
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
@@ -173,13 +233,17 @@ static void handle_begin_sai(struct iwf_runtime *rt,
     if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
 
-    LOGI("map", "RX BEGIN SAI imsi=%s tid=0x%08x peer_otid=0x%08x vec_req=%u",
-         s->imsi_str, s->tcap_dialogue_id, s->peer_tcap_dialogue_id,
+    LOGI("map",
+         "[%s] RX BEGIN SAI tid=0x%08x peer_otid=0x%08x invoke=%u vec_req=%u",
+         s->imsi_str,
+         s->tcap_dialogue_id,
+         s->peer_tcap_dialogue_id,
+         (unsigned)s->peer_invoke_id,
          req.num_vectors);
 
     if (diameter_send_air(rt, s) < 0) {
-        LOGW("map", "AIR send failed imsi=%s; replying systemFailure", s->imsi_str);
-        send_tcap_end_with_error(rt, s, /*invoke_id*/ 1,
+        LOGW("map", "[%s] AIR send failed; replying systemFailure", s->imsi_str);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id,
                                  MAP_ERR_SYSTEM_FAILURE, /*nrc=hlr*/ 1);
     }
 }
@@ -200,18 +264,64 @@ static void handle_begin_ugl(struct iwf_runtime *rt,
     s->state  = MAP_SESS_WAIT_DIAMETER;
     s->peer_tcap_dialogue_id = tmsg->otid;
     s->have_peer_tid         = tmsg->have_otid;
+    s->peer_invoke_id        = cmp->invoke_id;
     s->t_dialogue_ms         = rt->cfg.map_t_dialogue_ms > 0
                                  ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
+    map_sess_store_peer(s, calling);
     memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
     s->imsi_bcd_len = req.imsi_bcd_len;
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
     if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
 
-    LOGI("map", "RX BEGIN UGL imsi=%s tid=0x%08x peer_otid=0x%08x",
-         s->imsi_str, s->tcap_dialogue_id, s->peer_tcap_dialogue_id);
+    LOGI("map",
+         "[%s] RX BEGIN UGL tid=0x%08x peer_otid=0x%08x",
+         s->imsi_str,
+         s->tcap_dialogue_id,
+         s->peer_tcap_dialogue_id);
     if (diameter_send_ulr(rt, s) < 0) {
-        send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
+    }
+}
+
+static void handle_begin_ul(struct iwf_runtime *rt,
+                            const ss7_sccp_addr_t *calling,
+                            const tcap_msg_t *tmsg,
+                            const tcap_component_t *cmp)
+{
+    map_ul_req_t req;
+    if (map_decode_ul_arg(cmp->parameters, cmp->parameters_len, &req) < 0) {
+        LOGW("map", "UL: malformed argument from pc=%u", calling->point_code);
+        return;
+    }
+    map_session_t *s = map_sess_create(map_sess_new_tid());
+    if (!s) return;
+    s->map_op = MAP_OP_UL;
+    s->gsup_cn_domain = GSUP_CN_DOMAIN_CS;
+    s->state  = MAP_SESS_WAIT_DIAMETER;
+    s->peer_tcap_dialogue_id = tmsg->otid;
+    s->have_peer_tid         = tmsg->have_otid;
+    s->peer_invoke_id        = cmp->invoke_id;
+    s->t_dialogue_ms         = rt->cfg.map_t_dialogue_ms > 0
+                                 ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
+    map_sess_store_peer(s, calling);
+    memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
+    s->imsi_bcd_len = req.imsi_bcd_len;
+    memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
+        s->have_visited_plmn = true;
+
+    LOGI("map",
+         "[%s] RX BEGIN UL tid=0x%08x peer_otid=0x%08x invoke=%u msc=%s vlr=%s",
+         s->imsi_str,
+         s->tcap_dialogue_id,
+         s->peer_tcap_dialogue_id,
+         (unsigned)s->peer_invoke_id,
+         req.msc_number[0] ? req.msc_number : "-",
+         req.vlr_number[0] ? req.vlr_number
+                           : (calling && calling->have_gt ? calling->gt_digits : "-"));
+    if (diameter_send_ulr(rt, s) < 0) {
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
     }
 }
 
@@ -231,17 +341,22 @@ static void handle_begin_purge(struct iwf_runtime *rt,
     s->state  = MAP_SESS_WAIT_DIAMETER;
     s->peer_tcap_dialogue_id = tmsg->otid;
     s->have_peer_tid         = tmsg->have_otid;
+    s->peer_invoke_id        = cmp->invoke_id;
     s->t_dialogue_ms         = rt->cfg.map_t_dialogue_ms > 0
                                  ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
+    map_sess_store_peer(s, calling);
     memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
     s->imsi_bcd_len = req.imsi_bcd_len;
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
     if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
-    LOGI("map", "RX BEGIN PurgeMS imsi=%s tid=0x%08x",
-         s->imsi_str, s->tcap_dialogue_id);
+    LOGI("map",
+         "[%s] RX BEGIN PurgeMS tid=0x%08x invoke=%u",
+         s->imsi_str,
+         s->tcap_dialogue_id,
+         (unsigned)s->peer_invoke_id);
     if (diameter_send_pur(rt, s) < 0) {
-        send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
     }
 }
 
@@ -263,15 +378,137 @@ static void handle_begin_cl(struct iwf_runtime *rt,
     s->state  = MAP_SESS_WAIT_MAP_TX;
     s->peer_tcap_dialogue_id = tmsg->otid;
     s->have_peer_tid         = tmsg->have_otid;
+    s->peer_invoke_id        = cmp->invoke_id;
+    map_sess_store_peer(s, calling);
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
-    LOGI("map", "RX BEGIN CL imsi=%s ct=%u (immediate ack)",
-         s->imsi_str, req.cancellation_type);
+    LOGI("map",
+         "[%s] RX BEGIN CL ct=%u (immediate ack)",
+         s->imsi_str,
+         req.cancellation_type);
     /* No Diameter side - just acknowledge. */
-    send_tcap_end_with_result(rt, s, cmp->invoke_id,
+    send_tcap_end_with_result(rt, s, s->peer_invoke_id,
                               MAP_OP_CODE_CANCEL_LOCATION, NULL, 0);
 }
 
-/* ----- Continue / End handlers (ISD ack from SGSN) ----------------- */
+/* ProvideRoamingNumber: allocate MSRN, bind IMSI, TCAP-End with result.
+ * Pool miss / exhaustion -> ReturnError(noRoamingNumberAvailable). */
+static void handle_begin_prn(struct iwf_runtime *rt,
+                             const ss7_sccp_addr_t *calling,
+                             const tcap_msg_t *tmsg,
+                             const tcap_component_t *cmp)
+{
+    map_prn_req_t req;
+    map_session_t *s = map_sess_create(map_sess_new_tid());
+    if (!s) {
+        LOGE("map", "PRN: session alloc failed from pc=%u",
+             calling ? calling->point_code : 0);
+        return;
+    }
+    s->map_op = MAP_OP_PRN;
+    s->state  = MAP_SESS_WAIT_MAP_TX;
+    s->peer_tcap_dialogue_id = tmsg->otid;
+    s->have_peer_tid         = tmsg->have_otid;
+    s->peer_invoke_id        = cmp->invoke_id;
+    s->t_dialogue_ms         = rt->cfg.map_t_dialogue_ms > 0
+                                 ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
+    map_sess_store_peer(s, calling);
+
+    if (map_decode_prn_arg(cmp->parameters, cmp->parameters_len, &req) < 0) {
+        LOGW("map",
+             "[?] RX BEGIN PRN tid=0x%08x peer_otid=0x%08x: malformed arg "
+             "(pc=%u) -> systemFailure",
+             s->tcap_dialogue_id, s->peer_tcap_dialogue_id,
+             calling ? calling->point_code : 0);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id,
+                                 MAP_ERR_SYSTEM_FAILURE, 1);
+        return;
+    }
+
+    if (req.imsi_bcd_len) {
+        memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
+        s->imsi_bcd_len = req.imsi_bcd_len;
+    }
+    if (req.imsi_str[0])
+        memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
+
+    const char *imsi_log = s->imsi_str[0] ? s->imsi_str : "?";
+    LOGI("map",
+         "[%s] RX BEGIN PRN tid=0x%08x peer_otid=0x%08x invoke=%u msc=%s msisdn=%s",
+         imsi_log,
+         s->tcap_dialogue_id,
+         s->peer_tcap_dialogue_id,
+         (unsigned)s->peer_invoke_id,
+         req.msc_number[0] ? req.msc_number : "-",
+         req.msisdn[0] ? req.msisdn : "-");
+
+    if (!req.imsi_str[0]) {
+        LOGW("map",
+             "[?] PRN tid=0x%08x: IMSI missing -> systemFailure",
+             s->tcap_dialogue_id);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id,
+                                 MAP_ERR_SYSTEM_FAILURE, 1);
+        return;
+    }
+
+    if (!msrn_pool_configured()) {
+        LOGW("map",
+             "[%s] PRN tid=0x%08x: no msrn_pool configured -> "
+             "noRoamingNumberAvailable",
+             imsi_log, s->tcap_dialogue_id);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id,
+                                 MAP_ERR_NO_ROAMING_NUMBER_AVAILABLE, 0);
+        return;
+    }
+
+    msrn_binding_t bind;
+    if (msrn_pool_alloc(req.imsi_str,
+                        req.msisdn[0] ? req.msisdn : NULL,
+                        req.msc_number[0] ? req.msc_number : NULL,
+                        s->tcap_dialogue_id,
+                        &bind) < 0) {
+        LOGW("map",
+             "[%s] PRN tid=0x%08x: alloc failed (exhausted/unknown MSC) -> "
+             "noRoamingNumberAvailable",
+             imsi_log, s->tcap_dialogue_id);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id,
+                                 MAP_ERR_NO_ROAMING_NUMBER_AVAILABLE, 0);
+        return;
+    }
+
+    uint8_t params[64];
+    int pn = map_encode_prn_res(bind.msrn, params, sizeof(params));
+    if (pn < 0) {
+        LOGE("map",
+             "[%s] PRN tid=0x%08x: encode res failed msrn=%s -> systemFailure",
+             imsi_log, s->tcap_dialogue_id, bind.msrn);
+        msrn_pool_release(bind.msrn);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id,
+                                 MAP_ERR_SYSTEM_FAILURE, 1);
+        return;
+    }
+
+    LOGI("map",
+         "[%s] PRN tid=0x%08x allocated msrn=%s pool=%s",
+         imsi_log, s->tcap_dialogue_id, bind.msrn, bind.pool_name);
+    send_tcap_end_with_result(rt, s, s->peer_invoke_id,
+                              MAP_OP_CODE_PROVIDE_ROAMING_NUMBER,
+                              params, (size_t)pn);
+}
+
+/* ----- Continue / End handlers (ISD ack from VLR/SGSN) ----------------- */
+
+static void finish_ul_with_result(struct iwf_runtime *rt, map_session_t *s)
+{
+    uint8_t params[64];
+    int pn = encode_loc_up_res(rt, params, sizeof(params));
+    if (pn < 0) {
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
+        return;
+    }
+    send_tcap_end_with_result(rt, s, s->peer_invoke_id,
+                              MAP_OP_CODE_UPDATE_LOCATION,
+                              params, (size_t)pn);
+}
 
 static void handle_continue_or_end(struct iwf_runtime *rt,
                                    const tcap_msg_t *tmsg)
@@ -286,15 +523,39 @@ static void handle_continue_or_end(struct iwf_runtime *rt,
              tmsg->dtid);
         return;
     }
-    /* ISD ack from SGSN: complete the parent UGL response. */
+    map_sess_touch(s);
+
+    /* MAP-C UL: ISD ReturnResult on the same networkLocUp dialogue. */
+    if (s->state == MAP_SESS_WAIT_MAP_ACK && s->map_op == MAP_OP_UL) {
+        if (tmsg->have_otid) {
+            s->peer_tcap_dialogue_id = tmsg->otid;
+            s->have_peer_tid = true;
+        }
+        if (tmsg->type == TCAP_MSG_END) {
+            /* Dialogue already closed by VLR; cannot send updateLocation Res. */
+            LOGW("map",
+                 "[%s] ISD ack via END tid=0x%08x; dropping UL result",
+                 s->imsi_str, s->tcap_dialogue_id);
+            map_sess_remove(s);
+            return;
+        }
+        LOGI("map", "[%s] ISD acked on UL dialogue tid=0x%08x -> TX UL End",
+             s->imsi_str, s->tcap_dialogue_id);
+        finish_ul_with_result(rt, s);
+        return;
+    }
+
+    /* Standalone ISD dialogue (UGL path): ack only. */
     if (s->state == MAP_SESS_WAIT_MAP_ACK && s->map_op == MAP_OP_ISD) {
-        LOGI("map", "ISD acked by SGSN tid=0x%08x", s->tcap_dialogue_id);
+        LOGI("map", "[%s] ISD acked by SGSN tid=0x%08x",
+             s->imsi_str, s->tcap_dialogue_id);
         s->state = MAP_SESS_DONE;
         map_sess_remove(s);
-    } else {
-        LOGD("map", "ignoring CONTINUE/END for tid=0x%08x state=%s",
-             tmsg->dtid, map_sess_state_str(s->state));
+        return;
     }
+
+    LOGD("map", "ignoring CONTINUE/END for tid=0x%08x state=%s op=%s",
+         tmsg->dtid, map_sess_state_str(s->state), map_op_str(s->map_op));
 }
 
 static void handle_abort(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
@@ -302,9 +563,11 @@ static void handle_abort(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
     if (!tmsg->have_dtid) return;
     map_session_t *s = map_sess_find_by_tid(tmsg->dtid);
     if (!s) return;
-    LOGW("map", "RX ABORT imsi=%s tid=0x%08x state=%s",
+    LOGW("map",
+         "[%s] RX ABORT tid=0x%08x state=%s",
          s->imsi_str[0] ? s->imsi_str : "?",
-         s->tcap_dialogue_id, map_sess_state_str(s->state));
+         s->tcap_dialogue_id,
+         map_sess_state_str(s->state));
     rt->map->stat_timeouts++;
     map_sess_remove(s);
 }
@@ -338,9 +601,11 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
         const tcap_component_t *c = &tmsg.components[0];
         switch (c->opcode) {
         case MAP_OP_CODE_SEND_AUTH_INFO:        handle_begin_sai  (rt, calling, &tmsg, c); break;
+        case MAP_OP_CODE_UPDATE_LOCATION:        handle_begin_ul   (rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_UPDATE_GPRS_LOCATION:  handle_begin_ugl  (rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_PURGE_MS:              handle_begin_purge(rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_CANCEL_LOCATION:       handle_begin_cl   (rt, calling, &tmsg, c); break;
+        case MAP_OP_CODE_PROVIDE_ROAMING_NUMBER: handle_begin_prn (rt, calling, &tmsg, c); break;
         default:
             LOGW("map", "unsupported MAP opcode=%d ac=%d in BEGIN",
                  c->opcode, ac);
@@ -367,6 +632,15 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
     }
 }
 
+void map_iwf_on_sccp_unitdata(struct iwf_runtime *rt,
+                              const ss7_sccp_addr_t *calling,
+                              const uint8_t *tcap, size_t tcap_len)
+{
+    if (!rt || !rt->map || !calling || !tcap || !tcap_len)
+        return;
+    on_sccp_pdu(rt, calling, tcap, tcap_len);
+}
+
 /* ====================================================================== */
 /* Outbound: build & send TCAP messages back to the SGSN                  */
 /* ====================================================================== */
@@ -386,35 +660,36 @@ static int send_tcap_end_with_result(struct iwf_runtime *rt,
     if (tcap_enc_return_result(cmp, sizeof(cmp), &co,
                                invoke_id, local_opcode,
                                params, params_len) < 0) {
-        LOGE("map", "tcap_enc_return_result failed imsi=%s", s->imsi_str);
+        LOGE("map", "[%s] tcap_enc_return_result failed", s->imsi_str);
         return -1;
     }
-    /* AARE dialogue portion. */
-    uint8_t dlg[128]; int dn = map_encode_aare(ac_for_op(s->map_op),
-                                               dlg, sizeof(dlg));
-    if (dn < 0) return -1;
+    /* AARE dialogue portion (omit if already sent on an earlier CONTINUE). */
+    uint8_t dlg[128]; int dn = 0;
+    const uint8_t *dlg_ptr = NULL;
+    if (!s->aare_sent) {
+        dn = map_encode_aare(ac_for_op(s->map_op), dlg, sizeof(dlg));
+        if (dn < 0) return -1;
+        dlg_ptr = dlg;
+    }
 
     uint8_t out[3072];
     int n = tcap_encode_message(TCAP_MSG_END,
                                 0, false,
                                 s->peer_tcap_dialogue_id, s->have_peer_tid,
-                                dlg, (size_t)dn,
+                                dlg_ptr, (size_t)dn,
                                 cmp, co,
                                 out, sizeof(out));
     if (n < 0) return -1;
 
-    /* For now we don't have the SGSN's full SCCP addr cached.  We send to
-     * the SS7 default route via the local address swapped to a "called" -
-     * the STP fills in based on the inverse of the calling we received.
-     * A future patch will cache the original calling-party address per
-     * dialogue so the SCCP layer can route by point-code rather than GT. */
-    ss7_sccp_addr_t called = {0};
-    called.ssn = SS7_SSN_SGSN;
-    int rc = ss7_link_send_tcap(rt, &called, out, (size_t)n);
+    int rc = map_send_tcap_to_peer(rt, s, out, (size_t)n);
     if (rc == 0) {
         rt->map->stat_map_tx++;
-        LOGI("map", "TX END dtid=0x%08x op=%s imsi=%s len=%d",
-             s->peer_tcap_dialogue_id, map_op_str(s->map_op), s->imsi_str, n);
+        LOGI("map",
+         "[%s] TX END dtid=0x%08x op=%s len=%d",
+         s->imsi_str,
+         s->peer_tcap_dialogue_id,
+         map_op_str(s->map_op),
+         n);
         s->state = MAP_SESS_DONE;
         map_sess_remove(s);
     }
@@ -453,15 +728,16 @@ static int send_tcap_end_with_error(struct iwf_runtime *rt,
                                 out, sizeof(out));
     if (n < 0) return -1;
 
-    ss7_sccp_addr_t called = {0};
-    called.ssn = SS7_SSN_SGSN;
-    int rc = ss7_link_send_tcap(rt, &called, out, (size_t)n);
+    int rc = map_send_tcap_to_peer(rt, s, out, (size_t)n);
     if (rc == 0) {
         rt->map->stat_systemfailures_sent++;
         rt->map->stat_map_tx++;
-        LOGW("map", "TX END(Error %d) imsi=%s dtid=0x%08x op=%s",
-             map_error_code, s->imsi_str, s->peer_tcap_dialogue_id,
-             map_op_str(s->map_op));
+        LOGW("map",
+         "[%s] TX END(Error %d) dtid=0x%08x op=%s",
+         s->imsi_str,
+         map_error_code,
+         s->peer_tcap_dialogue_id,
+         map_op_str(s->map_op));
         s->state = MAP_SESS_DONE;
         map_sess_remove(s);
     }
@@ -607,14 +883,17 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
     aia_collect_vectors(body, body_len, s, 0);
     aia_finalize_vectors(s);
 
-    LOGI("map", "AIA imsi=%s vectors=%u -> emitting MAP SAI Resp",
-         s->imsi_str, s->n_av);
+    LOGI("map",
+         "[%s] AIA vectors=%u -> emitting MAP SAI Resp",
+         s->imsi_str,
+         s->n_av);
     if (s->gsup_originated && s->n_av > 0 && !auth_vector_has_ckik(&s->av[0]))
-        LOGW("map", "AIA imsi=%s: no CK/IK (Confidentiality-Key/625, Integrity-Key/626)",
-             s->imsi_str);
+        LOGW("map",
+         "[%s] AIA: no CK/IK (Confidentiality-Key/625, Integrity-Key/626)",
+         s->imsi_str);
 
     if (s->n_av == 0) {
-        LOGW("map", "AIA imsi=%s: no auth vectors in answer", s->imsi_str);
+        LOGW("map", "[%s] AIA: no auth vectors in answer", s->imsi_str);
         if (is_cmd_test) {
             cmd_test_abort(s, "no_vectors");
             return;
@@ -625,7 +904,7 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
 #endif
             return;
         }
-        send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
         return;
     }
 
@@ -638,8 +917,10 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
                               s->av[0].rand, s->av[0].autn);
             close(fd);
         } else {
-            LOGI("map", "cmd-test SAI OK imsi=%s vectors=%u",
-                 s->imsi_str, (unsigned)s->n_av);
+            LOGI("map",
+         "[%s] cmd-test SAI OK vectors=%u",
+         s->imsi_str,
+         (unsigned)s->n_av);
         }
         map_sess_remove(s);
         return;
@@ -654,10 +935,10 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
     uint8_t params[1600];
     int pn = map_encode_sai_res(s->av, s->n_av, params, sizeof(params));
     if (pn < 0) {
-        send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
         return;
     }
-    send_tcap_end_with_result(rt, s, /*invoke_id*/ 1,
+    send_tcap_end_with_result(rt, s, s->peer_invoke_id,
                               MAP_OP_CODE_SEND_AUTH_INFO,
                               params, (size_t)pn);
 }
@@ -876,12 +1157,14 @@ static void extract_ula_subdata(map_session_t *s,
                           DIAMETER_VENDOR_3GPP, &sd) < 0) {
         if (s->msisdn_str[0]) {
             s->have_ula_subdata = true;
-            LOGI("map", "ULA imsi=%s msisdn=%s (no Subscription-Data AVP)",
-                 s->imsi_str, s->msisdn_str);
+            LOGI("map",
+         "[%s] ULA msisdn=%s (no Subscription-Data AVP)",
+         s->imsi_str,
+         s->msisdn_str);
         } else {
-            LOGW("map", "ULA imsi=%s: no Subscription-Data and no MSISDN "
-                 "(check Open5GS subscriber msisdn[] in MongoDB)",
-                 s->imsi_str);
+            LOGW("map",
+         "[%s] ULA: no Subscription-Data and no MSISDN (check Open5GS subscriber msisdn[] in MongoDB)",
+         s->imsi_str);
         }
         return;
     }
@@ -894,12 +1177,13 @@ static void extract_ula_subdata(map_session_t *s,
         decode_ula_msisdn(msisdn_avp.data, msisdn_avp.data_len,
                           s->msisdn_str, sizeof(s->msisdn_str));
 
-    /* CS GSUP: MSISDN only toward MSC; skip GPRS APN walk. */
+    /* CS (MAP UL or GSUP CN=CS): MSISDN only toward VLR/MSC; skip GPRS APN walk. */
 #ifdef GSUP_PROXY_ENABLED
     const bool want_apn =
-        !(s->gsup_originated && s->gsup_cn_domain == GSUP_CN_DOMAIN_CS);
+        !(s->map_op == MAP_OP_UL ||
+          (s->gsup_originated && s->gsup_cn_domain == GSUP_CN_DOMAIN_CS));
 #else
-    const bool want_apn = true;
+    const bool want_apn = (s->map_op != MAP_OP_UL);
 #endif
 
     /* APN-Configuration-Profile → all APN-Configuration (1430) children. */
@@ -959,20 +1243,22 @@ static void extract_ula_subdata(map_session_t *s,
     }
 
     if (s->n_ula_apns <= 1) {
-        LOGI("map", "ULA imsi=%s msisdn=%s apn=%s ambr=%lu/%lu bps",
-             s->imsi_str,
-             s->msisdn_str[0] ? s->msisdn_str : "(none)",
-             s->ula_apn[0]   ? s->ula_apn   : "(none)",
-             (unsigned long)s->ula_ambr_ul_bps,
-             (unsigned long)s->ula_ambr_dl_bps);
+        LOGI("map",
+         "[%s] ULA msisdn=%s apn=%s ambr=%lu/%lu bps",
+         s->imsi_str,
+         s->msisdn_str[0] ? s->msisdn_str : "(none)",
+         s->ula_apn[0]   ? s->ula_apn   : "(none)",
+         (unsigned long)s->ula_ambr_ul_bps,
+         (unsigned long)s->ula_ambr_dl_bps);
     } else {
-        LOGI("map", "ULA imsi=%s msisdn=%s apns=%u default_ctx=%u ambr=%lu/%lu bps",
-             s->imsi_str,
-             s->msisdn_str[0] ? s->msisdn_str : "(none)",
-             (unsigned)s->n_ula_apns,
-             (unsigned)s->ula_default_context_id,
-             (unsigned long)s->ula_ambr_ul_bps,
-             (unsigned long)s->ula_ambr_dl_bps);
+        LOGI("map",
+         "[%s] ULA msisdn=%s apns=%u default_ctx=%u ambr=%lu/%lu bps",
+         s->imsi_str,
+         s->msisdn_str[0] ? s->msisdn_str : "(none)",
+         (unsigned)s->n_ula_apns,
+         (unsigned)s->ula_default_context_id,
+         (unsigned long)s->ula_ambr_ul_bps,
+         (unsigned long)s->ula_ambr_dl_bps);
         for (uint8_t i = 0; i < s->n_ula_apns; i++) {
             const map_ula_apn_entry_t *a = &s->ula_apns[i];
             char pgw[64] = "";
@@ -1008,6 +1294,31 @@ static void extract_ula_subdata(map_session_t *s,
  * ISD Invoke, exactly as TS 29.002 describes. */
 static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent);
 
+/* UpdateLocationRes / UpdateGprsLocationRes: hlr-Number = local_gt when set. */
+static int encode_loc_up_res(struct iwf_runtime *rt,
+                             uint8_t *params, size_t params_cap)
+{
+    uint8_t buf[16];
+    size_t len = 0;
+    if (rt && rt->cfg.map_local_gt[0]) {
+        buf[0] = 0x91;
+        int n = map_str_to_bcd(rt->cfg.map_local_gt, buf + 1, sizeof(buf) - 1);
+        if (n > 0)
+            len = (size_t)(n + 1);
+    }
+    if (!len) {
+        buf[0] = 0x00;
+        len = 1;
+    }
+    return map_encode_ugl_res(buf, len, params, params_cap);
+}
+
+static int loc_up_result_opcode(map_op_t op)
+{
+    return (op == MAP_OP_UL) ? MAP_OP_CODE_UPDATE_LOCATION
+                             : MAP_OP_CODE_UPDATE_GPRS_LOCATION;
+}
+
 void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
                     const uint8_t *body, size_t body_len)
 {
@@ -1018,8 +1329,9 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
          * PS: ISD carries PDP/APN; UL_RES may repeat subscription IEs. */
         if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS) {
             if (!s->msisdn_str[0]) {
-                LOGE("map", "CS ULA imsi=%s: no MSISDN for ISD "
-                     "(Open5GS subscriber msisdn[] required)", s->imsi_str);
+                LOGE("map",
+         "[%s] CS ULA: no MSISDN for ISD (Open5GS subscriber msisdn[] required)",
+         s->imsi_str);
                 gsup_map_proxy_abort_ugl(rt, s);
                 return;
             }
@@ -1039,47 +1351,115 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
     }
     extract_ula_subdata(s, body, body_len);
 
-    /* If we have any subscription data, push ISD first (then UGL Resp on
-     * its ack).  Otherwise send the UGL ReturnResult immediately. */
+    /* If we have any subscription data, push ISD first (then UL/UGL Resp).
+     * Otherwise send the location-update ReturnResult immediately. */
     if (s->have_ula_subdata && (s->msisdn_str[0] || s->n_ula_apns > 0)) {
         send_isd_invoke(rt, s);
         return;
     }
-    /* Send UGL ReturnResult: hlr-Number is synthesized as our origin host. */
-    static const uint8_t fake_hlr[1] = { 0x00 };
     uint8_t params[64];
-    int pn = map_encode_ugl_res(fake_hlr, sizeof(fake_hlr),
-                                params, sizeof(params));
+    int pn = encode_loc_up_res(rt, params, sizeof(params));
     if (pn < 0) {
-        send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
         return;
     }
-    send_tcap_end_with_result(rt, s, 1,
-                              MAP_OP_CODE_UPDATE_GPRS_LOCATION,
+    send_tcap_end_with_result(rt, s, s->peer_invoke_id,
+                              loc_up_result_opcode(s->map_op),
                               params, (size_t)pn);
 }
 
 static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
 {
-    /* Open a brand-new dialogue toward the SGSN for the ISD invoke. */
+    /* CS MAP UL: MSISDN only (no GPRS PDP list toward VLR). */
+    const map_ula_apn_entry_t *apns = parent->ula_apns;
+    size_t n_apns = parent->n_ula_apns;
+    if (parent->map_op == MAP_OP_UL) {
+        apns = NULL;
+        n_apns = 0;
+    }
+
+    uint8_t arg[1024];
+    int an = map_encode_isd_arg(parent->imsi_str,
+                                parent->msisdn_str,
+                                apns,
+                                n_apns,
+                                parent->ula_default_context_id,
+                                arg, sizeof(arg));
+    if (an < 0) {
+        LOGE("map", "[%s] ISD: encode failed", parent->imsi_str);
+        send_tcap_end_with_error(rt, parent, parent->peer_invoke_id,
+                                 MAP_ERR_SYSTEM_FAILURE, 1);
+        return;
+    }
+
+    /*
+     * MAP-C networkLocUp: ISD must ride the same dialogue as updateLocation
+     * (TC-CONTINUE + AARE + Invoke ISD). A separate subscriberDataMngt BEGIN
+     * is ignored/rejected by the VLR and leaves UL hanging until timeout.
+     */
+    if (parent->map_op == MAP_OP_UL) {
+        const uint8_t isd_iid = 1;
+        uint8_t cmp[1200]; size_t co = 0;
+        if (tcap_enc_invoke(cmp, sizeof(cmp), &co,
+                            isd_iid,
+                            MAP_OP_CODE_INSERT_SUBSCRIBER_DATA,
+                            arg, (size_t)an) < 0) {
+            send_tcap_end_with_error(rt, parent, parent->peer_invoke_id,
+                                     MAP_ERR_SYSTEM_FAILURE, 1);
+            return;
+        }
+        uint8_t dlg[128];
+        int dn = map_encode_aare(MAP_AC_NETWORK_LOC_UP_V3, dlg, sizeof(dlg));
+        if (dn < 0) {
+            send_tcap_end_with_error(rt, parent, parent->peer_invoke_id,
+                                     MAP_ERR_SYSTEM_FAILURE, 1);
+            return;
+        }
+
+        uint8_t out[2048];
+        int n = tcap_encode_message(TCAP_MSG_CONTINUE,
+                                    parent->tcap_dialogue_id, true,
+                                    parent->peer_tcap_dialogue_id,
+                                    parent->have_peer_tid,
+                                    dlg, (size_t)dn,
+                                    cmp, co,
+                                    out, sizeof(out));
+        if (n < 0) {
+            send_tcap_end_with_error(rt, parent, parent->peer_invoke_id,
+                                     MAP_ERR_SYSTEM_FAILURE, 1);
+            return;
+        }
+        if (map_send_tcap_to_peer(rt, parent, out, (size_t)n) < 0) {
+            LOGE("map", "[%s] ISD CONTINUE: SCCP send failed", parent->imsi_str);
+            send_tcap_end_with_error(rt, parent, parent->peer_invoke_id,
+                                     MAP_ERR_SYSTEM_FAILURE, 1);
+            return;
+        }
+        rt->map->stat_map_tx++;
+        parent->aare_sent = true;
+        parent->isd_invoke_id = isd_iid;
+        parent->state = MAP_SESS_WAIT_MAP_ACK;
+        map_sess_touch(parent);
+        LOGI("map",
+             "[%s] TX CONTINUE ISD tid=0x%08x peer=0x%08x msisdn=%s "
+             "(await ISD ack then UL End)",
+             parent->imsi_str,
+             parent->tcap_dialogue_id,
+             parent->peer_tcap_dialogue_id,
+             parent->msisdn_str[0] ? parent->msisdn_str : "(none)");
+        return;
+    }
+
+    /* UGL: separate subscriberDataMngt dialogue for ISD, then UGL End. */
     map_session_t *isd = map_sess_create(map_sess_new_tid());
     if (!isd) {
-        LOGE("map", "ISD: alloc failed for imsi=%s", parent->imsi_str);
+        LOGE("map", "[%s] ISD: alloc failed", parent->imsi_str);
         return;
     }
     isd->map_op = MAP_OP_ISD;
     isd->state  = MAP_SESS_WAIT_MAP_ACK;
     isd->t_dialogue_ms = parent->t_dialogue_ms;
     memcpy(isd->imsi_str, parent->imsi_str, sizeof(isd->imsi_str));
-
-    uint8_t arg[1024];
-    int an = map_encode_isd_arg(parent->imsi_str,
-                                parent->msisdn_str,
-                                parent->ula_apns,
-                                parent->n_ula_apns,
-                                parent->ula_default_context_id,
-                                arg, sizeof(arg));
-    if (an < 0) { map_sess_remove(isd); return; }
 
     uint8_t cmp[1200]; size_t co = 0;
     if (tcap_enc_invoke(cmp, sizeof(cmp), &co,
@@ -1101,28 +1481,34 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
                                 out, sizeof(out));
     if (n < 0) { map_sess_remove(isd); return; }
 
-    ss7_sccp_addr_t called = {0};
-    called.ssn = SS7_SSN_SGSN;
-    if (ss7_link_send_tcap(rt, &called, out, (size_t)n) < 0) {
-        LOGE("map", "ISD: SCCP send failed imsi=%s", parent->imsi_str);
+    if (parent->have_peer_sccp) {
+        isd->peer_sccp = parent->peer_sccp;
+        isd->have_peer_sccp = true;
+    }
+    if (map_send_tcap_to_peer(rt, isd, out, (size_t)n) < 0) {
+        LOGE("map", "[%s] ISD: SCCP send failed", parent->imsi_str);
         map_sess_remove(isd);
         return;
     }
     rt->map->stat_map_tx++;
-    LOGI("map", "TX BEGIN ISD imsi=%s tid=0x%08x apns=%u (UGL parent tid=0x%08x)",
-         parent->imsi_str, isd->tcap_dialogue_id,
-         (unsigned)parent->n_ula_apns, parent->tcap_dialogue_id);
+    LOGI("map",
+         "[%s] TX BEGIN ISD tid=0x%08x apns=%u (%s parent tid=0x%08x)",
+         parent->imsi_str,
+         isd->tcap_dialogue_id,
+         (unsigned)n_apns,
+         map_op_str(parent->map_op),
+         parent->tcap_dialogue_id);
 
-    /* Now also send the UGL ReturnResult on the parent dialogue. */
-    static const uint8_t fake_hlr[1] = { 0x00 };
+    /* Also send the UGL ReturnResult on the parent dialogue. */
     uint8_t params[64];
-    int pn = map_encode_ugl_res(fake_hlr, sizeof(fake_hlr), params, sizeof(params));
+    int pn = encode_loc_up_res(rt, params, sizeof(params));
     if (pn < 0) {
-        send_tcap_end_with_error(rt, parent, 1, MAP_ERR_SYSTEM_FAILURE, 1);
+        send_tcap_end_with_error(rt, parent, parent->peer_invoke_id,
+                                 MAP_ERR_SYSTEM_FAILURE, 1);
         return;
     }
-    send_tcap_end_with_result(rt, parent, 1,
-                              MAP_OP_CODE_UPDATE_GPRS_LOCATION,
+    send_tcap_end_with_result(rt, parent, parent->peer_invoke_id,
+                              loc_up_result_opcode(parent->map_op),
                               params, (size_t)pn);
 }
 
@@ -1165,9 +1551,39 @@ static int send_map_cl_begin(struct iwf_runtime *rt, const char *imsi,
         return -1;
 
     rt->map->stat_map_tx++;
-    LOGI("map", "TX BEGIN CL imsi=%s tid=0x%08x type=%u (HSS CLR)",
-         imsi, tid, (unsigned)cancellation_type);
+    LOGI("map",
+         "[%s] TX BEGIN CL tid=0x%08x type=%u (HSS CLR)",
+         imsi,
+         tid,
+         (unsigned)cancellation_type);
     return 0;
+}
+
+/* Map Diameter Destination-Host to GSUP CN domain.
+ * CS when dest matches origin_host_cs (or contains "vlr");
+ * PS when dest matches origin_host; 0 = both / unknown. */
+static uint8_t cn_domain_from_dest_host(const iwf_config_t *cfg,
+                                        const char *dest)
+{
+    if (!cfg || !dest || !dest[0])
+        return 0;
+    if (cfg->diam_origin_host_cs[0] &&
+        !strcasecmp(dest, cfg->diam_origin_host_cs))
+        return GSUP_CN_DOMAIN_CS;
+    if (cfg->diam_origin_host[0] &&
+        !strcasecmp(dest, cfg->diam_origin_host))
+        return GSUP_CN_DOMAIN_PS;
+    if (strcasestr(dest, "vlr"))
+        return GSUP_CN_DOMAIN_CS;
+    return 0;
+}
+
+static const char *origin_host_for_dest(const iwf_config_t *cfg,
+                                        const char *dest)
+{
+    if (dest && dest[0])
+        return dest;
+    return cfg->diam_origin_host;
 }
 
 void map_iwf_on_clr(struct iwf_runtime *rt,
@@ -1177,37 +1593,58 @@ void map_iwf_on_clr(struct iwf_runtime *rt,
 {
     char sid[DIAMETER_SESSION_ID_MAX];
     char imsi[MAP_IMSI_STR_MAX];
+    char dest_host[128];
     uint32_t cancel_type = 0;
+    const iwf_config_t *cfg = &rt->cfg;
     bool forwarded = false;
 
     sid[0] = '\0';
+    dest_host[0] = '\0';
     (void)diameter_get_session_id(body, body_len, sid, sizeof(sid));
+    (void)diameter_get_os_avp(body, body_len, AVP_DESTINATION_HOST, 0,
+                              dest_host, sizeof(dest_host));
 
     if (diameter_get_user_name(body, body_len, imsi, sizeof(imsi)) < 0) {
         LOGW("map", "CLR: missing User-Name");
         (void)diameter_send_cla_answer(rt, hop_by_hop, end_to_end, sid,
-                                       DIAM_RC_UNABLE_TO_DELIVER, peer_idx);
+                                       DIAM_RC_UNABLE_TO_DELIVER,
+                                       origin_host_for_dest(cfg, dest_host),
+                                       peer_idx);
         return;
     }
 
     (void)diameter_get_uint32_avp(body, body_len, AVP_3GPP_CANCELLATION_TYPE,
                                   DIAMETER_VENDOR_3GPP, &cancel_type);
 
-    LOGI("map", "RX CLR imsi=%s cancel_type=%u sid=%s",
-         imsi, (unsigned)cancel_type, sid[0] ? sid : "-");
+    uint8_t cn = cn_domain_from_dest_host(cfg, dest_host);
+    const char *origin = origin_host_for_dest(cfg, dest_host);
+
+    LOGI("map",
+         "[%s] RX CLR cancel_type=%u sid=%s dest=%s cn=%s",
+         imsi,
+         (unsigned)cancel_type,
+         sid[0] ? sid : "-",
+         dest_host[0] ? dest_host : "-",
+         cn == GSUP_CN_DOMAIN_CS ? "CS" :
+         cn == GSUP_CN_DOMAIN_PS ? "PS" : "CS+PS");
 
 #ifdef GSUP_PROXY_ENABLED
-    if (gsup_map_proxy_hss_clr(rt, imsi, (uint8_t)cancel_type))
+    if (gsup_map_proxy_hss_clr(rt, imsi, (uint8_t)cancel_type, cn))
         forwarded = true;
 #endif
-    if (!forwarded && send_map_cl_begin(rt, imsi, (uint8_t)cancel_type) == 0)
-        forwarded = true;
-
+    /* Do not fall back to MAP CancelLocation: CdPA was SSN-only (no GT) and
+     * never reached a real SGSN. Per 3GPP TS 29.272, unknown IMSI / no
+     * serving peer for this CN domain still gets DIAMETER_SUCCESS in CLA. */
     if (!forwarded)
-        LOGW("map", "CLR: no GSUP/MAP downstream for imsi=%s", imsi);
+        LOGW("map",
+         "[%s] CLR: no GSUP LOC-CANCEL for cn=%s (IMSI unknown / no peer) "
+         "-> CLA Success",
+         imsi,
+         cn == GSUP_CN_DOMAIN_CS ? "CS" :
+             cn == GSUP_CN_DOMAIN_PS ? "PS" : "CS+PS");
 
     (void)diameter_send_cla_answer(rt, hop_by_hop, end_to_end, sid,
-                                   DIAM_RC_SUCCESS, peer_idx);
+                                   DIAM_RC_SUCCESS, origin, peer_idx);
 }
 
 void map_iwf_on_idr(struct iwf_runtime *rt,
@@ -1237,33 +1674,79 @@ void map_iwf_on_idr(struct iwf_runtime *rt,
     (void)diameter_get_os_avp(body, body_len, AVP_DESTINATION_HOST, 0,
                               dest_host, sizeof(dest_host));
 
-    const char *origin = cfg->diam_origin_host;
-    if (dest_host[0])
-        origin = dest_host;
+    const char *origin = origin_host_for_dest(cfg, dest_host);
+    uint8_t cn = cn_domain_from_dest_host(cfg, dest_host);
+    /* Ambiguous dest → prefer CS when origin_host_cs is configured (IDR to
+     * iwf-vlr is the common HSS path); else PS. */
+    if (cn == 0)
+        cn = cfg->diam_origin_host_cs[0] ? GSUP_CN_DOMAIN_CS
+                                         : GSUP_CN_DOMAIN_PS;
 
-    LOGI("map", "RX IDR imsi=%s idr_flags=0x%x sid=%s dest=%s",
-         imsi, (unsigned)idr_flags, sid[0] ? sid : "-",
-         dest_host[0] ? dest_host : "-");
+    LOGI("map",
+         "[%s] RX IDR idr_flags=0x%x sid=%s dest=%s cn=%s",
+         imsi,
+         (unsigned)idr_flags,
+         sid[0] ? sid : "-",
+         dest_host[0] ? dest_host : "-",
+         cn == GSUP_CN_DOMAIN_CS ? "CS" : "PS");
 
     diameter_avp_t sub_avp;
-    bool has_sub = (diameter_avp_find_3gpp(body, body_len,
-                                           AVP_3GPP_SUBSCRIPTION_DATA,
-                                           &sub_avp) == 0);
+    bool has_sub = (diameter_avp_find(body, body_len, AVP_3GPP_SUBSCRIPTION_DATA,
+                                      DIAMETER_VENDOR_3GPP, &sub_avp) == 0);
     bool has_urrp = (idr_flags & IDR_FLAG_UE_REACHABILITY) != 0;
 
     if (!has_urrp && !has_sub) {
-        LOGW("map", "IDR: unsupported flags=0x%x for imsi=%s",
-             (unsigned)idr_flags, imsi);
+        LOGW("map",
+         "[%s] IDR: unsupported flags=0x%x",
+         imsi,
+         (unsigned)idr_flags);
         (void)diameter_send_ida_answer(rt, hop_by_hop, end_to_end, sid,
                                        DIAM_RC_UNABLE_TO_DELIVER, origin, peer_idx);
         return;
     }
 
-    if (has_sub && !has_urrp)
-        LOGI("map", "IDR: Subscription-Data ack (no GSUP push) imsi=%s", imsi);
+    bool pushed = false;
+#ifdef GSUP_PROXY_ENABLED
+    if (has_sub) {
+        map_session_t tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        strncpy(tmp.imsi_str, imsi, sizeof(tmp.imsi_str) - 1);
+        tmp.gsup_originated = true;
+        tmp.gsup_cn_domain = cn;
+        extract_ula_subdata(&tmp, body, body_len);
+        pushed = gsup_map_proxy_hss_idr(rt, imsi, cn, tmp.msisdn_str,
+                                        tmp.ula_apns, tmp.n_ula_apns);
+        if (pushed)
+            LOGI("map",
+         "[%s] IDR: GSUP ISD pushed cn=%s msisdn=%s apns=%u",
+         imsi,
+         cn == GSUP_CN_DOMAIN_CS ? "CS" : "PS",
+         tmp.msisdn_str[0] ? tmp.msisdn_str : "-",
+         (unsigned)tmp.n_ula_apns);
+        else if (!gsup_map_proxy_imsi_known(imsi, cn))
+            LOGW("map",
+         "[%s] IDR: IMSI not known on %s GSUP",
+         imsi,
+         cn == GSUP_CN_DOMAIN_CS ? "CS" : "PS");
+    }
+#else
+    (void)has_sub;
+#endif
+
+    uint32_t rc = DIAM_RC_SUCCESS;
+    if (has_sub && !pushed) {
+#ifdef GSUP_PROXY_ENABLED
+        if (!gsup_map_proxy_imsi_known(imsi, cn))
+            rc = DIAM_EXP_RC_USER_UNKNOWN;
+        else
+            rc = DIAM_RC_UNABLE_TO_DELIVER;
+#else
+        rc = DIAM_RC_SUCCESS; /* no GSUP build: ack only */
+#endif
+    }
 
     (void)diameter_send_ida_answer(rt, hop_by_hop, end_to_end, sid,
-                                   DIAM_RC_SUCCESS, origin, peer_idx);
+                                   rc, origin, peer_idx);
 
     if (has_urrp) {
 #ifdef GSUP_PROXY_ENABLED
@@ -1282,7 +1765,7 @@ void map_iwf_on_cla(struct iwf_runtime *rt, map_session_t *s,
      * Invoke MAP CancelLocation toward the SGSN).  CLA acknowledges that
      * our Diameter request was accepted; the SGSN-facing dialogue should
      * already be settled.  Nothing further to do here. */
-    LOGI("map", "CLA imsi=%s rc=%u", s->imsi_str, s->diameter_result_code);
+    LOGI("map", "[%s] CLA rc=%u", s->imsi_str, s->diameter_result_code);
     map_sess_remove(s);
 }
 
@@ -1293,10 +1776,10 @@ void map_iwf_on_pua(struct iwf_runtime *rt, map_session_t *s,
     uint8_t params[16];
     int pn = map_encode_purge_res(false, params, sizeof(params));
     if (pn < 0) {
-        send_tcap_end_with_error(rt, s, 1, MAP_ERR_SYSTEM_FAILURE, 1);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
         return;
     }
-    send_tcap_end_with_result(rt, s, 1, MAP_OP_CODE_PURGE_MS, params, (size_t)pn);
+    send_tcap_end_with_result(rt, s, s->peer_invoke_id, MAP_OP_CODE_PURGE_MS, params, (size_t)pn);
 }
 
 void map_iwf_diameter_error(struct iwf_runtime *rt, map_session_t *s,
@@ -1309,8 +1792,11 @@ void map_iwf_diameter_error(struct iwf_runtime *rt, map_session_t *s,
 #endif
         return;
     }
-    LOGW("map", "Diameter error rc=%u imsi=%s op=%s; sending MAP SystemFailure",
-         (unsigned)rc, s->imsi_str, map_op_str(s->map_op));
+    LOGW("map",
+         "[%s] Diameter error rc=%u op=%s; sending MAP SystemFailure",
+         s->imsi_str,
+         (unsigned)rc,
+         map_op_str(s->map_op));
     if (s->cmd_test) {
         char buf[48];
         snprintf(buf, sizeof(buf), "diameter_%u", (unsigned)rc);
@@ -1320,7 +1806,8 @@ void map_iwf_diameter_error(struct iwf_runtime *rt, map_session_t *s,
     int map_err = MAP_ERR_SYSTEM_FAILURE;
     if (rc == DIAM_EXP_RC_USER_UNKNOWN)        map_err = MAP_ERR_UNKNOWN_SUBSCRIBER;
     else if (rc == DIAM_EXP_RC_ROAMING_NOT_ALLOWED) map_err = MAP_ERR_ROAMING_NOT_ALLOWED;
-    send_tcap_end_with_error(rt, s, 1, map_err, /*nrc=hlr*/ 1);
+    send_tcap_end_with_error(rt, s, s->peer_invoke_id ? s->peer_invoke_id : 1,
+                             map_err, /*nrc=hlr*/ 1);
 }
 
 /* ====================================================================== */
@@ -1361,6 +1848,7 @@ void map_iwf_on_ttimer_tick(struct iwf_runtime *rt)
     (void)r;
     int killed = map_sess_sweep(time(NULL), map_sess_timeout_hook_cmd, rt);
     if (killed) rt->map->stat_timeouts += (uint64_t)killed;
+    msrn_pool_sweep(time(NULL));
 #ifdef GSUP_PROXY_ENABLED
     gsup_map_proxy_sweep(rt, time(NULL));
 #endif
@@ -1383,9 +1871,11 @@ int map_iwf_init(struct iwf_runtime *rt, int epfd)
     rt->map->ss7.fd     = -1;
 
     map_sess_init();
+    msrn_pool_init(&rt->cfg);
 
     if (ss7_link_init(rt) < 0) {
         LOGE("map", "SS7 link bring-up failed");
+        msrn_pool_shutdown();
         free(rt->map); rt->map = NULL;
         return -1;
     }
@@ -1394,6 +1884,7 @@ int map_iwf_init(struct iwf_runtime *rt, int epfd)
     if (diameter_init(rt) < 0) {
         LOGE("map", "Diameter bring-up failed");
         ss7_link_shutdown(rt);
+        msrn_pool_shutdown();
         free(rt->map); rt->map = NULL;
         return -1;
     }
@@ -1405,6 +1896,7 @@ int map_iwf_init(struct iwf_runtime *rt, int epfd)
         LOGE("map", "timerfd: %s", strerror(errno));
         diameter_shutdown(rt);
         ss7_link_shutdown(rt);
+        msrn_pool_shutdown();
         free(rt->map); rt->map = NULL;
         return -1;
     }
@@ -1461,6 +1953,7 @@ void map_iwf_shutdown(struct iwf_runtime *rt)
     diameter_shutdown(rt);
     ss7_link_shutdown(rt);
     if (rt->map->t_timer_fd >= 0) close(rt->map->t_timer_fd);
+    msrn_pool_shutdown();
     map_sess_shutdown();
     free(rt->map);
     rt->map = NULL;
@@ -1531,8 +2024,10 @@ int map_iwf_cmd_test_sai(struct iwf_runtime *rt,
     s->t_dialogue_ms = 10000;
     map_sess_touch(s);
 
-    LOGI("map", "cmd-test TX AIR imsi=%s tid=0x%08x",
-         s->imsi_str, s->tcap_dialogue_id);
+    LOGI("map",
+         "[%s] cmd-test TX AIR tid=0x%08x",
+         s->imsi_str,
+         s->tcap_dialogue_id);
 
     if (diameter_send_air(rt, s) < 0) {
         cmd_test_abort(s, "air_send_failed");
@@ -1547,6 +2042,6 @@ void map_iwf_sigusr1_test_sai(struct iwf_runtime *rt)
         LOGW("map", "SIGUSR1 cmd-test SAI ignored (MAP-IWF not active)");
         return;
     }
-    LOGI("map", "SIGUSR1: cmd-test SAI imsi=001010000000003");
+    LOGI("map", "[001010000000003] SIGUSR1: cmd-test SAI");
     (void)map_iwf_cmd_test_sai(rt, "001010000000003", -1);
 }

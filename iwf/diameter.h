@@ -229,11 +229,14 @@ int  diameter_get_uint32_avp   (const uint8_t *body, size_t len,
                                 uint32_t code, uint32_t vendor_id,
                                 uint32_t *out_val);
 
-/* Answer an inbound Cancel-Location-Request (HSS -> IWF). */
+/* Answer an inbound Cancel-Location-Request (HSS -> IWF).
+ * origin_host may be NULL → [diameter_s6d] origin_host. For 3GPP
+ * Experimental-Result codes (e.g. 5001 User-Unknown) pass that value as
+ * result_code; base Result-Code is used for 2xxx/3xxx. */
 int  diameter_send_cla_answer  (struct iwf_runtime *rt,
                                 uint32_t hop_by_hop, uint32_t end_to_end,
                                 const char *session_id, uint32_t result_code,
-                                int peer_idx);
+                                const char *origin_host, int peer_idx);
 
 /* Answer an inbound Insert-Subscriber-Data-Request (HSS -> IWF). */
 int  diameter_send_ida_answer (struct iwf_runtime *rt,

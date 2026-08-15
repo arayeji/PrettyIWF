@@ -1,13 +1,15 @@
 /*
  * map_codec.h - MAP (3GPP TS 29.002) BER codec for the IWF.
  *
- * We handle only the five operations our IWF cares about:
+ * We handle only the operations our IWF cares about:
  *
  *   SendAuthenticationInfo       opcode 56  (Authentication info retrieval)
  *   UpdateGprsLocation           opcode 23  (Mobility management)
+ *   UpdateLocation               opcode  2  (MAP-C)
  *   InsertSubscriberData         opcode  7  (Subscriber-data insertion)
  *   CancelLocation               opcode  3
  *   PurgeMS                      opcode 67
+ *   ProvideRoamingNumber         opcode  4  (MSRN allocation)
  *
  * Each operation has a Req struct populated by the decoder and an Encoder
  * helper to build the ReturnResult parameters going back. The "raw" message
@@ -37,6 +39,7 @@
 /* MAP operation codes (TS 29.002 §17.5 - "local value" form). */
 #define MAP_OP_CODE_UPDATE_LOCATION         2
 #define MAP_OP_CODE_CANCEL_LOCATION         3
+#define MAP_OP_CODE_PROVIDE_ROAMING_NUMBER  4
 #define MAP_OP_CODE_INSERT_SUBSCRIBER_DATA  7
 #define MAP_OP_CODE_UPDATE_GPRS_LOCATION    23
 #define MAP_OP_CODE_SEND_AUTH_INFO          56
@@ -47,11 +50,13 @@
 /* MAP error codes we may receive/send (TS 29.002 §17.6). */
 #define MAP_ERR_UNKNOWN_SUBSCRIBER          1
 #define MAP_ERR_ROAMING_NOT_ALLOWED         8
+#define MAP_ERR_FACILITY_NOT_SUPPORTED      21
+#define MAP_ERR_DELIVERY_FAILURE            32
 #define MAP_ERR_SYSTEM_FAILURE              34
 #define MAP_ERR_DATA_MISSING                35
 #define MAP_ERR_UNEXPECTED_DATA_VALUE       36
+#define MAP_ERR_NO_ROAMING_NUMBER_AVAILABLE 39
 #define MAP_ERR_AUTHENTICATION_FAILURE      52
-#define MAP_ERR_DELIVERY_FAILURE            32
 
 /* ----- decoded request views -------------------------------------- */
 
@@ -87,6 +92,15 @@ typedef struct {
     uint8_t  sgsn_addr_len;
 } map_ugl_req_t;
 
+/* MAP-C UpdateLocationArg (networkLocUpContext). */
+typedef struct {
+    uint8_t  imsi_bcd[8];
+    uint8_t  imsi_bcd_len;
+    char     imsi_str[16];
+    char     msc_number[24];   /* E.164 digits from msc-Number */
+    char     vlr_number[24];   /* E.164 digits from vlr-Number */
+} map_ul_req_t;
+
 typedef struct {
     uint8_t  imsi_bcd[8];
     uint8_t  imsi_bcd_len;
@@ -101,12 +115,27 @@ typedef struct {
     char     imsi_str[16];
 } map_purge_req_t;
 
+typedef struct {
+    uint8_t  imsi_bcd[8];
+    uint8_t  imsi_bcd_len;
+    char     imsi_str[16];
+    char     msc_number[24];            /* E.164 digits */
+    char     msisdn[24];                /* optional */
+    bool     suppression_of_announcement;
+    bool     have_gsm_bearer_cap;       /* present but not fully decoded */
+} map_prn_req_t;
+
 /* ----- decoders ----------------------------------------------------- */
 
 int map_decode_sai_arg     (const uint8_t *p, size_t n, map_sai_req_t *out);
 int map_decode_ugl_arg     (const uint8_t *p, size_t n, map_ugl_req_t *out);
+int map_decode_ul_arg      (const uint8_t *p, size_t n, map_ul_req_t  *out);
 int map_decode_cl_arg      (const uint8_t *p, size_t n, map_cl_req_t  *out);
 int map_decode_purge_arg   (const uint8_t *p, size_t n, map_purge_req_t *out);
+int map_decode_prn_arg     (const uint8_t *p, size_t n, map_prn_req_t *out);
+
+/* ProvideRoamingNumberRes: roamingNumber ISDN-AddressString. */
+int map_encode_prn_res(const char *msrn_digits, uint8_t *out, size_t out_cap);
 
 /* MAP SMS (TS 29.002) — used by sms_iwf when SMS_IWF_ENABLED. */
 int map_decode_sri_sm_arg(const uint8_t *p, size_t n, char *msisdn_out, size_t cap);
@@ -209,6 +238,7 @@ typedef enum {
     MAP_AC_GPRS_LOCATION_CANCEL_V3  = 4, /* cancelLocation over Gr         */
     MAP_AC_MS_PURGING_V3            = 5, /* purgeMS                        */
     MAP_AC_NETWORK_LOC_UP_V3        = 6, /* updateLocation (MAP-C)         */
+    MAP_AC_ROAMING_NUMBER_ENQUIRY_V3 = 7, /* provideRoamingNumber           */
 } map_app_ctx_t;
 
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap);

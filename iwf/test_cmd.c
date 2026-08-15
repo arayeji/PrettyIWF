@@ -2,12 +2,15 @@
  * test_cmd.c - /tmp/iwf_cmd.sock command interface.
  *
  * Line-oriented commands (newline-terminated):
- *   sai <IMSI>\n  -> outbound Diameter AIR (same internal path as MAP SAI from SGSN).
+ *   sai <IMSI>\n              -> outbound Diameter AIR (MAP SAI path)
+ *   msrn_lookup <MSRN>\n      -> resolve MSRN↔IMSI binding (SIP glue)
+ *   msrn_show\n               -> dump active MSRN bindings
  */
 
 #include "test_cmd.h"
 
 #include "map_iwf.h"
+#include "msrn_pool.h"
 #include "runtime.h"
 #include "logging.h"
 
@@ -128,8 +131,67 @@ static void handle_accepted_client(struct iwf_runtime *rt, int cfd)
     char *pb = buf;
     while (*pb && isspace((unsigned char)*pb)) pb++;
 
+    if (strncasecmp(pb, "msrn_show", 9) == 0 &&
+        (pb[9] == '\0' || isspace((unsigned char)pb[9]))) {
+        char dump[4096];
+        msrn_pool_show(dump, sizeof(dump));
+        char line[4200];
+        int wn = snprintf(line, sizeof(line), "OK\n%s", dump);
+        if (wn > 0 && (size_t)wn < sizeof(line))
+            (void)wr_all(cfd, line, (size_t)wn);
+        else
+            test_cmd_reply_err(cfd, "show_overflow");
+        close(cfd);
+        return;
+    }
+
+    if (strncasecmp(pb, "msrn_lookup", 11) == 0 &&
+        (pb[11] == '\0' || isspace((unsigned char)pb[11]))) {
+        pb += 11;
+        while (*pb && isspace((unsigned char)*pb)) pb++;
+        size_t dl = strlen(pb);
+        if (dl == 0 || dl >= MSRN_DIGITS_MAX) {
+            test_cmd_reply_err(cfd, "usage_msrn_lookup_<MSRN>");
+            close(cfd);
+            return;
+        }
+        for (size_t i = 0; i < dl; i++) {
+            if (!isdigit((unsigned char)pb[i])) {
+                test_cmd_reply_err(cfd, "msrn_digits_only");
+                close(cfd);
+                return;
+            }
+        }
+        msrn_binding_t b;
+        bool consume = rt->cfg.map_msrn_consume_on_lookup != 0;
+        int rc = msrn_pool_lookup(pb, consume, &b);
+        if (rc == -2) {
+            test_cmd_reply_err(cfd, "expired");
+            close(cfd);
+            return;
+        }
+        if (rc < 0) {
+            test_cmd_reply_err(cfd, "not_found");
+            close(cfd);
+            return;
+        }
+        char line[320];
+        int wn = snprintf(line, sizeof(line),
+                          "OK imsi=%s msisdn=%s pool=%s msc=%s tid=0x%08x\n",
+                          b.imsi, b.msisdn, b.pool_name,
+                          b.msc_number[0] ? b.msc_number : "-",
+                          b.dialogue_id);
+        if (wn > 0 && (size_t)wn < sizeof(line))
+            (void)wr_all(cfd, line, (size_t)wn);
+        else
+            test_cmd_reply_err(cfd, "encode_response");
+        close(cfd);
+        return;
+    }
+
     /* "sai" + IMSI tail */
-    if (strncasecmp(pb, "sai", 3) != 0) {
+    if (strncasecmp(pb, "sai", 3) != 0 ||
+        (pb[3] != '\0' && !isspace((unsigned char)pb[3]))) {
         test_cmd_reply_err(cfd, "unknown_command");
         close(cfd);
         return;

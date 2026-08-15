@@ -25,16 +25,34 @@ typedef struct {
     uint16_t    sgwc_port;
 
     /* [smf] PGW-C / SMF GTP-C (S5/S8) — F-TEID IE instance 1 in Create Session Request.
-     * Used as the PGW when the HSS does not advertise one (or when
-     * pgw_from_subscription = 0). Optional if every subscriber's HSS returns
-     * a PGW in ULA Subscription-Data (MIP6-Agent-Info). */
+     * Used when pgw_select includes smf. Optional if ULA / per-partner PGW covers all. */
     char        smf_ip[64];
     uint32_t    smf_teid;         /* host byte order; SGW uses this toward SMF */
 
-    /* [iwf] pgw_from_subscription — when set (default), prefer the PGW the
-     * home HSS advertised per (IMSI, APN) in ULA over the static [smf]. This
-     * enables home-routed roaming and lets local users skip [smf]. */
+    /* [iwf] pgw_from_subscription — legacy boolean. When 0 and pgw_select is
+     * unset, forces order static,dns,smf (skip ULA MIP). Prefer pgw_select. */
     int         pgw_from_subscription;
+
+    /* PGW Create-Session source order (tried until one yields IPv4):
+     *   mip    — ULA MIP6-Agent-Info IPv4 (MIP-Home-Agent-Address)
+     *   dns    — DNS-resolve FQDN from ULA MIP-Home-Agent-Host, else
+     *            [roaming_hlr] mncNNN_pgw_fqdn, else 3GPP APN FQDN
+     *            <apn>.apn.epc.mncXXX.mccYYY.3gppnetwork.org
+     *   static — [roaming_hlr] mncNNN_pgw_ip (literal, no DNS)
+     *   smf    — [smf] ip
+     * Default: mip,dns,static,smf. Override globally via [iwf] pgw_select
+     * or per partner via [roaming_hlr] mncNNN_pgw_select. */
+#define IWF_PGW_SRC_MIP     1
+#define IWF_PGW_SRC_DNS     2
+#define IWF_PGW_SRC_STATIC  3
+#define IWF_PGW_SRC_SMF     4
+#define IWF_PGW_SELECT_MAX  4
+    uint8_t     pgw_select[IWF_PGW_SELECT_MAX];
+    int         pgw_n_select;           /* 1..4 */
+    int         pgw_select_explicit;    /* 1 if [iwf] pgw_select was set */
+
+    /* [iwf] pgw_cache_ttl_s — subscription PGW cache invalidation (default 300). */
+    int         pgw_cache_ttl_s;
 
     /* [logging] */
     char        log_level[16];
@@ -53,6 +71,23 @@ typedef struct {
     uint8_t     map_local_ssn;            /* default 149 (SGSN)            */
     int         map_t_dialogue_ms;        /* TCAP T-timeout default        */
     char        map_cmd_sock_path[128];   /* UNIX cmd socket (SAI test); default /tmp/iwf_cmd.sock */
+
+    /* MSRN pools for ProvideRoamingNumber (optional; empty = feature off). */
+#define IWF_MSRN_MAX_POOLS    4
+#define IWF_MSRN_MAX_MSC_MAPS 8
+    struct {
+        char     name[16];              /* thr1 / thr2 */
+        char     start[20];             /* inclusive E.164 digits */
+        char     end[20];
+    } map_msrn_pools[IWF_MSRN_MAX_POOLS];
+    int         map_msrn_n_pools;
+    struct {
+        char     msc_gt[24];            /* PRN msc-Number digits */
+        char     pool_name[16];
+    } map_msrn_msc_map[IWF_MSRN_MAX_MSC_MAPS];
+    int         map_msrn_n_msc_map;
+    int         map_msrn_ttl_sec;       /* default 30 */
+    int         map_msrn_consume_on_lookup; /* 1 = free on msrn_lookup (default) */
 
     /* [stp] */
     char        stp_local_ip[64];   /* optional: source IPv4 for M3UA SCTP (0.0.0.0 = any) */
@@ -126,11 +161,13 @@ typedef struct {
         int     use_diameter;       /* 1 = S6d via DRA (not MAP) for this MNC   */
         char    dest_realm[128];    /* partner HSS realm (DRA routing)          */
         char    dest_host[128];     /* optional pinned HSS Origin-Host          */
-        /* Preconfigured PGW for this partner, used as the Create Session PGW
-         * (S5/S8-C F-TEID) when the HSS sends no PGW in ULA. IP and/or FQDN
-         * (FQDN is DNS-resolved). Falls through to global [smf] when unset. */
+        /* Preconfigured PGW for this partner (S5/S8-C F-TEID). Used when
+         * pgw_select includes static (pgw_ip) and/or dns (pgw_fqdn). */
         char    pgw_ip[64];
         char    pgw_fqdn[256];
+        /* Optional per-partner override of [iwf] pgw_select (same tokens). */
+        uint8_t pgw_select[IWF_PGW_SELECT_MAX];
+        int     pgw_n_select;           /* 0 = inherit global */
     } gsup_roam_routes[GSUP_MAX_ROAM_ROUTES];
     int         gsup_n_roam_routes;
 
@@ -179,5 +216,10 @@ void iwf_config_dump(const iwf_config_t *c);
  * may be NULL. Always compiled (no GSUP/MAP dependency). */
 int  iwf_config_roam_pgw(const iwf_config_t *cfg, const char *imsi,
                          const char **out_ip, const char **out_fqdn);
+
+/* Effective PGW source order for this IMSI (partner override or global).
+ * Writes up to IWF_PGW_SELECT_MAX tokens into out[]; returns count (>= 1). */
+int  iwf_config_pgw_select(const iwf_config_t *cfg, const char *imsi,
+                           uint8_t out[IWF_PGW_SELECT_MAX]);
 
 #endif /* IWF_CONFIG_H */
