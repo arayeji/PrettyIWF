@@ -180,7 +180,7 @@ static void map_sess_store_peer(map_session_t *s, const ss7_sccp_addr_t *calling
     s->have_peer_sccp = true;
 }
 
-/* Reply CdPA = inbound CgPA; CgPA = local GT, HLR SSN when peer is VLR/MSC. */
+/* Reply CdPA = inbound CgPA; CgPA = local GT, HLR SSN when peer is VLR/MSC/SGSN. */
 static int map_send_tcap_to_peer(struct iwf_runtime *rt, map_session_t *s,
                                  const uint8_t *out, size_t n)
 {
@@ -193,8 +193,11 @@ static int map_send_tcap_to_peer(struct iwf_runtime *rt, map_session_t *s,
         called.ssn = SS7_SSN_SGSN;
 
     ss7_link_make_local_addr(rt, &calling);
+    /* Acting as HLR: force CgPA SSN=6 for VLR/MSC/SGSN peers (not HLR↔HLR). */
     if (s->have_peer_sccp &&
-        (s->peer_sccp.ssn == SS7_SSN_VLR || s->peer_sccp.ssn == SS7_SSN_MSC))
+        (s->peer_sccp.ssn == SS7_SSN_VLR ||
+         s->peer_sccp.ssn == SS7_SSN_MSC ||
+         s->peer_sccp.ssn == SS7_SSN_SGSN))
         calling.ssn = SS7_SSN_HLR;
 
     return ss7_link_send_tcap_ex(rt, &called, &calling, out, n);
