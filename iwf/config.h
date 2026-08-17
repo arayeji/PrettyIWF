@@ -69,6 +69,12 @@ typedef struct {
     char        map_local_gt[24];         /* Global Title (E.164 digits)   */
     char        map_local_pc[16];         /* dotted SS7 point code         */
     uint8_t     map_local_ssn;            /* default 149 (SGSN)            */
+    /* SCCP routing indicator for CdPA/CgPA when a GT is present.
+     * IWF_SCCP_RI_GT  (default): Route on GT (osmo-stp GTT).
+     * IWF_SCCP_RI_SSN: Route on SSN+PC; GT digits still included in the address. */
+#define IWF_SCCP_RI_GT  0
+#define IWF_SCCP_RI_SSN 1
+    int         map_sccp_ri;              /* default IWF_SCCP_RI_GT */
     int         map_t_dialogue_ms;        /* TCAP T-timeout default        */
     char        map_cmd_sock_path[128];   /* UNIX cmd socket (SAI test); default /tmp/iwf_cmd.sock */
 

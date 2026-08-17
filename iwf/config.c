@@ -44,6 +44,7 @@ static void defaults(iwf_config_t *c)
     /* MAP-IWF: disabled by default - existing GTP-only deployments need no changes. */
     c->map_iwf_enabled    = 0;
     c->map_local_ssn      = 149;
+    c->map_sccp_ri        = IWF_SCCP_RI_GT;
     c->map_t_dialogue_ms  = 10000;
     c->map_msrn_ttl_sec   = 30;
     c->map_msrn_consume_on_lookup = 1;
@@ -462,7 +463,16 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "local_gt"))       copy_str(out->map_local_gt, sizeof(out->map_local_gt), val);
             else if (!strcmp(key, "local_pc"))       copy_str(out->map_local_pc, sizeof(out->map_local_pc), val);
             else if (!strcmp(key, "local_ssn"))      out->map_local_ssn    = (uint8_t)atoi(val);
-            else if (!strcmp(key, "t_dialogue_ms"))  out->map_t_dialogue_ms = atoi(val);
+            else if (!strcmp(key, "sccp_ri")) {
+                /* gt = Route on GT when GT present (default); ssn = Route on SSN+PC. */
+                if (!strcasecmp(val, "gt") || !strcmp(val, "0"))
+                    out->map_sccp_ri = IWF_SCCP_RI_GT;
+                else if (!strcasecmp(val, "ssn") || !strcasecmp(val, "ssn_pc") ||
+                         !strcmp(val, "1"))
+                    out->map_sccp_ri = IWF_SCCP_RI_SSN;
+                else
+                    LOGW("config", "bad [map_iwf].sccp_ri '%s' (want gt|ssn)", val);
+            } else if (!strcmp(key, "t_dialogue_ms"))  out->map_t_dialogue_ms = atoi(val);
             else if (!strcmp(key, "cmd_sock"))
                 copy_str(out->map_cmd_sock_path, sizeof(out->map_cmd_sock_path), val);
             else if (!strcmp(key, "msrn_ttl_sec")) {
@@ -673,10 +683,12 @@ void iwf_config_dump(const iwf_config_t *c)
          c->log_level, c->log_file);
 
     if (c->map_iwf_enabled) {
-        LOGI("config", "map_iwf: local_gt=%s local_pc=%s ssn=%u t_dialogue=%dms cmd_sock=%s",
+        LOGI("config", "map_iwf: local_gt=%s local_pc=%s ssn=%u sccp_ri=%s t_dialogue=%dms cmd_sock=%s",
              c->map_local_gt[0] ? c->map_local_gt : "(unset)",
              c->map_local_pc[0] ? c->map_local_pc : "(unset)",
-             (unsigned)c->map_local_ssn, c->map_t_dialogue_ms,
+             (unsigned)c->map_local_ssn,
+             c->map_sccp_ri == IWF_SCCP_RI_SSN ? "ssn" : "gt",
+             c->map_t_dialogue_ms,
              c->map_cmd_sock_path[0] ? c->map_cmd_sock_path : "(default)");
         if (c->map_msrn_n_pools > 0) {
             LOGI("config",
