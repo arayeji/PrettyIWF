@@ -247,12 +247,15 @@ static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *o
     memset(out, 0, sizeof(*out));
     if (!in || !out) return;
     out->ssn = in->ssn;
-    out->pc  = in->point_code;
-    out->presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
+    out->presence = OSMO_SCCP_ADDR_T_SSN;
+    /* sccp_ri=ssn: RI=SSN on the wire but omit PC from the SCCP address
+     * (PCI=0), matching Irancell / allstp5.pcap.  M3UA still uses STP DPC.
+     * sccp_ri=gt: keep PC in the address (default / GTT path). */
+    if (sccp_ri != IWF_SCCP_RI_SSN) {
+        out->pc = in->point_code;
+        out->presence |= OSMO_SCCP_ADDR_T_PC;
+    }
     if (in->have_gt) {
-        /* Always include GT digits when present.  RI depends on [map_iwf].sccp_ri:
-         * gt  — Route on GT so osmo-stp GTT can translate (default).
-         * ssn — Route on SSN+PC (partners that require RI=SSN, e.g. Irancell). */
         ss7_put_gt_in_osmo_addr(in, out);
         out->ri = (sccp_ri == IWF_SCCP_RI_SSN) ? OSMO_SCCP_RI_SSN_PC
                                               : OSMO_SCCP_RI_GT;
@@ -266,10 +269,17 @@ static void ss7_encode_outbound_called(const ss7_sccp_addr_t *in,
                                        uint32_t stp_dpc,
                                        int sccp_ri)
 {
-    /* CDPA PC=[stp] remote_pc so MTP delivers to the STP; GT digits stay in
-     * the address when present.  RI follows [map_iwf].sccp_ri. */
+    /* RI follows [map_iwf].sccp_ri.  For gt: set CDPA PC=[stp] remote_pc so
+     * the SCCP address carries the STP PC; MTP/M3UA still routes via STP
+     * either way.  For ssn: leave PC out of the address (PCI=0). */
     ss7_to_osmo_addr(in, out, sccp_ri);
-    out->pc = osmo_ss7_pc_is_valid(stp_dpc) ? stp_dpc : 0;
+    if (sccp_ri != IWF_SCCP_RI_SSN) {
+        out->pc = osmo_ss7_pc_is_valid(stp_dpc) ? stp_dpc : 0;
+        out->presence |= OSMO_SCCP_ADDR_T_PC;
+    } else {
+        out->pc = 0;
+        out->presence &= ~OSMO_SCCP_ADDR_T_PC;
+    }
     if (in && in->have_gt) {
         out->presence |= OSMO_SCCP_ADDR_T_GT;
         out->ri = (sccp_ri == IWF_SCCP_RI_SSN) ? OSMO_SCCP_RI_SSN_PC
@@ -616,12 +626,14 @@ int ss7_link_init(struct iwf_runtime *rt)
     ctx->local_pc = default_pc;
     ctx->stp_dpc  = pack_dotted_pc(rt->cfg.stp_remote_pc);
     ctx->sccp_ri  = rt->cfg.map_sccp_ri;
-    LOGI("ss7", "outbound MAP: SCCP CDPA/CgPA sccp_ri=%s (GT digits %s), CDPA PC=%s",
-         ctx->sccp_ri == IWF_SCCP_RI_SSN ? "ssn" : "gt",
-         ctx->sccp_ri == IWF_SCCP_RI_SSN ? "included, RI=SSN+PC" : "RI=GT when present",
-         osmo_ss7_pc_is_valid(ctx->stp_dpc)
-             ? rt->cfg.stp_remote_pc
-             : "0");
+    if (ctx->sccp_ri == IWF_SCCP_RI_SSN)
+        LOGI("ss7", "outbound MAP: sccp_ri=ssn RI=SSN, omit PC from CdPA/CgPA "
+             "(PCI=0; M3UA still uses STP DPC=%s)",
+             osmo_ss7_pc_is_valid(ctx->stp_dpc) ? rt->cfg.stp_remote_pc : "0");
+    else
+        LOGI("ss7", "outbound MAP: sccp_ri=gt RI=GT when GT present, "
+             "CdPA PC=%s (MTP to STP)",
+             osmo_ss7_pc_is_valid(ctx->stp_dpc) ? rt->cfg.stp_remote_pc : "0");
 
     rt->map->ss7.opaque = ctx;
     rt->map->ss7.active = true;
@@ -665,11 +677,14 @@ static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
     struct osmo_sccp_addr calling_addr = {0};
     ss7_encode_outbound_called(called, &called_addr, ctx->stp_dpc, ctx->sccp_ri);
     ss7_to_osmo_addr(calling, &calling_addr, ctx->sccp_ri);
-    if (osmo_ss7_pc_is_valid(ctx->local_pc))
+    /* gt: put local PC in CgPA.  ssn: leave PC out (PCI=0), RI=SSN. */
+    if (ctx->sccp_ri != IWF_SCCP_RI_SSN && osmo_ss7_pc_is_valid(ctx->local_pc)) {
         calling_addr.pc = ctx->local_pc;
+        calling_addr.presence |= OSMO_SCCP_ADDR_T_PC;
+    }
     /* Partners often copy CgPA into the CdPA of their answer.  When sccp_ri=gt,
      * RI=GT makes the return path GT-routed (local_gt already in CgPA).
-     * When sccp_ri=ssn, keep RI=SSN+PC while still advertising GT digits. */
+     * When sccp_ri=ssn, RI=SSN without PC while still advertising GT digits. */
     if (calling && calling->have_gt) {
         calling_addr.presence |= OSMO_SCCP_ADDR_T_GT;
         calling_addr.ri = (ctx->sccp_ri == IWF_SCCP_RI_SSN) ? OSMO_SCCP_RI_SSN_PC

@@ -6,10 +6,10 @@
  * Server Process) in IPSP-client mode, ASP-UP -> ACTIVE.
  *
  * Outbound MAP SCCP addressing includes GT digits (when configured) plus
- * SSN/PC.  Routing indicator is configurable via [map_iwf].sccp_ri:
- *   gt  (default) — RI=GT when a GT is present (osmo-stp GTT)
- *   ssn           — RI=SSN+PC even when GT digits are present
- * Called-party DPC is [stp] remote_pc so MTP delivers to the STP.
+ * SSN.  Routing indicator is configurable via [map_iwf].sccp_ri:
+ *   gt  (default) — RI=GT when a GT is present (osmo-stp GTT); PC in addr
+ *   ssn           — RI=SSN, SSN+GT digits, no PC in addr (PCI=0; Irancell)
+ * M3UA OPC/DPC still use [stp] remote_pc at the MTP layer either way.
  *
  * Build-time switch
  * -----------------
