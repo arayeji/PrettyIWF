@@ -5,9 +5,11 @@
  * association. M3UA is the underlying transport; we run as an ASP (Application
  * Server Process) in IPSP-client mode, ASP-UP -> ACTIVE.
  *
- * Outbound MAP toward a partner HLR GT uses SCCP RI=PC+SSN (libosmo cannot
- * route RI=GT locally).  The called-party GT is included for osmo-stp GTT;
- * DPC is [stp] remote_pc (or 0 via the simple_client default route).
+ * Outbound MAP SCCP addressing includes GT digits (when configured) plus
+ * SSN/PC.  Routing indicator is configurable via [map_iwf].sccp_ri:
+ *   gt  (default) — RI=GT when a GT is present (osmo-stp GTT)
+ *   ssn           — RI=SSN+PC even when GT digits are present
+ * Called-party DPC is [stp] remote_pc so MTP delivers to the STP.
  *
  * Build-time switch
  * -----------------

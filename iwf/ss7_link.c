@@ -198,6 +198,7 @@ struct ss7_impl_ctx {
     int                    eventfd_to_main;       /* main thread polls this */
     uint32_t               local_pc;              /* packed [map_iwf] local_pc */
     uint32_t               stp_dpc;               /* packed [stp] remote_pc (MTP routes) */
+    int                    sccp_ri;               /* IWF_SCCP_RI_GT or IWF_SCCP_RI_SSN */
 };
 
 bool ss7_link_is_active(const struct iwf_runtime *rt)
@@ -240,7 +241,8 @@ static void ss7_put_gt_in_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_
     out->gt.digits[sizeof(out->gt.digits) - 1] = '\0';
 }
 
-static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *out)
+static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *out,
+                             int sccp_ri)
 {
     memset(out, 0, sizeof(*out));
     if (!in || !out) return;
@@ -248,11 +250,12 @@ static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *o
     out->pc  = in->point_code;
     out->presence = OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC;
     if (in->have_gt) {
-        /* osmo-stp GTT (libosmo-sigtran feature/sccp-gtt) dispatches on the
-         * called-party RI: RI=SSN+PC does a local-subsystem lookup and fails
-         * with UNEQUIPPED_USER before translation. Route on GT when present. */
+        /* Always include GT digits when present.  RI depends on [map_iwf].sccp_ri:
+         * gt  — Route on GT so osmo-stp GTT can translate (default).
+         * ssn — Route on SSN+PC (partners that require RI=SSN, e.g. Irancell). */
         ss7_put_gt_in_osmo_addr(in, out);
-        out->ri = OSMO_SCCP_RI_GT;
+        out->ri = (sccp_ri == IWF_SCCP_RI_SSN) ? OSMO_SCCP_RI_SSN_PC
+                                              : OSMO_SCCP_RI_GT;
     } else {
         out->ri = OSMO_SCCP_RI_SSN_PC;
     }
@@ -260,15 +263,17 @@ static void ss7_to_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *o
 
 static void ss7_encode_outbound_called(const ss7_sccp_addr_t *in,
                                        struct osmo_sccp_addr *out,
-                                       uint32_t stp_dpc)
+                                       uint32_t stp_dpc,
+                                       int sccp_ri)
 {
-    /* CDPA PC=[stp] remote_pc so MTP delivers to the STP; with have_gt,
-     * ss7_to_osmo_addr sets RI=GT so the STP runs GTT on the GT digits. */
-    ss7_to_osmo_addr(in, out);
+    /* CDPA PC=[stp] remote_pc so MTP delivers to the STP; GT digits stay in
+     * the address when present.  RI follows [map_iwf].sccp_ri. */
+    ss7_to_osmo_addr(in, out, sccp_ri);
     out->pc = osmo_ss7_pc_is_valid(stp_dpc) ? stp_dpc : 0;
     if (in && in->have_gt) {
-        out->ri = OSMO_SCCP_RI_GT;
         out->presence |= OSMO_SCCP_ADDR_T_GT;
+        out->ri = (sccp_ri == IWF_SCCP_RI_SSN) ? OSMO_SCCP_RI_SSN_PC
+                                              : OSMO_SCCP_RI_GT;
     }
 }
 
@@ -610,7 +615,10 @@ int ss7_link_init(struct iwf_runtime *rt)
 
     ctx->local_pc = default_pc;
     ctx->stp_dpc  = pack_dotted_pc(rt->cfg.stp_remote_pc);
-    LOGI("ss7", "outbound MAP: SCCP CDPA GT+SSN, CDPA PC=%s (STP local MTP for GTT)",
+    ctx->sccp_ri  = rt->cfg.map_sccp_ri;
+    LOGI("ss7", "outbound MAP: SCCP CDPA/CgPA sccp_ri=%s (GT digits %s), CDPA PC=%s",
+         ctx->sccp_ri == IWF_SCCP_RI_SSN ? "ssn" : "gt",
+         ctx->sccp_ri == IWF_SCCP_RI_SSN ? "included, RI=SSN+PC" : "RI=GT when present",
          osmo_ss7_pc_is_valid(ctx->stp_dpc)
              ? rt->cfg.stp_remote_pc
              : "0");
@@ -655,15 +663,17 @@ static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
 
     struct osmo_sccp_addr called_addr = {0};
     struct osmo_sccp_addr calling_addr = {0};
-    ss7_encode_outbound_called(called, &called_addr, ctx->stp_dpc);
-    ss7_to_osmo_addr(calling, &calling_addr);
+    ss7_encode_outbound_called(called, &called_addr, ctx->stp_dpc, ctx->sccp_ri);
+    ss7_to_osmo_addr(calling, &calling_addr, ctx->sccp_ri);
     if (osmo_ss7_pc_is_valid(ctx->local_pc))
         calling_addr.pc = ctx->local_pc;
-    /* Partners copy CgPA into the CdPA of their answer — RI=GT makes the
-     * return path GT-routed (local_gt already in CgPA when have_gt). */
+    /* Partners often copy CgPA into the CdPA of their answer.  When sccp_ri=gt,
+     * RI=GT makes the return path GT-routed (local_gt already in CgPA).
+     * When sccp_ri=ssn, keep RI=SSN+PC while still advertising GT digits. */
     if (calling && calling->have_gt) {
-        calling_addr.ri = OSMO_SCCP_RI_GT;
         calling_addr.presence |= OSMO_SCCP_ADDR_T_GT;
+        calling_addr.ri = (ctx->sccp_ri == IWF_SCCP_RI_SSN) ? OSMO_SCCP_RI_SSN_PC
+                                                           : OSMO_SCCP_RI_GT;
     }
 
     int rc = osmo_sccp_tx_unitdata_msg(user, &calling_addr, &called_addr, msg);
