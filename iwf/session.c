@@ -163,8 +163,11 @@ sess_t *sess_create(const char *imsi, uint8_t nsapi)
 {
     sess_t *existing = sess_find(imsi, nsapi);
     if (existing) {
-        LOGD("session", "reusing existing session imsi=%s nsapi=%u state=%s",
-             imsi, nsapi, sess_state_str(existing->state));
+        LOGD("session",
+         "[%s] reusing existing session nsapi=%u state=%s",
+         imsi,
+         nsapi,
+         sess_state_str(existing->state));
         return existing;
     }
 
@@ -183,16 +186,23 @@ sess_t *sess_create(const char *imsi, uint8_t nsapi)
     teid_index_insert(&g_iwf_c_idx,  s->iwf_ctrl_teid, s);
     teid_index_insert(&g_iwf_s4_idx, s->iwf_s4_c_teid, s);
 
-    LOGI("session", "created imsi=%s nsapi=%u iwf_c=0x%08x iwf_s4=0x%08x",
-         imsi, nsapi, s->iwf_ctrl_teid, s->iwf_s4_c_teid);
+    LOGI("session",
+         "[%s] created nsapi=%u iwf_c=0x%08x iwf_s4=0x%08x",
+         imsi,
+         nsapi,
+         s->iwf_ctrl_teid,
+         s->iwf_s4_c_teid);
     return s;
 }
 
 void sess_remove(sess_t *s)
 {
     if (!s) return;
-    LOGI("session", "removing imsi=%s nsapi=%u state=%s",
-         s->key.imsi, s->key.nsapi, sess_state_str(s->state));
+    LOGI("session",
+         "[%s] removing nsapi=%u state=%s",
+         s->key.imsi,
+         s->key.nsapi,
+         sess_state_str(s->state));
     teid_index_remove(&g_iwf_c_idx,  s->iwf_ctrl_teid);
     teid_index_remove(&g_iwf_s4_idx, s->iwf_s4_c_teid);
     HASH_DEL(g_by_key, s);
@@ -226,9 +236,11 @@ void sess_sweep(time_t now, int timeout_s)
     HASH_ITER(hh, g_by_key, s, tmp) {
         if ((now - s->last_activity) > timeout_s) {
             LOGW("session",
-                 "timeout imsi=%s nsapi=%u state=%s idle=%lds",
-                 s->key.imsi, s->key.nsapi, sess_state_str(s->state),
-                 (long)(now - s->last_activity));
+         "[%s] timeout nsapi=%u state=%s idle=%lds",
+         s->key.imsi,
+         s->key.nsapi,
+         sess_state_str(s->state),
+         (long)(now - s->last_activity));
             sess_remove(s);
         }
     }
