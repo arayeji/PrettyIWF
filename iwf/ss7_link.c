@@ -389,6 +389,14 @@ static void deliver_unitdata(struct iwf_runtime *rt, ss7_recv_cb_t cb,
     msgb_free(msg);
 }
 
+static void log_sccp_notice(const char *tag, struct osmo_prim_hdr *oph)
+{
+    /* UDTS/XUDTS → N-NOTICE; cause is Q.713 return cause (enum sccp_return_cause). */
+    struct osmo_scu_prim *scu = (struct osmo_scu_prim *)oph;
+    LOGW("ss7", "%s SCCP N-NOTICE (UDTS/XUDTS return) cause=%u",
+         tag ? tag : "ss7", (unsigned)scu->u.notice.cause);
+}
+
 static int sccp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
 {
     /* libosmo passes the osmo_sccp_user* as priv — NOT set_priv(). */
@@ -405,6 +413,13 @@ static int sccp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
         struct osmo_scu_prim *scu = (struct osmo_scu_prim *)oph;
         deliver_unitdata(rt, rt->map->ss7.recv_cb,
                          &scu->u.unitdata.calling_addr, oph->msg);
+        return 0;
+    }
+    if (oph->sap == SCCP_SAP_USER &&
+        oph->primitive == (unsigned int)OSMO_SCU_PRIM_N_NOTICE &&
+        oph->operation == PRIM_OP_INDICATION) {
+        log_sccp_notice("map", oph);
+        if (oph->msg) msgb_free(oph->msg);
         return 0;
     }
     if (oph->msg) msgb_free(oph->msg);
@@ -434,6 +449,13 @@ static int sccp_prim_cb_hlr(struct osmo_prim_hdr *oph, void *priv)
         struct osmo_scu_prim *scu = (struct osmo_scu_prim *)oph;
         deliver_unitdata(rt, ctx->recv_cb_hlr,
                          &scu->u.unitdata.calling_addr, oph->msg);
+        return 0;
+    }
+    if (oph->sap == SCCP_SAP_USER &&
+        oph->primitive == (unsigned int)OSMO_SCU_PRIM_N_NOTICE &&
+        oph->operation == PRIM_OP_INDICATION) {
+        log_sccp_notice("hlr", oph);
+        if (oph->msg) msgb_free(oph->msg);
         return 0;
     }
     if (oph->msg) msgb_free(oph->msg);
@@ -676,7 +698,11 @@ static int ss7_encode_sccp_udt(struct msgb *msg,
     const unsigned hdr_off = (unsigned)msgb_length(msg);
     uint8_t *hdr = msgb_put(msg, 5);
     hdr[0] = SCCP_MSG_TYPE_UDT;
-    hdr[1] = 0; /* protocol class 0, no return-on-error */
+    /* Q.713 §3.6 / Osmocom sccp_types.h: low nibble = class 0,
+     * high nibble = message handling "return message on error" (0x8 → 0x80).
+     * Wireshark: Protocol Class 0, Message handling = return on error. */
+    hdr[1] = (uint8_t)((SCCP_PROTOCOL_RETURN_MESSAGE << 4) |
+                       SCCP_PROTOCOL_CLASS_0);
 
     unsigned len_cd_off = (unsigned)msgb_length(msg);
     msgb_put(msg, 1);
