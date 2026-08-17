@@ -29,6 +29,7 @@ typedef struct subscr_entry {
 } subscr_entry_t;
 
 static subscr_entry_t *g_by_imsi = NULL;
+static int g_ttl_s = 300;   /* default 5 minutes */
 
 void subscr_cache_init(void)
 {
@@ -44,11 +45,44 @@ void subscr_cache_shutdown(void)
     }
 }
 
+void subscr_cache_set_ttl(int ttl_s)
+{
+    g_ttl_s = (ttl_s > 0) ? ttl_s : 300;
+}
+
+int subscr_cache_get_ttl(void)
+{
+    return g_ttl_s;
+}
+
 static subscr_entry_t *find_imsi(const char *imsi)
 {
     subscr_entry_t *e = NULL;
     HASH_FIND_STR(g_by_imsi, imsi, e);
+    if (!e)
+        return NULL;
+    if (g_ttl_s > 0 && (time(NULL) - e->updated_at) > g_ttl_s) {
+        HASH_DEL(g_by_imsi, e);
+        free(e);
+        return NULL;
+    }
     return e;
+}
+
+static subscr_apn_t *find_apn(subscr_entry_t *e, const char *apn)
+{
+    subscr_apn_t *a = NULL;
+    if (apn && *apn) {
+        for (uint8_t i = 0; i < e->n_apns; i++) {
+            if (!strcasecmp(e->apns[i].apn, apn)) {
+                a = &e->apns[i];
+                break;
+            }
+        }
+    }
+    if (!a && e->n_apns == 1)
+        a = &e->apns[0];
+    return a;
 }
 
 void subscr_cache_put_pgw(const char *imsi, const char *apn,
@@ -95,10 +129,14 @@ void subscr_cache_put_pgw(const char *imsi, const char *apn,
     }
     e->updated_at = time(NULL);
 
-    LOGI("subscr", "cache PGW imsi=%s apn=%s ipv4=%u.%u.%u.%u fqdn=%s alloc=%s",
-         imsi, apn,
-         (pgw_ipv4 >> 24) & 0xff, (pgw_ipv4 >> 16) & 0xff,
-         (pgw_ipv4 >> 8) & 0xff, pgw_ipv4 & 0xff,
+    LOGI("subscr",
+         "[%s] cache PGW apn=%s ipv4=%u.%u.%u.%u fqdn=%s alloc=%s",
+         imsi,
+         apn,
+         (pgw_ipv4 >> 24) & 0xff,
+         (pgw_ipv4 >> 16) & 0xff,
+         (pgw_ipv4 >> 8) & 0xff,
+         pgw_ipv4 & 0xff,
          a->pgw_fqdn[0] ? a->pgw_fqdn : "-",
          alloc_dynamic ? "dynamic" : "static");
 }
@@ -141,19 +179,7 @@ int subscr_cache_get_pgw(const char *imsi, const char *apn,
     if (!e || e->n_apns == 0)
         return 0;
 
-    subscr_apn_t *a = NULL;
-    if (apn && *apn) {
-        for (uint8_t i = 0; i < e->n_apns; i++) {
-            if (!strcasecmp(e->apns[i].apn, apn)) {
-                a = &e->apns[i];
-                break;
-            }
-        }
-    }
-    /* Single-APN subscription: tolerate an APN mismatch (emulators often send
-     * a generic APN in Create PDP that still maps to the one subscribed PDN). */
-    if (!a && e->n_apns == 1)
-        a = &e->apns[0];
+    subscr_apn_t *a = find_apn(e, apn);
     if (!a)
         return 0;
 
@@ -178,11 +204,47 @@ int subscr_cache_get_pgw(const char *imsi, const char *apn,
     return 1;
 }
 
+int subscr_cache_get_pgw_mip(const char *imsi, const char *apn,
+                             uint32_t *out_pgw_ipv4)
+{
+    if (!imsi || !*imsi)
+        return 0;
+    subscr_entry_t *e = find_imsi(imsi);
+    if (!e)
+        return 0;
+    subscr_apn_t *a = find_apn(e, apn);
+    if (!a || !a->pgw_ipv4)
+        return 0;
+    if (out_pgw_ipv4)
+        *out_pgw_ipv4 = a->pgw_ipv4;
+    return 1;
+}
+
+int subscr_cache_get_pgw_fqdn(const char *imsi, const char *apn,
+                              char *out_fqdn, size_t fqdn_cap)
+{
+    if (!imsi || !*imsi || !out_fqdn || fqdn_cap == 0)
+        return 0;
+    out_fqdn[0] = '\0';
+    subscr_entry_t *e = find_imsi(imsi);
+    if (!e)
+        return 0;
+    subscr_apn_t *a = find_apn(e, apn);
+    if (!a || !a->pgw_fqdn[0])
+        return 0;
+    strncpy(out_fqdn, a->pgw_fqdn, fqdn_cap - 1);
+    out_fqdn[fqdn_cap - 1] = '\0';
+    return 1;
+}
+
 void subscr_cache_sweep(time_t now, int ttl_s)
 {
+    int ttl = (ttl_s > 0) ? ttl_s : g_ttl_s;
+    if (ttl <= 0)
+        return;
     subscr_entry_t *e, *tmp;
     HASH_ITER(hh, g_by_imsi, e, tmp) {
-        if (now - e->updated_at > ttl_s) {
+        if (now - e->updated_at > ttl) {
             HASH_DEL(g_by_imsi, e);
             free(e);
         }

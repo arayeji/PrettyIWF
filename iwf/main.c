@@ -245,6 +245,7 @@ int main(int argc, char **argv)
 
     sess_init();
     subscr_cache_init();
+    subscr_cache_set_ttl(rt.cfg.pgw_cache_ttl_s);
 
     /* Resolve local IPv4 (network order) for GTP F-TEID / GSN Address IEs. */
     if (rt.cfg.local_ip[0]) {
@@ -443,7 +444,7 @@ int main(int argc, char **argv)
                 ssize_t r = read(tfd, &exp, sizeof(exp));
                 (void)r;
                 sess_sweep(time(NULL), IWF_SESSION_TIMEOUT_S);
-                subscr_cache_sweep(time(NULL), IWF_SESSION_TIMEOUT_S);
+                subscr_cache_sweep(time(NULL), rt.cfg.pgw_cache_ttl_s);
                 break;
             }
             case MAP_EPOLL_ROLE_SS7:

@@ -103,9 +103,15 @@ static void log_msg(const char *dir, const iwf_msg_t *m,
     const char *name = (m->version == 1) ? v1_msg_str(m->msg_type)
                                          : v2_msg_str(m->msg_type);
     LOGI("translate",
-         "%s v%u %s teid=0x%08x seq=%u imsi=%s apn=%s ies=%zu",
-         dir, m->version, name, m->teid, m->seq,
-         imsi[0] ? imsi : "-", apn[0] ? apn : "-", m->n_ies);
+         "[%s] %s v%u %s teid=0x%08x seq=%u apn=%s ies=%zu",
+         imsi[0] ? imsi : "-",
+         dir,
+         m->version,
+         name,
+         m->teid,
+         m->seq,
+         apn[0] ? apn : "-",
+         m->n_ies);
 }
 
 /* 0 ok, -1 missing IMSI IE, -2 BCD decode failure */
@@ -874,9 +880,12 @@ static int handle_gtpu_context_request(iwf_runtime_t *rt,
     sgsn.addr = rt->sgsn_gtp_addr;
     sgsn.addrlen = sizeof(sgsn.addr);
 
-    LOGI("translate", "Context-Req→Gn SGSN-Ctx-Req imsi=%s gn_seq=%u peer=%s:%u teid_cp=0x%08x",
-         imsi, (unsigned)gseq16,
-         inet_ntoa(sgsn.addr.sin_addr), ntohs(sgsn.addr.sin_port),
+    LOGI("translate",
+         "[%s] Context-Req→Gn SGSN-Ctx-Req gn_seq=%u peer=%s:%u teid_cp=0x%08x",
+         imsi,
+         (unsigned)gseq16,
+         inet_ntoa(sgsn.addr.sin_addr),
+         ntohs(sgsn.addr.sin_port),
          new_ctl_teid);
     iwf_log_hex("translate", "SGSN-Ctx-Req", out, (size_t)tot);
 
@@ -1010,8 +1019,9 @@ static int handle_v1_sgsn_ctx_req_gn_to_mme(iwf_runtime_t *rt,
     uint32_t s_cp_ipv4 = 0;
     const iwf_ie_t *stp = gtpv1_find_ie(v1req, GTPV1_IE_TEID_CTRL_PLANE);
     if (!stp || gtpv1_decode_teid(stp, &s_teid_cp) != 0 || !s_teid_cp) {
-        LOGW("translate", "Gn SGSN-Ctx-Req imsi=%s: missing TEID Ctrl Plane IE",
-             imsi);
+        LOGW("translate",
+         "[%s] Gn SGSN-Ctx-Req: missing TEID Ctrl Plane IE",
+         imsi);
         send_v1_sgsn_ctx_resp_quick(rt, from, v1req->teid,
                                     (uint16_t)v1req->seq,
                                     GTPV1_CAUSE_SYSTEM_FAILURE, imsi);
@@ -1025,8 +1035,8 @@ static int handle_v1_sgsn_ctx_req_gn_to_mme(iwf_runtime_t *rt,
 
     if (!rt->mme_gtp_addr.sin_port || rt->mme_gtp_addr.sin_addr.s_addr == 0) {
         LOGE("translate",
-             "Gn SGSN-Ctx-Req imsi=%s: set [mme] ip (and port) to relay Context-Req",
-             imsi);
+         "[%s] Gn SGSN-Ctx-Req: set [mme] ip (and port) to relay Context-Req",
+         imsi);
         send_v1_sgsn_ctx_resp_quick(rt, from, v1req->teid,
                                     (uint16_t)v1req->seq,
                                     GTPV1_CAUSE_SYSTEM_FAILURE, imsi);
@@ -1085,8 +1095,9 @@ static int handle_v1_sgsn_ctx_req_gn_to_mme(iwf_runtime_t *rt,
     mme_dst.addrlen = sizeof(mme_dst.addr);
 
     LOGI("translate",
-         "Gn SGSN-Ctx-Req→MME Context-Req imsi=%s v2-seq=%06x peer=%s:%u gn_teid_cp=0x%08x",
-         imsi, (unsigned)vseq_full,
+         "[%s] Gn SGSN-Ctx-Req→MME Context-Req v2-seq=%06x peer=%s:%u gn_teid_cp=0x%08x",
+         imsi,
+         (unsigned)vseq_full,
          inet_ntoa(mme_dst.addr.sin_addr),
          ntohs(mme_dst.addr.sin_port),
          s_teid_cp);
@@ -1136,8 +1147,9 @@ static int try_handle_gtpu_context_response_reverse(iwf_runtime_t *rt,
         mm_v104_to_v129(mm104, (size_t)mm104_len_w, u129_mm, sizeof(u129_mm),
                         &u129_len) != 0 ||
         unpack_v2_pdn_for_reverse(v2rsp, &pfill) != 0) {
-        LOGE("translate", "Gn→MME Context-Resp reverse map failed imsi=%s",
-             pend->req_imsi);
+        LOGE("translate",
+         "[%s] Gn→MME Context-Resp reverse map failed",
+         pend->req_imsi);
         send_v1_sgsn_ctx_resp_quick(rt, &pend->gn_peer_sa, pend->gn_req_hdr_teid,
                                     pend->gn_req_seq16, GTPV1_CAUSE_SYSTEM_FAILURE,
                                     pend->req_imsi);
@@ -1204,8 +1216,10 @@ static int try_handle_gtpu_context_response_reverse(iwf_runtime_t *rt,
     }
 
     LOGI("translate",
-         "TX-Gn SGSN-Ctx-Resp imsi=%s (Gn←MME path) hdr-teid=0x%08x gn_seq=%u len=%d",
-         pend->req_imsi, pend->gn_req_hdr_teid, (unsigned)pend->gn_req_seq16,
+         "[%s] TX-Gn SGSN-Ctx-Resp (Gn←MME path) hdr-teid=0x%08x gn_seq=%u len=%d",
+         pend->req_imsi,
+         pend->gn_req_hdr_teid,
+         (unsigned)pend->gn_req_seq16,
          tout);
     iwf_log_hex("translate", "SGSN-Ctx-Resp(reverse)", out, (size_t)tout);
     iwf_send_v1(rt, &pend->gn_peer_sa, out, (size_t)tout);
@@ -1275,9 +1289,11 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             sess_find_pending_create_by_imsi_gnseq(imsi, (uint16_t)v1->seq);
         if (pending) {
             LOGI("translate",
-                 "duplicate Create-PDP-Req (retransmit) imsi=%s gn_seq=%u nsapi=%u state=%s — ignoring",
-                 imsi, (unsigned)(uint16_t)v1->seq, (unsigned)pending->key.nsapi,
-                 sess_state_str(pending->state));
+         "[%s] duplicate Create-PDP-Req (retransmit) gn_seq=%u nsapi=%u state=%s — ignoring",
+         imsi,
+         (unsigned)(uint16_t)v1->seq,
+         (unsigned)pending->key.nsapi,
+         sess_state_str(pending->state));
             return 0;
         }
     }
@@ -1292,9 +1308,11 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         sess_t *stale = sess_find(imsi, nsapi);
         if (stale) {
             LOGW("translate",
-                 "reattach for imsi=%s nsapi=%u (old state=%s sgwc_teid=0x%08x) — implicit detach",
-                 imsi, (unsigned)nsapi, sess_state_str(stale->state),
-                 stale->sgwc_ctrl_teid);
+         "[%s] reattach for nsapi=%u (old state=%s sgwc_teid=0x%08x) — implicit detach",
+         imsi,
+         (unsigned)nsapi,
+         sess_state_str(stale->state),
+         stale->sgwc_ctrl_teid);
             if (stale->sgwc_ctrl_teid)
                 (void)send_orphan_delete_session_req(rt,
                                                      stale->sgwc_ctrl_teid,
@@ -1397,7 +1415,7 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
 
     sess_t *s = sess_create(imsi, nsapi);
     if (!s) {
-        LOGE("translate", "out of memory creating session imsi=%s", imsi);
+        LOGE("translate", "[%s] out of memory creating session", imsi);
         return -1;
     }
 
@@ -1572,7 +1590,9 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
                     pgw_ipv4 = ntohl(a.s_addr);
                 else
                     LOGW("translate",
-                         "invalid [roaming_hlr] pgw_ip=%s for imsi=%s", cip, imsi);
+         "[%s] invalid [roaming_hlr] pgw_ip=%s",
+         imsi,
+         cip);
             }
             if (!pgw_ipv4 && cfqdn && cfqdn[0]) {
                 pgw_ipv4 = subscr_resolve_fqdn_ipv4(cfqdn);
@@ -1581,8 +1601,9 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
                     pgw_fqdn[sizeof(pgw_fqdn) - 1] = '\0';
                 } else {
                     LOGW("translate",
-                         "could not resolve [roaming_hlr] pgw_fqdn=%s for imsi=%s",
-                         cfqdn, imsi);
+         "[%s] could not resolve [roaming_hlr] pgw_fqdn=%s",
+         imsi,
+         cfqdn);
                 }
             }
             if (pgw_ipv4) {
@@ -1608,20 +1629,26 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         gtpv2_enc_fteid_ipv4(&e, 1, FTEID_IFACE_S5S8_PGW_GTPC,
                              pgw_teid, pgw_ipv4);
         LOGI("translate",
-             "PGW imsi=%s apn=%s = %u.%u.%u.%u teid=0x%08x src=%s%s%s",
-             imsi, s->apn[0] ? s->apn : "(none)",
-             (pgw_ipv4 >> 24) & 0xff, (pgw_ipv4 >> 16) & 0xff,
-             (pgw_ipv4 >> 8) & 0xff, pgw_ipv4 & 0xff,
-             pgw_teid, pgw_src,
-             pgw_fqdn[0] ? " fqdn=" : "", pgw_fqdn[0] ? pgw_fqdn : "");
+         "[%s] PGW apn=%s = %u.%u.%u.%u teid=0x%08x src=%s%s%s",
+         imsi,
+         s->apn[0] ? s->apn : "(none)",
+         (pgw_ipv4 >> 24) & 0xff,
+         (pgw_ipv4 >> 16) & 0xff,
+         (pgw_ipv4 >> 8) & 0xff,
+         pgw_ipv4 & 0xff,
+         pgw_teid,
+         pgw_src,
+         pgw_fqdn[0] ? " fqdn=" : "",
+         pgw_fqdn[0] ? pgw_fqdn : "");
     } else {
         static int warned_no_pgw;
         if (!warned_no_pgw) {
             warned_no_pgw = 1;
             LOGW("translate",
-                 "Create Session: no PGW for imsi=%s apn=%s — none of HSS subscription (ULA MIP6-Agent-Info), [roaming_hlr] mncNNN_pgw_ip/pgw_fqdn, or [smf] ip is set (config file: %s). Open5GS SGWC rejects CSReq (cause 103). Provide PGW in HSS APN-Configuration, a per-partner pgw_ip/pgw_fqdn, or [smf] ip=<PGW/SMF GTP-C IPv4>.",
-                 imsi, s->apn[0] ? s->apn : "(none)",
-                 rt->cfg.cfg_path[0] ? rt->cfg.cfg_path : "iwf.conf");
+         "[%s] Create Session: no PGW for apn=%s — none of HSS subscription (ULA MIP6-Agent-Info), [roaming_hlr] mncNNN_pgw_ip/pgw_fqdn, or [smf] ip is set (config file: %s). Open5GS SGWC rejects CSReq (cause 103). Provide PGW in HSS APN-Configuration, a per-partner pgw_ip/pgw_fqdn, or [smf] ip=<PGW/SMF GTP-C IPv4>.",
+         imsi,
+         s->apn[0] ? s->apn : "(none)",
+         rt->cfg.cfg_path[0] ? rt->cfg.cfg_path : "iwf.conf");
         }
     }
 
@@ -1670,8 +1697,8 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
          * SGW-U has somewhere to forward DL packets if Update is delayed. */
         if (!s->sgsn_addr_ipv4) {
             LOGE("translate",
-                 "Create-Session: cannot derive S4-SGSN-U IPv4 (no GSN IE, invalid peer) imsi=%s",
-                 imsi);
+         "[%s] Create-Session: cannot derive S4-SGSN-U IPv4 (no GSN IE, invalid peer)",
+         imsi);
             sess_remove(s);
             return -1;
         }
@@ -1689,8 +1716,11 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     s->state = SESS_WAIT_CS_RESP;
     sess_touch(s);
 
-    LOGI("translate", "TX-S4 Create-Session-Req imsi=%s seq=%u len=%d",
-         imsi, s->gtpv2_seq, total);
+    LOGI("translate",
+         "[%s] TX-S4 Create-Session-Req seq=%u len=%d",
+         imsi,
+         s->gtpv2_seq,
+         total);
     iwf_log_hex("translate", "CSReq", outbuf, (size_t)total);
 
     return iwf_send_v2(rt, outbuf, (size_t)total);
@@ -1715,8 +1745,11 @@ static int translate_update_pdp_context(iwf_runtime_t *rt,
     if (!s && v1->teid) s = sess_find_by_iwf_ctrl_teid(v1->teid);
 
     if (!s) {
-        LOGW("translate", "Update PDP Context for unknown session imsi=%s nsapi=%u teid=0x%08x",
-             imsi, nsapi, v1->teid);
+        LOGW("translate",
+         "[%s] Update PDP Context for unknown session nsapi=%u teid=0x%08x",
+         imsi,
+         nsapi,
+         v1->teid);
         return -1;
     }
 
@@ -1749,10 +1782,15 @@ static int translate_update_pdp_context(iwf_runtime_t *rt,
     s->state = SESS_WAIT_MB_RESP;
     s->mb_pending_update_seq = s->gtpv2_seq;
 
-    LOGI("translate", "TX-S4 Modify-Bearer-Req imsi=%s seq=%u rnc_teid=0x%08x rnc_ip=%u.%u.%u.%u",
-         imsi, s->gtpv2_seq, rnc_teid,
-         (rnc_ipv4 >> 24) & 0xff, (rnc_ipv4 >> 16) & 0xff,
-         (rnc_ipv4 >> 8) & 0xff, rnc_ipv4 & 0xff);
+    LOGI("translate",
+         "[%s] TX-S4 Modify-Bearer-Req seq=%u rnc_teid=0x%08x rnc_ip=%u.%u.%u.%u",
+         imsi,
+         s->gtpv2_seq,
+         rnc_teid,
+         (rnc_ipv4 >> 24) & 0xff,
+         (rnc_ipv4 >> 16) & 0xff,
+         (rnc_ipv4 >> 8) & 0xff,
+         rnc_ipv4 & 0xff);
     return rc;
 }
 
@@ -1781,8 +1819,9 @@ static int translate_delete_pdp_context(iwf_runtime_t *rt,
     if (s->state == SESS_WAIT_DS_RESP &&
         s->sgsn_seq == (uint16_t)v1->seq) {
         LOGI("translate",
-             "duplicate Delete-PDP-Req (retransmit) imsi=%s gn_seq=%u — ignoring",
-             s->key.imsi, (unsigned)(uint16_t)v1->seq);
+         "[%s] duplicate Delete-PDP-Req (retransmit) gn_seq=%u — ignoring",
+         s->key.imsi,
+         (unsigned)(uint16_t)v1->seq);
         return 0;
     }
 
@@ -1809,8 +1848,11 @@ static int translate_delete_pdp_context(iwf_runtime_t *rt,
     s->state = SESS_WAIT_DS_RESP;
     sess_touch(s);
 
-    LOGI("translate", "TX-S4 Delete-Session-Req imsi=%s seq=%u sgwc_teid=0x%08x",
-         s->key.imsi, s->gtpv2_seq, s->sgwc_ctrl_teid);
+    LOGI("translate",
+         "[%s] TX-S4 Delete-Session-Req seq=%u sgwc_teid=0x%08x",
+         s->key.imsi,
+         s->gtpv2_seq,
+         s->sgwc_ctrl_teid);
     iwf_log_hex("translate", "DSReq", outbuf, (size_t)total);
 
     return iwf_send_v2(rt, outbuf, (size_t)total);
@@ -1957,27 +1999,37 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
     }
     if (s->state != SESS_WAIT_CS_RESP) {
         LOGI("translate",
-             "CSResp duplicate or late imsi=%s seq=%u state=%s — ignoring",
-             s->key.imsi, (unsigned)(v2->seq & 0xffffffu), sess_state_str(s->state));
+         "[%s] CSResp duplicate or late seq=%u state=%s — ignoring",
+         s->key.imsi,
+         (unsigned)(v2->seq & 0xffffffu),
+         sess_state_str(s->state));
         return 0;
     }
     if (v2->teid != s->iwf_s4_c_teid)
-        LOGI("translate", "CSResp imsi=%s matched via seq=%u (hdr teid=0x%08x, iwf_s4_c=0x%08x)",
-             s->key.imsi, (unsigned)(v2->seq & 0xffffffu), v2->teid, s->iwf_s4_c_teid);
+        LOGI("translate",
+         "[%s] CSResp matched via seq=%u (hdr teid=0x%08x, iwf_s4_c=0x%08x)",
+         s->key.imsi,
+         (unsigned)(v2->seq & 0xffffffu),
+         v2->teid,
+         s->iwf_s4_c_teid);
 
     uint8_t gtpv2_cause;
     if (gtpv2_find_cause_value(v2, &gtpv2_cause) < 0) {
-        LOGW("translate", "CSResp imsi=%s no decodable Cause IE (ies=%zu) — treating as reject",
-             s->key.imsi, v2->n_ies);
+        LOGW("translate",
+         "[%s] CSResp no decodable Cause IE (ies=%zu) — treating as reject",
+         s->key.imsi,
+         v2->n_ies);
         gtpv2_cause = GTPV2_CAUSE_SYSTEM_FAILURE;
     } else if (gtpv2_cause != GTPV2_CAUSE_REQUEST_ACCEPTED) {
         if (gtpv2_cause == 103) {
             LOGW("translate",
-                 "CSResp imsi=%s gtpv2_cause=103 (Conditional IE missing) — GTP CSReq: missing ULI or missing [smf] PGW F-TEID (sgwc: No IMSI / No PGW IP). If CSReq already has SMF F-TEID (len grew), Open5GS maps PFCP Sx failure (SGWC⇄SGW-U) to 103 — check sgwc/sgwu logs and udp/8805",
-                 s->key.imsi);
+         "[%s] CSResp gtpv2_cause=103 (Conditional IE missing) — GTP CSReq: missing ULI or missing [smf] PGW F-TEID (sgwc: No IMSI / No PGW IP). If CSReq already has SMF F-TEID (len grew), Open5GS maps PFCP Sx failure (SGWC⇄SGW-U) to 103 — check sgwc/sgwu logs and udp/8805",
+         s->key.imsi);
         } else {
-            LOGW("translate", "CSResp imsi=%s gtpv2_cause=%u (not Request Accepted)",
-                 s->key.imsi, (unsigned)gtpv2_cause);
+            LOGW("translate",
+         "[%s] CSResp gtpv2_cause=%u (not Request Accepted)",
+         s->key.imsi,
+         (unsigned)gtpv2_cause);
         }
     }
 
@@ -2064,14 +2116,15 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
         s->pco_len = pco_ie->length;
     } else if (pco_ie && pco_ie->length > sizeof(s->pco_blob)) {
         LOGW("translate",
-             "CSResp imsi=%s PCO too large (%u) — dropping; UE will see empty DNS/MTU",
-             s->key.imsi, (unsigned)pco_ie->length);
+         "[%s] CSResp PCO too large (%u) — dropping; UE will see empty DNS/MTU",
+         s->key.imsi,
+         (unsigned)pco_ie->length);
     }
 
     if (gtpv2_cause == GTPV2_CAUSE_REQUEST_ACCEPTED && !s->sgwu_addr_ipv4) {
         LOGW("translate",
-             "CSResp imsi=%s no SGW-U F-TEID in Bearer (expected iface 16 S4 SGW GTP-U or 1 S1-U SGW GTP-U)",
-             s->key.imsi);
+         "[%s] CSResp no SGW-U F-TEID in Bearer (expected iface 16 S4 SGW GTP-U or 1 S1-U SGW GTP-U)",
+         s->key.imsi);
     }
 
     log_msg("RX-S4", v2, s->key.imsi, s->apn);
@@ -2144,13 +2197,19 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
     if (total <= 0) return -1;
 
     LOGI("translate",
-         "TX-Gn Create-PDP-Resp imsi=%s seq=%u cause=%u sgwu=%u.%u.%u.%u teid=0x%08x ue_ip=%u.%u.%u.%u",
-         log_imsi, (unsigned)resp_seq, v1_cause,
-         (log_sgwu_ip >> 24) & 0xff, (log_sgwu_ip >> 16) & 0xff,
-         (log_sgwu_ip >> 8) & 0xff, log_sgwu_ip & 0xff,
+         "[%s] TX-Gn Create-PDP-Resp seq=%u cause=%u sgwu=%u.%u.%u.%u teid=0x%08x ue_ip=%u.%u.%u.%u",
+         log_imsi,
+         (unsigned)resp_seq,
+         v1_cause,
+         (log_sgwu_ip >> 24) & 0xff,
+         (log_sgwu_ip >> 16) & 0xff,
+         (log_sgwu_ip >> 8) & 0xff,
+         log_sgwu_ip & 0xff,
          log_sgwu_teid,
-         (log_ue_ip >> 24) & 0xff, (log_ue_ip >> 16) & 0xff,
-         (log_ue_ip >> 8) & 0xff, log_ue_ip & 0xff);
+         (log_ue_ip >> 24) & 0xff,
+         (log_ue_ip >> 16) & 0xff,
+         (log_ue_ip >> 8) & 0xff,
+         log_ue_ip & 0xff);
     iwf_log_hex("translate", "Create-PDP-Resp", outbuf, (size_t)total);
 
     int sent_v1 = iwf_send_v1(rt, &resp_ep, outbuf, (size_t)total);
@@ -2171,15 +2230,19 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
         int mb_rc = send_modify_bearer_req(rt, s, s->key.nsapi);
         if (mb_rc < 0) {
             LOGW("translate",
-                 "activation MBReq send failed imsi=%s — DL FAR may stay BUFFER on SGW-U",
-                 s->key.imsi);
+         "[%s] activation MBReq send failed — DL FAR may stay BUFFER on SGW-U",
+         s->key.imsi);
             s->state = SESS_ACTIVE;
         } else {
             LOGI("translate",
-                 "TX-S4 Modify-Bearer-Req (activate) imsi=%s seq=%u sgsn_teid=0x%08x sgsn_ip=%u.%u.%u.%u",
-                 s->key.imsi, s->gtpv2_seq, s->sgsn_data_teid,
-                 (s->sgsn_addr_ipv4 >> 24) & 0xff, (s->sgsn_addr_ipv4 >> 16) & 0xff,
-                 (s->sgsn_addr_ipv4 >> 8)  & 0xff,  s->sgsn_addr_ipv4 & 0xff);
+         "[%s] TX-S4 Modify-Bearer-Req (activate) seq=%u sgsn_teid=0x%08x sgsn_ip=%u.%u.%u.%u",
+         s->key.imsi,
+         s->gtpv2_seq,
+         s->sgsn_data_teid,
+         (s->sgsn_addr_ipv4 >> 24) & 0xff,
+         (s->sgsn_addr_ipv4 >> 16) & 0xff,
+         (s->sgsn_addr_ipv4 >> 8)  & 0xff,
+         s->sgsn_addr_ipv4 & 0xff);
             s->mb_pending_init_seq = s->gtpv2_seq;
         }
     }
@@ -2219,12 +2282,15 @@ static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
         s->mb_pending_init_seq = 0;
         if (cause == GTPV2_CAUSE_REQUEST_ACCEPTED) {
             LOGI("translate",
-                 "MBResp (activate) imsi=%s seq=%u cause=16 — bearer ACTIVE, DL FAR should be FORWARD",
-                 s->key.imsi, (unsigned)seq24);
+         "[%s] MBResp (activate) seq=%u cause=16 — bearer ACTIVE, DL FAR should be FORWARD",
+         s->key.imsi,
+         (unsigned)seq24);
         } else {
             LOGW("translate",
-                 "MBResp (activate) imsi=%s seq=%u gtpv2_cause=%u — DL may stay BUFFER on SGW-U",
-                 s->key.imsi, (unsigned)seq24, (unsigned)cause);
+         "[%s] MBResp (activate) seq=%u gtpv2_cause=%u — DL may stay BUFFER on SGW-U",
+         s->key.imsi,
+         (unsigned)seq24,
+         (unsigned)cause);
         }
         sess_touch(s);
         if (s->mb_pending_update_seq)
@@ -2239,23 +2305,27 @@ static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
         if (s->state != SESS_WAIT_MB_RESP) {
             if (cause == GTPV2_CAUSE_REQUEST_ACCEPTED) {
                 LOGI("translate",
-                     "MBResp (activate/legacy) imsi=%s seq=%u cause=16 — bearer ACTIVE",
-                     s->key.imsi, (unsigned)seq24);
+         "[%s] MBResp (activate/legacy) seq=%u cause=16 — bearer ACTIVE",
+         s->key.imsi,
+         (unsigned)seq24);
             } else {
                 LOGW("translate",
-                     "MBResp (activate/legacy) imsi=%s seq=%u gtpv2_cause=%u",
-                     s->key.imsi, (unsigned)seq24, (unsigned)cause);
+         "[%s] MBResp (activate/legacy) seq=%u gtpv2_cause=%u",
+         s->key.imsi,
+         (unsigned)seq24,
+         (unsigned)cause);
             }
             s->state = SESS_ACTIVE;
             sess_touch(s);
             return 0;
         }
         LOGW("translate",
-             "MBResp imsi=%s seq=%u unexpected (pending_init=%u pending_upd=%u state=%s)",
-             s->key.imsi, (unsigned)seq24,
-             (unsigned)(s->mb_pending_init_seq & 0xffffffu),
-             (unsigned)(s->mb_pending_update_seq & 0xffffffu),
-             sess_state_str(s->state));
+         "[%s] MBResp seq=%u unexpected (pending_init=%u pending_upd=%u state=%s)",
+         s->key.imsi,
+         (unsigned)seq24,
+         (unsigned)(s->mb_pending_init_seq & 0xffffffu),
+         (unsigned)(s->mb_pending_update_seq & 0xffffffu),
+         sess_state_str(s->state));
         return 0;
     }
 
@@ -2285,8 +2355,11 @@ static int handle_modify_bearer_response(iwf_runtime_t *rt, const iwf_msg_t *v2)
     int total = gtpv1_enc_finish(&e);
     if (total <= 0) return -1;
 
-    LOGI("translate", "TX-Gn Update-PDP-Resp imsi=%s seq=%u cause=%u",
-         s->key.imsi, s->sgsn_seq, v1_cause);
+    LOGI("translate",
+         "[%s] TX-Gn Update-PDP-Resp seq=%u cause=%u",
+         s->key.imsi,
+         s->sgsn_seq,
+         v1_cause);
     iwf_log_hex("translate", "Update-PDP-Resp", outbuf, (size_t)total);
 
     return iwf_send_v1(rt, &s->sgsn_ep, outbuf, (size_t)total);
@@ -2322,8 +2395,11 @@ static int handle_delete_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
 
     int total = gtpv1_enc_finish(&e);
     if (total > 0) {
-        LOGI("translate", "TX-Gn Delete-PDP-Resp imsi=%s seq=%u cause=%u",
-             s->key.imsi, s->sgsn_seq, v1_cause);
+        LOGI("translate",
+         "[%s] TX-Gn Delete-PDP-Resp seq=%u cause=%u",
+         s->key.imsi,
+         s->sgsn_seq,
+         v1_cause);
         iwf_log_hex("translate", "Delete-PDP-Resp", outbuf, (size_t)total);
         iwf_send_v1(rt, &s->sgsn_ep, outbuf, (size_t)total);
     }

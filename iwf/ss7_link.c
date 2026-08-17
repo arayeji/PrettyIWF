@@ -62,9 +62,14 @@
 #  include <osmocom/core/msgb.h>
 #  include <osmocom/core/prim.h>
 #  include <osmocom/sigtran/osmo_ss7.h>
+#  include <osmocom/sigtran/mtp_sap.h>
+#  include <osmocom/sigtran/sigtran_sap.h>
 #  include <osmocom/sigtran/protocol/mtp.h>
 #  include <osmocom/sigtran/sccp_sap.h>
 #  include <osmocom/sigtran/sccp_helpers.h>
+#  include <osmocom/sccp/sccp_types.h>
+/* Exported by libosmo-sigtran; not always declared in public headers. */
+int osmo_sccp_addr_encode(struct msgb *msg, const struct osmo_sccp_addr *in);
 #endif
 
 #ifdef MAP_IWF_WITH_OSMO_SIGTRAN
@@ -198,6 +203,7 @@ struct ss7_impl_ctx {
     int                    eventfd_to_main;       /* main thread polls this */
     uint32_t               local_pc;              /* packed [map_iwf] local_pc */
     uint32_t               stp_dpc;               /* packed [stp] remote_pc (MTP routes) */
+    uint8_t                network_indicator;    /* [stp] network_indicator for MTP SIO */
     int                    sccp_ri;               /* IWF_SCCP_RI_GT or IWF_SCCP_RI_SSN */
 };
 
@@ -269,9 +275,10 @@ static void ss7_encode_outbound_called(const ss7_sccp_addr_t *in,
                                        uint32_t stp_dpc,
                                        int sccp_ri)
 {
-    /* RI follows [map_iwf].sccp_ri.  For gt: set CDPA PC=[stp] remote_pc so
-     * the SCCP address carries the STP PC; MTP/M3UA still routes via STP
-     * either way.  For ssn: leave PC out of the address (PCI=0). */
+    /* RI follows [map_iwf].sccp_ri.
+     * gt: CdPA carries STP PC (osmo-sigtran also copies it into M3UA DPC).
+     * ssn: omit PC from the SCCP address (PCI=0).  M3UA DPC is set separately
+     * in ss7_tx_unitdata_ssn_mtp() — do NOT put PC here or PCI becomes 1. */
     ss7_to_osmo_addr(in, out, sccp_ri);
     if (sccp_ri != IWF_SCCP_RI_SSN) {
         out->pc = osmo_ss7_pc_is_valid(stp_dpc) ? stp_dpc : 0;
@@ -625,10 +632,11 @@ int ss7_link_init(struct iwf_runtime *rt)
 
     ctx->local_pc = default_pc;
     ctx->stp_dpc  = pack_dotted_pc(rt->cfg.stp_remote_pc);
+    ctx->network_indicator = rt->cfg.stp_network_indicator;
     ctx->sccp_ri  = rt->cfg.map_sccp_ri;
     if (ctx->sccp_ri == IWF_SCCP_RI_SSN)
-        LOGI("ss7", "outbound MAP: sccp_ri=ssn RI=SSN, omit PC from CdPA/CgPA "
-             "(PCI=0; M3UA still uses STP DPC=%s)",
+        LOGI("ss7", "outbound MAP: sccp_ri=ssn RI=SSN, SCCP PCI=0 (no PC in "
+             "CdPA/CgPA); M3UA DPC set via MTP-TRANSFER to STP PC=%s",
              osmo_ss7_pc_is_valid(ctx->stp_dpc) ? rt->cfg.stp_remote_pc : "0");
     else
         LOGI("ss7", "outbound MAP: sccp_ri=gt RI=GT when GT present, "
@@ -662,17 +670,123 @@ void ss7_link_on_readable(struct iwf_runtime *rt)
     osmo_select_main_ctx(1);
 }
 
+/* Encode a classic SCCP UDT (class 0) into msg.  Addresses must already have
+ * the desired PCI/SSNI/GTI (for sccp_ri=ssn: no OSMO_SCCP_ADDR_T_PC → PCI=0). */
+static int ss7_encode_sccp_udt(struct msgb *msg,
+                               const struct osmo_sccp_addr *called,
+                               const struct osmo_sccp_addr *calling,
+                               const uint8_t *data, size_t data_len)
+{
+    if (!msg || !called || !calling || (!data && data_len))
+        return -1;
+    if (data_len > 255u)
+        return -EMSGSIZE; /* would need XUDT/LUDT; MAP PDUs are smaller */
+
+    /* Snapshot header offset so later msgb_put cannot invalidate local ptrs. */
+    const unsigned hdr_off = (unsigned)msgb_length(msg);
+    uint8_t *hdr = msgb_put(msg, 5);
+    hdr[0] = SCCP_MSG_TYPE_UDT;
+    hdr[1] = 0; /* protocol class 0, no return-on-error */
+
+    unsigned len_cd_off = (unsigned)msgb_length(msg);
+    msgb_put(msg, 1);
+    msg->data[hdr_off + 2] =
+        (uint8_t)((msg->data + len_cd_off) - (msg->data + hdr_off + 2));
+    int rc = osmo_sccp_addr_encode(msg, called);
+    if (rc < 0)
+        return rc;
+    if (rc > 255)
+        return -EMSGSIZE;
+    msg->data[len_cd_off] = (uint8_t)rc;
+
+    unsigned len_cg_off = (unsigned)msgb_length(msg);
+    msgb_put(msg, 1);
+    msg->data[hdr_off + 3] =
+        (uint8_t)((msg->data + len_cg_off) - (msg->data + hdr_off + 3));
+    rc = osmo_sccp_addr_encode(msg, calling);
+    if (rc < 0)
+        return rc;
+    if (rc > 255)
+        return -EMSGSIZE;
+    msg->data[len_cg_off] = (uint8_t)rc;
+
+    unsigned len_d_off = (unsigned)msgb_length(msg);
+    msgb_put(msg, 1);
+    msg->data[hdr_off + 4] =
+        (uint8_t)((msg->data + len_d_off) - (msg->data + hdr_off + 4));
+    if (data_len) {
+        uint8_t *p = msgb_put(msg, data_len);
+        memcpy(p, data, data_len);
+    }
+    msg->data[len_d_off] = (uint8_t)data_len;
+    return 0;
+}
+
+/* libosmo-sigtran copies CdPA PC → M3UA DPC (sccp_scrc gen_mtp_transfer_req_xua).
+ * Omitting OSMO_SCCP_ADDR_T_PC (for SCCP PCI=0) therefore yields M3UA DPC=0 and
+ * the STP cannot route.  For sccp_ri=ssn: encode SCCP UDT without PC, then issue
+ * MTP-TRANSFER.req with DPC=[stp] remote_pc so M3UA and SCCP PCI are independent. */
+static int ss7_tx_unitdata_ssn_mtp(struct ss7_impl_ctx *ctx,
+                                  const struct osmo_sccp_addr *calling_addr,
+                                  const struct osmo_sccp_addr *called_addr,
+                                  const uint8_t *tcap, size_t tcap_len)
+{
+    if (!ctx || !ctx->ss7 || !tcap)
+        return -1;
+    if (!osmo_ss7_pc_is_valid(ctx->stp_dpc)) {
+        LOGE("ss7", "sccp_ri=ssn: [stp] remote_pc unset — refusing TX (M3UA DPC would be 0)");
+        return -1;
+    }
+    if (!osmo_ss7_pc_is_valid(ctx->local_pc)) {
+        LOGE("ss7", "sccp_ri=ssn: local_pc unset — refusing TX");
+        return -1;
+    }
+
+    struct osmo_ss7_user *mtp_user =
+        osmo_ss7_user_find_by_si(ctx->ss7, MTP_SI_SCCP);
+    if (!mtp_user) {
+        LOGE("ss7", "sccp_ri=ssn: no MTP user for SI=SCCP on ss7 instance");
+        return -1;
+    }
+
+    /* Headroom for osmo_mtp_prim; room for UDT + addresses + TCAP. */
+    struct msgb *msg = msgb_alloc_headroom(tcap_len + 512, 128, "iwf-sccp-udt");
+    if (!msg)
+        return -1;
+
+    int rc = ss7_encode_sccp_udt(msg, called_addr, calling_addr, tcap, tcap_len);
+    if (rc < 0) {
+        LOGE("ss7", "SCCP UDT encode failed rc=%d (sccp_ri=ssn MTP path)", rc);
+        msgb_free(msg);
+        return rc;
+    }
+
+    /* Match osmo_mtp_prim_xfer_req_prepend: l2h = SCCP before pushing prim. */
+    msg->l2h = msg->data;
+    if (msgb_headroom(msg) < (int)sizeof(struct osmo_mtp_prim)) {
+        LOGE("ss7", "SCCP msgb headroom too small for MTP prim");
+        msgb_free(msg);
+        return -1;
+    }
+    struct osmo_mtp_prim *omp =
+        (struct osmo_mtp_prim *)msgb_push(msg, sizeof(*omp));
+    osmo_prim_init(&omp->oph, MTP_SAP_USER,
+                   OSMO_MTP_PRIM_TRANSFER, PRIM_OP_REQUEST, msg);
+    omp->u.transfer.opc = ctx->local_pc;
+    omp->u.transfer.dpc = ctx->stp_dpc;
+    omp->u.transfer.sls = 0;
+    omp->u.transfer.sio = MTP_SIO(MTP_SI_SCCP, ctx->network_indicator);
+
+    /* Takes ownership of msg. */
+    return osmo_ss7_user_mtp_sap_prim_down(mtp_user, omp);
+}
+
 static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
                            struct osmo_sccp_user *user,
                            const ss7_sccp_addr_t *called,
                            const ss7_sccp_addr_t *calling,
                            const uint8_t *tcap, size_t tcap_len)
 {
-    struct msgb *msg = msgb_alloc(tcap_len + 64, "iwf-tcap-tx");
-    if (!msg) return -1;
-    uint8_t *p = msgb_put(msg, tcap_len);
-    memcpy(p, tcap, tcap_len);
-
     struct osmo_sccp_addr called_addr = {0};
     struct osmo_sccp_addr calling_addr = {0};
     ss7_encode_outbound_called(called, &called_addr, ctx->stp_dpc, ctx->sccp_ri);
@@ -690,6 +804,15 @@ static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
         calling_addr.ri = (ctx->sccp_ri == IWF_SCCP_RI_SSN) ? OSMO_SCCP_RI_SSN_PC
                                                            : OSMO_SCCP_RI_GT;
     }
+
+    if (ctx->sccp_ri == IWF_SCCP_RI_SSN)
+        return ss7_tx_unitdata_ssn_mtp(ctx, &calling_addr, &called_addr,
+                                       tcap, tcap_len);
+
+    struct msgb *msg = msgb_alloc(tcap_len + 64, "iwf-tcap-tx");
+    if (!msg) return -1;
+    uint8_t *p = msgb_put(msg, tcap_len);
+    memcpy(p, tcap, tcap_len);
 
     int rc = osmo_sccp_tx_unitdata_msg(user, &calling_addr, &called_addr, msg);
     if (rc < 0)
