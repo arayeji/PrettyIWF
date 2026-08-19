@@ -99,6 +99,27 @@ sess_t *sess_find_by_pending_v2_seq(uint32_t seq24, sess_state_t expect_state)
     return NULL;
 }
 
+sess_t *sess_find_by_pending_v2_seq_any(uint32_t seq24)
+{
+    static const sess_state_t states[] = {
+        SESS_WAIT_CS_RESP,
+        SESS_WAIT_MB_RESP,
+        SESS_WAIT_MB_RESP_INIT,
+        SESS_WAIT_DS_RESP,
+        SESS_MODIFYING,
+        SESS_CREATING,
+    };
+    sess_t *s;
+    size_t i;
+
+    for (i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
+        s = sess_find_by_pending_v2_seq(seq24, states[i]);
+        if (s)
+            return s;
+    }
+    return NULL;
+}
+
 sess_t *sess_find_pending_create_by_imsi_gnseq(const char *imsi, uint16_t gn_seq)
 {
     sess_t *s, *tmp;

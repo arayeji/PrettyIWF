@@ -81,6 +81,7 @@
 #include "runtime.h"
 #include "logging.h"
 #include "test_cmd.h"
+#include "imsi_trace.h"
 #include "subscr_cache.h"
 #include "gsup_proto.h"
 #ifdef GSUP_PROXY_ENABLED
@@ -200,7 +201,10 @@ static int map_send_tcap_to_peer(struct iwf_runtime *rt, map_session_t *s,
          s->peer_sccp.ssn == SS7_SSN_SGSN))
         calling.ssn = SS7_SSN_HLR;
 
-    return ss7_link_send_tcap_ex(rt, &called, &calling, out, n);
+    int rc = ss7_link_send_tcap_ex(rt, &called, &calling, out, n);
+    if (rc >= 0 && s->imsi_str[0])
+        iwf_imsi_trace_packet(s->imsi_str, "map", "tx", out, n);
+    return rc;
 }
 
 static void handle_begin_sai(struct iwf_runtime *rt,
@@ -249,6 +253,7 @@ static void handle_begin_sai(struct iwf_runtime *rt,
         send_tcap_end_with_error(rt, s, s->peer_invoke_id,
                                  MAP_ERR_SYSTEM_FAILURE, /*nrc=hlr*/ 1);
     }
+    iwf_imsi_trace_flush_rx(s->imsi_str);
 }
 
 static void handle_begin_ugl(struct iwf_runtime *rt,
@@ -285,6 +290,7 @@ static void handle_begin_ugl(struct iwf_runtime *rt,
     if (diameter_send_ulr(rt, s) < 0) {
         send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
     }
+    iwf_imsi_trace_flush_rx(s->imsi_str);
 }
 
 static void handle_begin_ul(struct iwf_runtime *rt,
@@ -326,6 +332,7 @@ static void handle_begin_ul(struct iwf_runtime *rt,
     if (diameter_send_ulr(rt, s) < 0) {
         send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
     }
+    iwf_imsi_trace_flush_rx(s->imsi_str);
 }
 
 static void handle_begin_purge(struct iwf_runtime *rt,
@@ -361,6 +368,7 @@ static void handle_begin_purge(struct iwf_runtime *rt,
     if (diameter_send_pur(rt, s) < 0) {
         send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
     }
+    iwf_imsi_trace_flush_rx(s->imsi_str);
 }
 
 /* CancelLocation can be SGSN-initiated too (rare; mostly HSS-initiated via
@@ -391,6 +399,7 @@ static void handle_begin_cl(struct iwf_runtime *rt,
     /* No Diameter side - just acknowledge. */
     send_tcap_end_with_result(rt, s, s->peer_invoke_id,
                               MAP_OP_CODE_CANCEL_LOCATION, NULL, 0);
+    iwf_imsi_trace_flush_rx(s->imsi_str);
 }
 
 /* ProvideRoamingNumber: allocate MSRN, bind IMSI, TCAP-End with result.
@@ -496,6 +505,7 @@ static void handle_begin_prn(struct iwf_runtime *rt,
     send_tcap_end_with_result(rt, s, s->peer_invoke_id,
                               MAP_OP_CODE_PROVIDE_ROAMING_NUMBER,
                               params, (size_t)pn);
+    iwf_imsi_trace_flush_rx(s->imsi_str);
 }
 
 /* ----- Continue / End handlers (ISD ack from VLR/SGSN) ----------------- */
@@ -527,6 +537,7 @@ static void handle_continue_or_end(struct iwf_runtime *rt,
         return;
     }
     map_sess_touch(s);
+    iwf_imsi_trace_flush_rx(s->imsi_str);
 
     /* MAP-C UL: ISD ReturnResult on the same networkLocUp dialogue. */
     if (s->state == MAP_SESS_WAIT_MAP_ACK && s->map_op == MAP_OP_UL) {
@@ -582,6 +593,7 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
                         const uint8_t *tcap, size_t tcap_len)
 {
     rt->map->stat_map_rx++;
+    iwf_imsi_trace_bind_rx("map", tcap, tcap_len);
 
     tcap_msg_t tmsg;
     if (tcap_decode(tcap, tcap_len, &tmsg) < 0) {
@@ -1552,6 +1564,7 @@ static int send_map_cl_begin(struct iwf_runtime *rt, const char *imsi,
     called.ssn = SS7_SSN_SGSN;
     if (ss7_link_send_tcap(rt, &called, out, (size_t)n) < 0)
         return -1;
+    iwf_imsi_trace_packet(imsi, "map", "tx", out, (size_t)n);
 
     rt->map->stat_map_tx++;
     LOGI("map",

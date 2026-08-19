@@ -9,6 +9,7 @@
 #include "ss7_link.h"
 #include "runtime.h"
 #include "logging.h"
+#include "imsi_trace.h"
 #include "uthash.h"
 
 #include <arpa/inet.h>
@@ -140,6 +141,9 @@ static int proxy_send_gsup(int conn_id, const uint8_t *gsup, size_t len)
         LOGW("gsup", "send on dead conn=%d", conn_id);
         return -1;
     }
+    gsup_parsed_t req;
+    if (gsup_parse_payload(gsup, len, &req) == 0 && req.have_imsi)
+        iwf_imsi_trace_packet(req.imsi, "gsup", "tx", gsup, len);
     int rc = gsup_server_send(conn_id, gsup, len);
     if (rc < 0)
         LOGW("gsup", "send failed conn=%d peer=%s len=%zu",
@@ -317,6 +321,8 @@ static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
                               calling.have_gt ? &calling : NULL,
                               out, (size_t)n) < 0)
         return -1;
+
+    iwf_imsi_trace_packet(route->imsi, "map", "tx", out, (size_t)n);
 
     if (!pending_add(tid, conn_id, op, route->imsi, route->src_gt, cn_domain))
         return -1;
@@ -703,6 +709,7 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
         LOGW("gsup", "conn=%d malformed GSUP (no IMSI)", conn_id);
         return;
     }
+    iwf_imsi_trace_packet(req.imsi, "gsup", "rx", gsup, len);
 
     gsup_route_t route;
     if (gsup_router_lookup(&rt->cfg, req.imsi, &route) < 0) {
@@ -1103,6 +1110,9 @@ bool gsup_map_proxy_on_tcap(iwf_runtime_t *rt,
     gsup_pending_t *p = pending_find(tmsg->dtid);
     if (!p)
         return false;
+
+    iwf_imsi_trace_bind_rx("map", tmsg->raw, tmsg->raw_len);
+    iwf_imsi_trace_flush_rx(p->imsi);
 
     if (tmsg->have_otid) {
         p->peer_otid = tmsg->otid;

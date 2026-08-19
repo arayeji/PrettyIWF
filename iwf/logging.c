@@ -1,4 +1,5 @@
 #include "logging.h"
+#include "imsi_trace.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -69,6 +70,54 @@ void iwf_log_close(void)
 void iwf_log_set_level(iwf_log_level_t level)
 {
     g_level = level;
+}
+
+bool iwf_log_should_emit(iwf_log_level_t level, const char *imsi)
+{
+    if (level <= g_level)
+        return true;
+    if (imsi && imsi[0] && iwf_imsi_trace_match(imsi) &&
+        level <= IWF_LOG_DEBUG)
+        return true;
+    return false;
+}
+
+void iwf_log_imsi(iwf_log_level_t level, const char *imsi, const char *component,
+                  const char *fmt, ...)
+{
+    if (!iwf_log_should_emit(level, imsi))
+        return;
+    if (!g_fp) g_fp = stderr;
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm_buf;
+    localtime_r(&tv.tv_sec, &tm_buf);
+
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+
+    va_list ap;
+    va_start(ap, fmt);
+    char msgbuf[2048];
+    vsnprintf(msgbuf, sizeof(msgbuf), fmt, ap);
+    va_end(ap);
+
+    if (imsi && imsi[0]) {
+        fprintf(g_fp, "%s.%03ld [%s] [%-7s] pid=%d [IMSI:%s] %s\n",
+                ts, (long)(tv.tv_usec / 1000),
+                level_str(level), component ? component : "iwf",
+                (int)getpid(), imsi, msgbuf);
+    } else {
+        fprintf(g_fp, "%s.%03ld [%s] [%-7s] pid=%d %s\n",
+                ts, (long)(tv.tv_usec / 1000),
+                level_str(level), component ? component : "iwf",
+                (int)getpid(), msgbuf);
+    }
+    fflush(g_fp);
+
+    if (level <= IWF_LOG_ERROR && g_fp != stderr)
+        fprintf(stderr, "iwf: [%s] %s\n", component ? component : "iwf", msgbuf);
 }
 
 void iwf_log(iwf_log_level_t level, const char *component, const char *fmt, ...)

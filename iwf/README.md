@@ -117,9 +117,36 @@ ip          = 10.0.0.9
 teid        = 0
 
 [logging]
-level       = info              ; error|warn|info|debug|trace
+level       = error             ; error|warn|info|debug|trace (default: error)
 file        = /var/log/iwf.log  ; "-" or empty = stderr
+# trace_imsi  = 432350          ; optional startup prefixes (comma-separated)
+
+[metrics]
+enabled     = 1
+listen_ip   = 127.0.0.1
+listen_port = 9090                ; Pretty5GS-compatible /admin/trace/imsi API
 ```
+
+### Runtime IMSI trace (Pretty5GS-style)
+
+While `iwf` is running, enable per-IMSI debug + PACKET logging via HTTP:
+
+```bash
+curl -sS 'http://127.0.0.1:9090/admin/trace/imsi?imsi=432350'
+curl -sS 'http://127.0.0.1:9090/admin/trace/imsi?imsi=432350745708372&match=exact'
+curl -sS 'http://127.0.0.1:9090/admin/trace/imsi?imsi=list'
+curl -sS 'http://127.0.0.1:9090/admin/trace/imsi?imsi=432350&remove=1'
+curl -sS 'http://127.0.0.1:9090/admin/trace/imsi?force=1'
+curl -sS 'http://127.0.0.1:9090/admin/trace/imsi?imsi=432350745708372&match=exact&replace=1'
+```
+
+Traced IMSIs emit DEBUG-level logs and PACKET lines even when global `level = error`:
+
+```text
+[IMSI:432350745708372] PACKET: proto=map dir=rx len=142 b64=...
+```
+
+Responses without IMSI in the payload (MAP END, Diameter AIA, etc.) are correlated via `map_session_t` (TCAP DTID / Diameter Session-Id).
 
 > The IWF binds **one** UDP socket on `listen_port`. If `listen_ip` is a
 > concrete address, the socket is bound there. If `listen_ip` is `0.0.0.0`

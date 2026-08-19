@@ -57,6 +57,12 @@ typedef struct {
     /* [logging] */
     char        log_level[16];
     char        log_file[256];
+    char        trace_imsi[512];          /* optional startup prefixes (comma-sep) */
+
+    /* [metrics] HTTP admin (Pretty5GS-compatible /admin/trace/imsi) */
+    int         metrics_enabled;
+    char        metrics_listen_ip[64];
+    uint16_t    metrics_listen_port;
 
     /* ============================================================== */
     /* MAP <-> Diameter S6d IWF (independent of the GTP IWF above).   */

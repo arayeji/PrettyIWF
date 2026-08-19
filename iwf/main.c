@@ -22,6 +22,10 @@
 #include "translate.h"
 #include "map_iwf.h"
 #include "test_cmd.h"
+#include "gtp_trace.h"
+#include "imsi_trace.h"
+#include "metrics_http.h"
+#include "gtpv1.h"
 #ifdef GSUP_PROXY_ENABLED
 #  include "gsup_server.h"
 #endif
@@ -116,6 +120,7 @@ int iwf_send_v1(iwf_runtime_t *rt, const iwf_endpoint_t *to,
         LOGE("net", "sendto v1 failed: %s", strerror(errno));
         return -1;
     }
+    iwf_gtp_trace_tx_v1(buf, len);
     return (int)r;
 }
 
@@ -131,6 +136,7 @@ int iwf_send_v2_addr(iwf_runtime_t *rt, const struct sockaddr_in *to,
              inet_ntoa(to->sin_addr), ntohs(to->sin_port), strerror(errno));
         return -1;
     }
+    iwf_gtp_trace_tx_v2(buf, len);
     return (int)r;
 }
 
@@ -156,6 +162,7 @@ static void handle_v1_packet(iwf_runtime_t *rt,
         return;
     }
     iwf_log_hex("net", "RX-Gn raw", buf, len);
+    iwf_gtp_trace_rx_v1(buf, len, &msg);
     translate_v1_request(rt, from, &msg);
 }
 
@@ -171,6 +178,7 @@ static void handle_v2_packet(iwf_runtime_t *rt,
         return;
     }
     iwf_log_hex("net", "RX-S4 raw", buf, len);
+    iwf_gtp_trace_rx_v2(buf, len, &msg);
     translate_v2_response(rt, from, &msg);
 }
 
@@ -238,6 +246,10 @@ int main(int argc, char **argv)
     iwf_log_init(iwf_log_level_from_str(level_override ? level_override
                                                        : rt.cfg.log_level),
                  rt.cfg.log_file);
+
+    iwf_imsi_trace_init();
+    if (rt.cfg.trace_imsi[0])
+        iwf_imsi_trace_load_config(rt.cfg.trace_imsi);
 
     LOGI("iwf", "starting IWF v%s pid=%d config=%s",
          IWF_VERSION, (int)getpid(), conf_path);
@@ -387,6 +399,17 @@ int main(int argc, char **argv)
     }
 #endif
 
+    if (metrics_http_init(&rt, epfd) < 0) {
+        LOGE("iwf", "metrics HTTP init failed; check [metrics] config");
+        if (rt.cfg.metrics_enabled) {
+            map_iwf_shutdown(&rt);
+            close(epfd);
+            close(tfd);
+            close(rt.v1_sock);
+            return 1;
+        }
+    }
+
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGUSR1, on_sigusr1);
@@ -462,6 +485,9 @@ int main(int argc, char **argv)
             case MAP_EPOLL_ROLE_TEST_CMD:
                 test_cmd_on_readable(&rt);
                 break;
+            case METRICS_EPOLL_ROLE:
+                metrics_http_on_readable();
+                break;
 #ifdef GSUP_PROXY_ENABLED
             case GSUP_EPOLL_ROLE_LISTEN:
             case GSUP_EPOLL_ROLE_CONN:
@@ -510,6 +536,8 @@ int main(int argc, char **argv)
     }
 
     LOGI("iwf", "shutting down");
+    metrics_http_shutdown();
+    iwf_imsi_trace_shutdown();
 #ifdef SMS_IWF_ENABLED
     sms_iwf_shutdown(&rt);
 #endif
