@@ -6,6 +6,7 @@
 #include "session.h"
 #include "subscr_cache.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
@@ -189,6 +190,60 @@ static void ctx_pend_free(ctx_pend_t *p)
         return;
     ctx_pend_detach(p);
     free(p);
+}
+
+int translate_ctx_trace_imsi_by_gn_seq(uint16_t gn_seq, char *imsi, size_t cap)
+{
+    ctx_pend_t *pend = NULL;
+    int seq_k;
+
+    if (!imsi || cap == 0)
+        return -1;
+    imsi[0] = '\0';
+    if (!gn_seq)
+        return -1;
+
+    seq_k = (int)gn_seq;
+    HASH_FIND(hh_gn, g_ctx_pend_gn, &seq_k, sizeof(int), pend);
+    if (!pend || !pend->req_imsi[0])
+        return -1;
+    snprintf(imsi, cap, "%s", pend->req_imsi);
+    return 0;
+}
+
+int translate_ctx_trace_imsi_by_v2_seq(uint32_t v2_seq24, char *imsi, size_t cap)
+{
+    ctx_pend_t *pend = NULL;
+    ctx_pend_t *it, *tmp;
+    int seq_k;
+    uint32_t want;
+
+    if (!imsi || cap == 0)
+        return -1;
+    imsi[0] = '\0';
+    if (!v2_seq24)
+        return -1;
+
+    want = v2_seq24 & 0xffffffu;
+    seq_k = (int)want;
+    HASH_FIND(hh_v2, g_ctx_pend_v2, &seq_k, sizeof(int), pend);
+    if (pend && pend->req_imsi[0]) {
+        snprintf(imsi, cap, "%s", pend->req_imsi);
+        return 0;
+    }
+
+    /* MME-init: Context Response echoes the request's 24-bit seq. */
+    HASH_ITER(hh_gn, g_ctx_pend_gn, it, tmp) {
+        if (it->flow != CTX_FLOW_MME_TO_GN)
+            continue;
+        if ((it->mme_seq24 & 0xffffffu) != want)
+            continue;
+        if (!it->req_imsi[0])
+            continue;
+        snprintf(imsi, cap, "%s", it->req_imsi);
+        return 0;
+    }
+    return -1;
 }
 
 typedef struct parsed_pdp130_s {

@@ -31,6 +31,7 @@
 
 #include "diameter.h"
 #include "logging.h"
+#include "imsi_trace.h"
 #include "runtime.h"
 #include "map_session.h"
 #include "map_iwf.h"
@@ -639,7 +640,11 @@ static int diameter_tx_session(struct iwf_runtime *rt, map_session_t *s,
     if (idx < 0) return -1;
     diameter_peer_t *p = diam_peer_at(diam_pool(rt), idx);
     int rc = diameter_tx(p, pkt, off);
-    if (rc == 0) rt->map->stat_diam_tx++;
+    if (rc == 0) {
+        rt->map->stat_diam_tx++;
+        if (s && s->imsi_str[0])
+            iwf_imsi_trace_packet(s->imsi_str, "diameter", "tx", pkt, off);
+    }
     return rc;
 }
 
@@ -1363,10 +1368,16 @@ static void dispatch_message(struct iwf_runtime *rt, int peer_idx,
             return;
         }
         if (cmd_code == DIAMETER_CMD_CLR && app_id == DIAMETER_APP_S6D) {
+            char clr_imsi[MAP_IMSI_STR_MAX];
+            if (diameter_get_user_name(body, body_len, clr_imsi, sizeof(clr_imsi)) == 0)
+                iwf_imsi_trace_packet(clr_imsi, "diameter", "rx", pkt, len);
             map_iwf_on_clr(rt, body, body_len, hbh, e2e, peer_idx);
             return;
         }
         if (cmd_code == DIAMETER_CMD_IDR && app_id == DIAMETER_APP_S6D) {
+            char idr_imsi[MAP_IMSI_STR_MAX];
+            if (diameter_get_user_name(body, body_len, idr_imsi, sizeof(idr_imsi)) == 0)
+                iwf_imsi_trace_packet(idr_imsi, "diameter", "rx", pkt, len);
             map_iwf_on_idr(rt, body, body_len, hbh, e2e, peer_idx);
             return;
         }
@@ -1386,6 +1397,14 @@ static void dispatch_message(struct iwf_runtime *rt, int peer_idx,
     if (cmd_code == DIAMETER_CMD_DPR) {
         LOGI("diameter", "RX DPA peer[%d]", peer_idx);
         return;
+    }
+    {
+        char sid[DIAMETER_SESSION_ID_MAX];
+        sid[0] = '\0';
+        diameter_get_session_id(body, body_len, sid, sizeof(sid));
+        map_session_t *ts = map_sess_find_by_diameter_sid(sid);
+        if (ts && ts->imsi_str[0])
+            iwf_imsi_trace_packet(ts->imsi_str, "diameter", "rx", pkt, len);
     }
     on_answer(rt, cmd_code, body, body_len);
 }

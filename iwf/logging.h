@@ -11,6 +11,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 typedef enum {
     IWF_LOG_ERROR = 0,
@@ -28,6 +29,13 @@ iwf_log_level_t iwf_log_level_from_str(const char *s);
 void iwf_log(iwf_log_level_t level, const char *component,
              const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 
+/* True if line should emit: global level, or traced IMSI at DEBUG and below. */
+bool iwf_log_should_emit(iwf_log_level_t level, const char *imsi);
+
+/* IMSI-aware log: prefix [IMSI:<digits>]; elevates to DEBUG for traced IMSIs. */
+void iwf_log_imsi(iwf_log_level_t level, const char *imsi, const char *component,
+                  const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+
 /* Hex-dump (TRACE only). */
 void iwf_log_hex(const char *component, const char *tag,
                  const void *buf, size_t len);
@@ -37,5 +45,10 @@ void iwf_log_hex(const char *component, const char *tag,
 #define LOGI(comp, ...) iwf_log(IWF_LOG_INFO,  comp, __VA_ARGS__)
 #define LOGD(comp, ...) iwf_log(IWF_LOG_DEBUG, comp, __VA_ARGS__)
 #define LOGT(comp, ...) iwf_log(IWF_LOG_TRACE, comp, __VA_ARGS__)
+
+#define LOGI_IMSI(imsi, comp, ...) iwf_log_imsi(IWF_LOG_INFO,  imsi, comp, __VA_ARGS__)
+#define LOGD_IMSI(imsi, comp, ...) iwf_log_imsi(IWF_LOG_DEBUG, imsi, comp, __VA_ARGS__)
+#define LOGW_IMSI(imsi, comp, ...) iwf_log_imsi(IWF_LOG_WARN,  imsi, comp, __VA_ARGS__)
+#define LOGE_IMSI(imsi, comp, ...) iwf_log_imsi(IWF_LOG_ERROR, imsi, comp, __VA_ARGS__)
 
 #endif /* IWF_LOGGING_H */

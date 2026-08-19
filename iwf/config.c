@@ -21,8 +21,12 @@ static void defaults(iwf_config_t *c)
     c->mme_port = GTP_PORT;
     strncpy(c->sgwc_ip, "127.0.0.1", sizeof(c->sgwc_ip) - 1);
     c->sgwc_port = 2123;
-    strncpy(c->log_level, "info", sizeof(c->log_level) - 1);
+    strncpy(c->log_level, "error", sizeof(c->log_level) - 1);
     strncpy(c->log_file, "-", sizeof(c->log_file) - 1);
+    c->trace_imsi[0] = '\0';
+    c->metrics_enabled = 1;
+    strncpy(c->metrics_listen_ip, "127.0.0.1", sizeof(c->metrics_listen_ip) - 1);
+    c->metrics_listen_port = 9090;
     c->synthetic_uli_no_rai = 0;
     /* Prefer the HSS-advertised PGW (ULA MIP6-Agent-Info) over static [smf]. */
     c->pgw_from_subscription = 1;
@@ -457,7 +461,16 @@ int iwf_config_load(const char *path, iwf_config_t *out)
         } else if (!strcmp(section, "logging")) {
             if      (!strcmp(key, "level")) copy_str(out->log_level, sizeof(out->log_level), val);
             else if (!strcmp(key, "file"))  copy_str(out->log_file, sizeof(out->log_file), val);
+            else if (!strcmp(key, "trace_imsi"))
+                copy_str(out->trace_imsi, sizeof(out->trace_imsi), val);
             else LOGW("config", "unknown key [logging].%s", key);
+        } else if (!strcmp(section, "metrics")) {
+            if      (!strcmp(key, "enabled")) out->metrics_enabled = (atoi(val) != 0);
+            else if (!strcmp(key, "listen_ip"))
+                copy_str(out->metrics_listen_ip, sizeof(out->metrics_listen_ip), val);
+            else if (!strcmp(key, "listen_port"))
+                out->metrics_listen_port = (uint16_t)atoi(val);
+            else LOGW("config", "unknown key [metrics].%s", key);
         } else if (!strcmp(section, "map_iwf")) {
             if      (!strcmp(key, "enabled"))        out->map_iwf_enabled  = (atoi(val) != 0);
             else if (!strcmp(key, "local_gt"))       copy_str(out->map_local_gt, sizeof(out->map_local_gt), val);
