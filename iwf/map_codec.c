@@ -507,6 +507,25 @@ static void dec_isdn_addr_digits(const uint8_t *v, size_t l,
     }
 }
 
+void map_msisdn_avp_to_str(const uint8_t *data, size_t n, char *out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!data || n == 0) return;
+
+    if (data[0] >= '0' && data[0] <= '9') {
+        size_t o = 0;
+        for (size_t i = 0; i < n && o + 1 < cap; i++) {
+            if (data[i] >= '0' && data[i] <= '9')
+                out[o++] = (char)data[i];
+        }
+        out[o] = '\0';
+        return;
+    }
+
+    dec_isdn_addr_digits(data, n, out, cap);
+}
+
 int map_decode_ul_arg(const uint8_t *p, size_t n, map_ul_req_t *out)
 {
     /* UpdateLocationArg ::= SEQUENCE {
@@ -815,6 +834,7 @@ int map_encode_isd_arg(const char *imsi_str,
                        const map_ula_apn_entry_t *apns,
                        size_t n_apns,
                        uint8_t default_context_id,
+                       bool cs_vlr_isd,
                        uint8_t *out, size_t out_cap)
 {
     /* InsertSubscriberDataArg ::= SEQUENCE {
@@ -833,7 +853,7 @@ int map_encode_isd_arg(const char *imsi_str,
      * MAP uses IMPLICIT TAGS — universal 0x04 for IMSI/MSISDN is wrong. */
     uint8_t inner[4096];
     size_t io = 0;
-    const bool cs_only = !(apns && n_apns > 0);
+    const bool cs_only = cs_vlr_isd && !(apns && n_apns > 0);
 
     if (imsi_str && *imsi_str) {
         uint8_t bcd[8];
@@ -844,12 +864,11 @@ int map_encode_isd_arg(const char *imsi_str,
                 return -1;
     }
     if (msisdn_str && *msisdn_str) {
-        uint8_t buf[12];
-        buf[0] = 0x91;
-        int n = map_str_to_bcd(msisdn_str, buf + 1, sizeof(buf) - 1);
-        if (n > 0)
+        uint8_t buf[16];
+        int ml = enc_isdn_addr(msisdn_str, buf, sizeof(buf));
+        if (ml > 0)
             if (ber_enc_tlv(inner, sizeof(inner), &io, 0x81 /* [1] MSISDN */,
-                            buf, (size_t)(n + 1)) < 0)
+                            buf, (size_t)ml) < 0)
                 return -1;
     }
 
@@ -859,14 +878,12 @@ int map_encode_isd_arg(const char *imsi_str,
         if (ber_enc_tlv(inner, sizeof(inner), &io, 0x82 /* [2] category */,
                         &category_ordinary, 1) < 0)
             return -1;
-        /* subscriberStatus [3] ENUMERATED { serviceGranted(0), ... } */
-        static const uint8_t status_granted = 0x00;
-        if (ber_enc_tlv(inner, sizeof(inner), &io, 0x83 /* [3] */,
-                        &status_granted, 1) < 0)
+        if (ber_enc_integer_u32(inner, sizeof(inner), &io, 0x83 /* [3] */,
+                                0 /* serviceGranted */) < 0)
             return -1;
         /* teleserviceList [6]: speech + SMS MT/MO */
         static const uint8_t ts_list[] = {
-            0x04, 0x01, 0x11, /* allSpeechTransmissionServices */
+            0x04, 0x01, 0x10, /* allSpeechTransmissionServices */
             0x04, 0x01, 0x21, /* shortMessageMT-PP */
             0x04, 0x01, 0x22, /* shortMessageMO-PP */
         };
@@ -893,7 +910,8 @@ int map_encode_isd_arg(const char *imsi_str,
             size_t po = 0;
             uint8_t ctx = e->context_id ? e->context_id : (uint8_t)(i + 1);
 
-            if (ber_enc_integer_u32(pdp, sizeof(pdp), &po, 0x02, ctx) < 0)
+            if (ber_enc_integer_u32(pdp, sizeof(pdp), &po, 0x82 /* [2] ctx */,
+                                    ctx) < 0)
                 return -1;
 
             uint8_t pdp_type[2] = { 0xF1, 0x21 };
@@ -928,6 +946,11 @@ int map_encode_isd_arg(const char *imsi_str,
                 continue;
             if (ber_enc_tlv(pdp, sizeof(pdp), &po, 0x94 /* [20] apn */,
                             apn_wire, awi) < 0)
+                return -1;
+
+            /* vplmnAddressAllowed [17] NULL — roaming PDP activation permitted. */
+            if (ber_enc_tlv(pdp, sizeof(pdp), &po, 0x97 /* [17] */,
+                            NULL, 0) < 0)
                 return -1;
 
             if (ber_enc_tlv(gprs_list, sizeof(gprs_list), &gl,

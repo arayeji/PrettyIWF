@@ -155,13 +155,33 @@ static void cmd_test_abort(map_session_t *s, const char *reason)
 
 static void map_sess_timeout_hook_cmd(map_session_t *s, void *hook_ctx)
 {
-    (void)hook_ctx;
-    if (!s || !s->cmd_test) {
+    struct iwf_runtime *rt = (struct iwf_runtime *)hook_ctx;
+
+    if (!s) return;
+
+    if (!s->cmd_test) {
 #ifdef GSUP_PROXY_ENABLED
-        if (s && s->gsup_originated && hook_ctx) {
-            gsup_map_proxy_on_timeout((struct iwf_runtime *)hook_ctx, s);
+        if (s->gsup_originated && rt) {
+            gsup_map_proxy_on_timeout(rt, s);
+            return;
         }
 #endif
+        if (rt && !s->gsup_originated) {
+            if (s->map_op == MAP_OP_ISD && s->have_parent_tid) {
+                map_session_t *parent =
+                    map_sess_find_by_tid(s->parent_tcap_dialogue_id);
+                if (parent &&
+                    parent->state == MAP_SESS_WAIT_MAP_ACK &&
+                    parent->map_op == MAP_OP_UGL) {
+                    send_tcap_end_with_error(rt, parent, parent->peer_invoke_id,
+                                             MAP_ERR_SYSTEM_FAILURE, 1);
+                }
+            } else if (s->state == MAP_SESS_WAIT_MAP_ACK &&
+                       (s->map_op == MAP_OP_UL || s->map_op == MAP_OP_UGL)) {
+                send_tcap_end_with_error(rt, s, s->peer_invoke_id,
+                                         MAP_ERR_SYSTEM_FAILURE, 1);
+            }
+        }
         return;
     }
     if (s->cmd_test_reply_fd >= 0) {
@@ -269,6 +289,7 @@ static void handle_begin_ugl(struct iwf_runtime *rt,
     map_session_t *s = map_sess_create(map_sess_new_tid());
     if (!s) return;
     s->map_op = MAP_OP_UGL;
+    s->gsup_cn_domain = GSUP_CN_DOMAIN_PS;
     s->state  = MAP_SESS_WAIT_DIAMETER;
     s->peer_tcap_dialogue_id = tmsg->otid;
     s->have_peer_tid         = tmsg->have_otid;
@@ -523,6 +544,19 @@ static void finish_ul_with_result(struct iwf_runtime *rt, map_session_t *s)
                               params, (size_t)pn);
 }
 
+static void finish_ugl_with_result(struct iwf_runtime *rt, map_session_t *s)
+{
+    uint8_t params[64];
+    int pn = encode_loc_up_res(rt, params, sizeof(params));
+    if (pn < 0) {
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id, MAP_ERR_SYSTEM_FAILURE, 1);
+        return;
+    }
+    send_tcap_end_with_result(rt, s, s->peer_invoke_id,
+                              MAP_OP_CODE_UPDATE_GPRS_LOCATION,
+                              params, (size_t)pn);
+}
+
 static void handle_continue_or_end(struct iwf_runtime *rt,
                                    const tcap_msg_t *tmsg)
 {
@@ -559,10 +593,24 @@ static void handle_continue_or_end(struct iwf_runtime *rt,
         return;
     }
 
-    /* Standalone ISD dialogue (UGL path): ack only. */
+    /* Standalone ISD dialogue (UGL path): ack then UGL ReturnResult on parent. */
     if (s->state == MAP_SESS_WAIT_MAP_ACK && s->map_op == MAP_OP_ISD) {
-        LOGI("map", "[%s] ISD acked by SGSN tid=0x%08x",
-             s->imsi_str, s->tcap_dialogue_id);
+        if (s->have_parent_tid) {
+            map_session_t *parent =
+                map_sess_find_by_tid(s->parent_tcap_dialogue_id);
+            if (parent && parent->map_op == MAP_OP_UGL &&
+                parent->state == MAP_SESS_WAIT_MAP_ACK) {
+                LOGI("map",
+                     "[%s] ISD acked tid=0x%08x -> TX UGL End (parent tid=0x%08x)",
+                     parent->imsi_str,
+                     s->tcap_dialogue_id,
+                     parent->tcap_dialogue_id);
+                finish_ugl_with_result(rt, parent);
+            }
+        } else {
+            LOGI("map", "[%s] ISD acked by SGSN tid=0x%08x",
+                 s->imsi_str, s->tcap_dialogue_id);
+        }
         s->state = MAP_SESS_DONE;
         map_sess_remove(s);
         return;
@@ -1121,34 +1169,24 @@ static int ula_add_apn_entry(map_session_t *s, const diameter_avp_t *apnc)
 
 static void decode_ula_msisdn(const uint8_t *data, size_t n, char *out, size_t cap)
 {
-    if (!out || cap == 0) return;
-    out[0] = '\0';
-    if (!data || n == 0) return;
+    map_msisdn_avp_to_str(data, n, out, cap);
+}
 
-    /* Some HSS builds store plain ASCII digits (no TBCD / TON-NPI). */
-    if (data[0] >= '0' && data[0] <= '9') {
-        size_t o = 0;
-        for (size_t i = 0; i < n && o + 1 < cap; i++) {
-            if (data[i] >= '0' && data[i] <= '9')
-                out[o++] = (char)data[i];
-        }
-        out[o] = '\0';
-        return;
+static void ula_collect_apn_configs(map_session_t *s,
+                                  const uint8_t *buf, size_t len)
+{
+    diameter_avp_t it;
+    if (!s || !buf || len < 8) return;
+    if (diameter_avp_first(buf, len, &it) < 0) return;
+    for (;;) {
+        if (it.code == AVP_3GPP_APN_CONFIGURATION &&
+            it.vendor_id == DIAMETER_VENDOR_3GPP)
+            (void)ula_add_apn_entry(s, &it);
+        if (it.data_len >= 8)
+            ula_collect_apn_configs(s, it.data, it.data_len);
+        if (diameter_avp_next(buf, len, &it) < 0)
+            break;
     }
-
-    /* TS 29.329 MSISDN AVP: optional leading TON/NPI (e.g. 0x91), not digits. */
-    size_t start = 0;
-    if (n > 0 && (data[0] & 0x0f) == 0x01) /* ISDN numbering plan */
-        start = 1;
-
-    size_t o = 0;
-    for (size_t i = start; i < n && o + 1 < cap; i++) {
-        uint8_t lo = data[i] & 0x0f;
-        uint8_t hi = (data[i] >> 4) & 0x0f;
-        if (lo <= 9) out[o++] = (char)('0' + lo);
-        if (hi <= 9 && o + 1 < cap) out[o++] = (char)('0' + hi);
-    }
-    out[o] = '\0';
 }
 
 static void extract_ula_subdata(map_session_t *s,
@@ -1160,6 +1198,7 @@ static void extract_ula_subdata(map_session_t *s,
     s->ula_ambr_ul_bps = 0;
     s->ula_ambr_dl_bps = 0;
     s->msisdn_str[0] = '\0';
+    s->have_ula_subdata = false;
 
     diameter_avp_t msisdn_avp;
     if (diameter_avp_find_recursive(body, body_len, AVP_3GPP_MSISDN,
@@ -1168,7 +1207,7 @@ static void extract_ula_subdata(map_session_t *s,
                           s->msisdn_str, sizeof(s->msisdn_str));
 
     diameter_avp_t sd;
-    if (diameter_avp_find(body, body_len, AVP_3GPP_SUBSCRIPTION_DATA,
+    if (diameter_avp_find_recursive(body, body_len, AVP_3GPP_SUBSCRIPTION_DATA,
                           DIAMETER_VENDOR_3GPP, &sd) < 0) {
         if (s->msisdn_str[0]) {
             s->have_ula_subdata = true;
@@ -1223,6 +1262,9 @@ static void extract_ula_subdata(map_session_t *s,
             }
         }
     }
+
+    if (want_apn && s->n_ula_apns == 0)
+        ula_collect_apn_configs(s, sd.data, sd.data_len);
 
     if (s->n_ula_apns > 0) {
         map_ula_apn_entry_t *def = &s->ula_apns[0];
@@ -1366,9 +1408,18 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
     }
     extract_ula_subdata(s, body, body_len);
 
-    /* If we have any subscription data, push ISD first (then UL/UGL Resp).
-     * Otherwise send the location-update ReturnResult immediately. */
-    if (s->have_ula_subdata && (s->msisdn_str[0] || s->n_ula_apns > 0)) {
+    if (s->map_op == MAP_OP_UL && !s->msisdn_str[0]) {
+        LOGE("map",
+             "[%s] CS ULA: no MSISDN for ISD (Open5GS subscriber msisdn[] required)",
+             s->imsi_str);
+        send_tcap_end_with_error(rt, s, s->peer_invoke_id,
+                                 MAP_ERR_UNKNOWN_SUBSCRIBER, 1);
+        return;
+    }
+
+    bool need_isd = (s->map_op == MAP_OP_UL && s->msisdn_str[0]) ||
+                    (s->map_op == MAP_OP_UGL && s->n_ula_apns > 0);
+    if (s->have_ula_subdata && need_isd) {
         send_isd_invoke(rt, s);
         return;
     }
@@ -1385,6 +1436,7 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
 
 static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
 {
+    const bool cs_vlr_isd = (parent->map_op == MAP_OP_UL);
     /* CS MAP UL: MSISDN only (no GPRS PDP list toward VLR). */
     const map_ula_apn_entry_t *apns = parent->ula_apns;
     size_t n_apns = parent->n_ula_apns;
@@ -1399,6 +1451,7 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
                                 apns,
                                 n_apns,
                                 parent->ula_default_context_id,
+                                cs_vlr_isd,
                                 arg, sizeof(arg));
     if (an < 0) {
         LOGE("map", "[%s] ISD: encode failed", parent->imsi_str);
@@ -1465,7 +1518,7 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
         return;
     }
 
-    /* UGL: separate subscriberDataMngt dialogue for ISD, then UGL End. */
+    /* UGL: separate subscriberDataMngt dialogue; UGL End after ISD ack. */
     map_session_t *isd = map_sess_create(map_sess_new_tid());
     if (!isd) {
         LOGE("map", "[%s] ISD: alloc failed", parent->imsi_str);
@@ -1474,6 +1527,8 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
     isd->map_op = MAP_OP_ISD;
     isd->state  = MAP_SESS_WAIT_MAP_ACK;
     isd->t_dialogue_ms = parent->t_dialogue_ms;
+    isd->parent_tcap_dialogue_id = parent->tcap_dialogue_id;
+    isd->have_parent_tid = true;
     memcpy(isd->imsi_str, parent->imsi_str, sizeof(isd->imsi_str));
 
     uint8_t cmp[1200]; size_t co = 0;
@@ -1506,25 +1561,17 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
         return;
     }
     rt->map->stat_map_tx++;
+    parent->state = MAP_SESS_WAIT_MAP_ACK;
+    map_sess_touch(parent);
     LOGI("map",
-         "[%s] TX BEGIN ISD tid=0x%08x apns=%u (%s parent tid=0x%08x)",
+         "[%s] TX BEGIN ISD tid=0x%08x apns=%u (%s parent tid=0x%08x msisdn=%s) "
+         "(await ISD ack then UGL End)",
          parent->imsi_str,
          isd->tcap_dialogue_id,
          (unsigned)n_apns,
          map_op_str(parent->map_op),
-         parent->tcap_dialogue_id);
-
-    /* Also send the UGL ReturnResult on the parent dialogue. */
-    uint8_t params[64];
-    int pn = encode_loc_up_res(rt, params, sizeof(params));
-    if (pn < 0) {
-        send_tcap_end_with_error(rt, parent, parent->peer_invoke_id,
-                                 MAP_ERR_SYSTEM_FAILURE, 1);
-        return;
-    }
-    send_tcap_end_with_result(rt, parent, parent->peer_invoke_id,
-                              loc_up_result_opcode(parent->map_op),
-                              params, (size_t)pn);
+         parent->tcap_dialogue_id,
+         parent->msisdn_str[0] ? parent->msisdn_str : "(none)");
 }
 
 static int send_map_cl_begin(struct iwf_runtime *rt, const char *imsi,
