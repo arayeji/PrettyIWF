@@ -198,7 +198,12 @@ int map_encode_isd_arg(const char *imsi_str,
                        const map_ula_apn_entry_t *apns,
                        size_t n_apns,
                        uint8_t default_context_id,
+                       bool cs_vlr_isd,
                        uint8_t *out, size_t out_cap);
+
+/* Diameter / MAP MSISDN AVP → digit string (TBCD or ASCII). */
+void map_msisdn_avp_to_str(const uint8_t *data, size_t n,
+                           char *out, size_t cap);
 
 /* MAP CancelLocation Invoke argument (HSS-originated CLR -> we Invoke CL). */
 int map_encode_cl_arg(const uint8_t *imsi_bcd, size_t imsi_bcd_len,

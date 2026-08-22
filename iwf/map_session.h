@@ -129,6 +129,10 @@ typedef struct map_session {
     /* ISD invoke id used on UL CONTINUE (echoed by VLR ReturnResult). */
     uint8_t             isd_invoke_id;
 
+    /* UGL: ISD runs on a child dialogue; parent waits before UGL ReturnResult. */
+    uint32_t            parent_tcap_dialogue_id;
+    bool                have_parent_tid;
+
     /* PLMN of the SGSN, used to populate Visited-PLMN-Id AVP. BCD encoded
      * (TS 24.008 §10.5.1.3) - 3 octets [MCC2|MCC1, MNC3|MCC3, MNC2|MNC1]. */
     uint8_t             visited_plmn_bcd[3];
