@@ -13,9 +13,9 @@
  * AARQ / AARE
  * -----------
  * Each MAP dialogue carries either an AARQ (in TCAP Begin) or AARE (in TCAP
- * Continue/End) inside the dialogue portion.  We emit a compact AARQ/AARE
- * carrying just the application-context-name OID; that's all the MAP spec
- * requires for our supported operations.
+ * Continue/End) inside the dialogue portion.  AARQ carries protocol-version
+ * and application-context-name.  AARE additionally carries mandatory Q.773
+ * result (accepted) and result-source-diagnostic (dialogue-service-user null).
  *
  * Note: MAP encoding has many vendor- and version-specific edge cases.  This
  * codec implements the common subset that interoperates with Osmocom HLRs,
@@ -1075,9 +1075,13 @@ static int enc_aaXX(uint8_t apdu_tag, map_app_ctx_t ac,
     size_t ac_len;
     if (oid_for_ac(ac, &ac_oid, &ac_len) < 0) return -1;
 
-    /* AARQ/AARE body:
+    /* AARQ/AARE body (ITU-T Q.773):
      *   [0] IMPLICIT protocol-version: { version1 (0) }   -> 80 02 07 80
-     *   [1] EXPLICIT application-context-name OID         -> A1 <len> 06 <len> <oid bytes>
+     *   [1] EXPLICIT application-context-name OID         -> A1 <len> 06 <len> <oid>
+     * AARE only (mandatory):
+     *   [2] EXPLICIT result accepted(0)                     -> A2 03 02 01 00
+     *   [3] EXPLICIT result-source-diagnostic             -> A3 05 A1 03 02 01 00
+     *       (dialogue-service-user null)
      */
     uint8_t apdu[64];
     size_t  apo = 0;
@@ -1090,6 +1094,31 @@ static int enc_aaXX(uint8_t apdu_tag, map_app_ctx_t ac,
     if (ber_enc_tlv(ac_tlv, sizeof(ac_tlv), &at, 0x06 /* OID */,
                     ac_oid, ac_len) < 0) return -1;
     if (ber_enc_tlv(apdu, sizeof(apdu), &apo, 0xA1, ac_tlv, at) < 0) return -1;
+
+    if (apdu_tag == 0x61 /* AARE */) {
+        uint8_t result_inner[8];
+        size_t  ri = 0;
+        if (ber_enc_integer_u32(result_inner, sizeof(result_inner), &ri,
+                                0x02 /* INTEGER */, 0) < 0)
+            return -1;
+        if (ber_enc_tlv(apdu, sizeof(apdu), &apo, 0xA2 /* [2] result */,
+                        result_inner, ri) < 0)
+            return -1;
+
+        uint8_t diag_user[8];
+        size_t  du = 0;
+        if (ber_enc_integer_u32(diag_user, sizeof(diag_user), &du,
+                                0x02 /* INTEGER */, 0) < 0)
+            return -1;
+        uint8_t diag_choice[16];
+        size_t  dc = 0;
+        if (ber_enc_tlv(diag_choice, sizeof(diag_choice), &dc, 0xA1,
+                        diag_user, du) < 0)
+            return -1;
+        if (ber_enc_tlv(apdu, sizeof(apdu), &apo, 0xA3,
+                        diag_choice, dc) < 0)
+            return -1;
+    }
 
     /* Wrap APDU in [APPLICATION 0] (AARQ) / [APPLICATION 1] (AARE). */
     uint8_t single_asn1[128];
