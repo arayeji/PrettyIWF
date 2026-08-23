@@ -580,15 +580,13 @@ static void handle_continue_or_end(struct iwf_runtime *rt,
             s->have_peer_tid = true;
         }
         if (tmsg->type == TCAP_MSG_END) {
-            /* Dialogue already closed by VLR; cannot send updateLocation Res. */
-            LOGW("map",
-                 "[%s] ISD ack via END tid=0x%08x; dropping UL result",
+            LOGI("map",
+                 "[%s] ISD ack via END tid=0x%08x -> TX UL End",
                  s->imsi_str, s->tcap_dialogue_id);
-            map_sess_remove(s);
-            return;
+        } else {
+            LOGI("map", "[%s] ISD acked on UL dialogue tid=0x%08x -> TX UL End",
+                 s->imsi_str, s->tcap_dialogue_id);
         }
-        LOGI("map", "[%s] ISD acked on UL dialogue tid=0x%08x -> TX UL End",
-             s->imsi_str, s->tcap_dialogue_id);
         finish_ul_with_result(rt, s);
         return;
     }
@@ -1349,7 +1347,8 @@ static void extract_ula_subdata(map_session_t *s,
  * MSISDN/APN/AMBR directly into the UGL ReturnResult Extension Container
  * is NOT supported - the SGSN gets the subscription data via a follow-up
  * ISD Invoke, exactly as TS 29.002 describes. */
-static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent);
+static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent,
+                            bool isd_before_loc_up);
 
 /* UpdateLocationRes / UpdateGprsLocationRes: hlr-Number = local_gt when set. */
 static int encode_loc_up_res(struct iwf_runtime *rt,
@@ -1420,7 +1419,7 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
     bool need_isd = (s->map_op == MAP_OP_UL && s->msisdn_str[0]) ||
                     (s->map_op == MAP_OP_UGL && s->n_ula_apns > 0);
     if (s->have_ula_subdata && need_isd) {
-        send_isd_invoke(rt, s);
+        send_isd_invoke(rt, s, rt->cfg.map_isd_before_loc_up);
         return;
     }
     uint8_t params[64];
@@ -1434,7 +1433,8 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
                               params, (size_t)pn);
 }
 
-static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
+static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent,
+                            bool isd_before_loc_up)
 {
     const bool cs_vlr_isd = (parent->map_op == MAP_OP_UL);
     /* CS MAP UL: MSISDN only (no GPRS PDP list toward VLR). */
@@ -1460,10 +1460,82 @@ static void send_isd_invoke(struct iwf_runtime *rt, map_session_t *parent)
         return;
     }
 
+    /* Loc-up ReturnResult first, then ISD on a separate dialogue. */
+    if (!isd_before_loc_up) {
+        ss7_sccp_addr_t peer_sccp = parent->peer_sccp;
+        bool have_peer = parent->have_peer_sccp;
+        char imsi[MAP_IMSI_STR_MAX];
+        char msisdn[MAP_MSISDN_STR_MAX];
+        int t_dialogue_ms = parent->t_dialogue_ms;
+        map_op_t loc_op = parent->map_op;
+
+        memcpy(imsi, parent->imsi_str, sizeof(imsi));
+        memcpy(msisdn, parent->msisdn_str, sizeof(msisdn));
+
+        if (loc_op == MAP_OP_UL)
+            finish_ul_with_result(rt, parent);
+        else if (loc_op == MAP_OP_UGL)
+            finish_ugl_with_result(rt, parent);
+        else
+            return;
+
+        map_session_t *isd = map_sess_create(map_sess_new_tid());
+        if (!isd) {
+            LOGE("map", "[%s] ISD: alloc failed (after loc-up End)", imsi);
+            return;
+        }
+        isd->map_op = MAP_OP_ISD;
+        isd->state  = MAP_SESS_WAIT_MAP_ACK;
+        isd->t_dialogue_ms = t_dialogue_ms;
+        memcpy(isd->imsi_str, imsi, sizeof(isd->imsi_str));
+
+        uint8_t cmp[1200]; size_t co = 0;
+        if (tcap_enc_invoke(cmp, sizeof(cmp), &co, 1,
+                            MAP_OP_CODE_INSERT_SUBSCRIBER_DATA,
+                            arg, (size_t)an) < 0) {
+            map_sess_remove(isd);
+            return;
+        }
+        uint8_t dlg[128];
+        int dn = map_encode_aarq(MAP_AC_SUBSCRIBER_DATA_MGMT_V3, dlg, sizeof(dlg));
+        if (dn < 0) {
+            map_sess_remove(isd);
+            return;
+        }
+        uint8_t out[2048];
+        int n = tcap_encode_message(TCAP_MSG_BEGIN,
+                                    isd->tcap_dialogue_id, true,
+                                    0, false,
+                                    dlg, (size_t)dn,
+                                    cmp, co,
+                                    out, sizeof(out));
+        if (n < 0) {
+            map_sess_remove(isd);
+            return;
+        }
+        if (have_peer) {
+            isd->peer_sccp = peer_sccp;
+            isd->have_peer_sccp = true;
+        }
+        if (map_send_tcap_to_peer(rt, isd, out, (size_t)n) < 0) {
+            LOGE("map", "[%s] ISD: SCCP send failed (after loc-up End)", imsi);
+            map_sess_remove(isd);
+            return;
+        }
+        rt->map->stat_map_tx++;
+        LOGI("map",
+             "[%s] TX loc-up End then BEGIN ISD tid=0x%08x apns=%u op=%s msisdn=%s",
+             imsi,
+             isd->tcap_dialogue_id,
+             (unsigned)n_apns,
+             map_op_str(loc_op),
+             msisdn[0] ? msisdn : "(none)");
+        return;
+    }
+
     /*
-     * MAP-C networkLocUp: ISD must ride the same dialogue as updateLocation
-     * (TC-CONTINUE + AARE + Invoke ISD). A separate subscriberDataMngt BEGIN
-     * is ignored/rejected by the VLR and leaves UL hanging until timeout.
+     * ISD before loc-up result (TS 29.002): MAP-C UL uses the same dialogue
+     * (TC-CONTINUE + AARE + ISD). UGL uses a child ISD dialogue, then UGL End.
      */
     if (parent->map_op == MAP_OP_UL) {
         const uint8_t isd_iid = 1;

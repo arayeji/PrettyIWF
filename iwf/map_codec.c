@@ -486,8 +486,11 @@ int map_decode_ugl_res(const uint8_t *p, size_t n,
 static int enc_isdn_addr(const char *digits, uint8_t *buf, size_t cap)
 {
     if (!digits || !digits[0] || cap < 2) return -1;
+    char norm[MAP_MSISDN_STR_MAX];
+    map_normalize_msisdn_digits(digits, norm, sizeof(norm));
+    if (!norm[0]) return -1;
     buf[0] = 0x91;
-    int n = map_str_to_bcd(digits, buf + 1, cap - 1);
+    int n = map_str_to_bcd(norm, buf + 1, cap - 1);
     if (n < 0) return -1;
     return n + 1;
 }
@@ -520,10 +523,51 @@ void map_msisdn_avp_to_str(const uint8_t *data, size_t n, char *out, size_t cap)
                 out[o++] = (char)data[i];
         }
         out[o] = '\0';
+        map_normalize_msisdn_digits(out, out, cap);
         return;
     }
 
     dec_isdn_addr_digits(data, n, out, cap);
+    map_normalize_msisdn_digits(out, out, cap);
+}
+
+void map_normalize_msisdn_digits(const char *in, char *out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!in) return;
+
+    char digits[MAP_MSISDN_STR_MAX];
+    size_t n = 0;
+    for (const char *p = in; *p && n + 1 < sizeof(digits); p++) {
+        if (*p >= '0' && *p <= '9')
+            digits[n++] = *p;
+    }
+    digits[n] = '\0';
+    if (!n) return;
+
+    /* Strip duplicated international prefix 91 before 98 (9198… → 98…). */
+    if (n > 4 && !strncmp(digits, "9198", 4)) {
+        snprintf(out, cap, "%s", digits + 2);
+        return;
+    }
+    /* Iran national 10 digits starting with 9 → prepend 98. */
+    if (n == 10 && digits[0] == '9') {
+        snprintf(out, cap, "98%s", digits);
+        return;
+    }
+    /* Common ULA/HSS typo: 891219… instead of 9891219… (missing 9 after 98). */
+    if (n == 13 && !strncmp(digits, "891", 3)) {
+        snprintf(out, cap, "989%s", digits + 2);
+        return;
+    }
+    snprintf(out, cap, "%s", digits);
+}
+
+/* MAP IMPLICIT context-specific primitive tag [n]. */
+static uint8_t map_ctx_tag_prim(uint8_t n)
+{
+    return (uint8_t)(0x80 | (n & 0x1f));
 }
 
 int map_decode_ul_arg(const uint8_t *p, size_t n, map_ul_req_t *out)
@@ -881,9 +925,9 @@ int map_encode_isd_arg(const char *imsi_str,
         if (ber_enc_integer_u32(inner, sizeof(inner), &io, 0x83 /* [3] */,
                                 0 /* serviceGranted */) < 0)
             return -1;
-        /* teleserviceList [6]: speech + SMS MT/MO */
+        /* teleserviceList [6]: telephony + SMS MT/MO */
         static const uint8_t ts_list[] = {
-            0x04, 0x01, 0x10, /* allSpeechTransmissionServices */
+            0x04, 0x01, 0x11, /* telephony (allSpeechTransmissionServices) */
             0x04, 0x01, 0x21, /* shortMessageMT-PP */
             0x04, 0x01, 0x22, /* shortMessageMO-PP */
         };
@@ -892,7 +936,8 @@ int map_encode_isd_arg(const char *imsi_str,
             return -1;
     }
 
-    if (apns && n_apns > 0) {
+    /* GPRS subscription is SGSN-only; VLR shall ignore it (TS 29.002 §8.8.1.3). */
+    if (!cs_vlr_isd && apns && n_apns > 0) {
         /* Rel-99 QoS-Subscribed default (osmocom-compatible). */
         static const uint8_t default_qos[] = {
             0x57, 0x59, 0x96, 0x6C, 0x62, 0x76, 0x86, 0x60,
@@ -910,7 +955,8 @@ int map_encode_isd_arg(const char *imsi_str,
             size_t po = 0;
             uint8_t ctx = e->context_id ? e->context_id : (uint8_t)(i + 1);
 
-            if (ber_enc_integer_u32(pdp, sizeof(pdp), &po, 0x82 /* [2] ctx */,
+            /* pdp-ContextId is untagged ContextId INTEGER in PDP-Context. */
+            if (ber_enc_integer_u32(pdp, sizeof(pdp), &po, 0x02,
                                     ctx) < 0)
                 return -1;
 
@@ -919,11 +965,13 @@ int map_encode_isd_arg(const char *imsi_str,
                 pdp_type[1] = 0x57;
             else if (e->pdn_type_nr == 0x8d)
                 pdp_type[1] = 0x8d;
-            if (ber_enc_tlv(pdp, sizeof(pdp), &po, 0xB0 /* [16] pdp-Type */,
+            if (ber_enc_tlv(pdp, sizeof(pdp), &po,
+                            map_ctx_tag_prim(16) /* [16] pdp-Type */,
                             pdp_type, sizeof(pdp_type)) < 0)
                 return -1;
 
-            if (ber_enc_tlv(pdp, sizeof(pdp), &po, 0x92 /* [18] qos-Subscribed */,
+            if (ber_enc_tlv(pdp, sizeof(pdp), &po,
+                            map_ctx_tag_prim(18) /* [18] qos-Subscribed */,
                             default_qos, sizeof(default_qos)) < 0)
                 return -1;
 
@@ -944,12 +992,14 @@ int map_encode_isd_arg(const char *imsi_str,
             }
             if (awi < 2)
                 continue;
-            if (ber_enc_tlv(pdp, sizeof(pdp), &po, 0x94 /* [20] apn */,
+            if (ber_enc_tlv(pdp, sizeof(pdp), &po,
+                            map_ctx_tag_prim(20) /* [20] apn */,
                             apn_wire, awi) < 0)
                 return -1;
 
-            /* vplmnAddressAllowed [17] NULL — roaming PDP activation permitted. */
-            if (ber_enc_tlv(pdp, sizeof(pdp), &po, 0x97 /* [17] */,
+            /* vplmnAddressAllowed [19] NULL — roaming PDP activation permitted. */
+            if (ber_enc_tlv(pdp, sizeof(pdp), &po,
+                            map_ctx_tag_prim(19),
                             NULL, 0) < 0)
                 return -1;
 
@@ -964,11 +1014,11 @@ int map_encode_isd_arg(const char *imsi_str,
         uint8_t gprs_sub[3200];
         size_t gs = 0;
 
-        /* completeDataListIncluded [0] NULL — replace full PDP list. */
-        if (ber_enc_tlv(gprs_sub, sizeof(gprs_sub), &gs, 0x80, NULL, 0) < 0)
+        /* completeDataListIncluded NULL OPTIONAL (untagged in SEQUENCE). */
+        if (ber_enc_tlv(gprs_sub, sizeof(gprs_sub), &gs, 0x05, NULL, 0) < 0)
             return -1;
 
-        /* gprsDataList [1] IMPLICIT SEQUENCE OF PDP-Context */
+        /* gprsDataList [1] IMPLICIT GPRSDataList */
         if (ber_enc_tlv(gprs_sub, sizeof(gprs_sub), &gs, 0xA1,
                         gprs_list, gl) < 0)
             return -1;

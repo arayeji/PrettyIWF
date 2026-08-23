@@ -205,6 +205,9 @@ int map_encode_isd_arg(const char *imsi_str,
 void map_msisdn_avp_to_str(const uint8_t *data, size_t n,
                            char *out, size_t cap);
 
+/* Normalize MSISDN digits for MAP ISDN-AddressString (E.164, Iran 98…). */
+void map_normalize_msisdn_digits(const char *in, char *out, size_t cap);
+
 /* MAP CancelLocation Invoke argument (HSS-originated CLR -> we Invoke CL). */
 int map_encode_cl_arg(const uint8_t *imsi_bcd, size_t imsi_bcd_len,
                       uint8_t cancellation_type,

@@ -82,6 +82,10 @@ typedef struct {
 #define IWF_SCCP_RI_SSN 1
     int         map_sccp_ri;              /* default IWF_SCCP_RI_GT */
     int         map_t_dialogue_ms;        /* TCAP T-timeout default        */
+    /* 1 = insertSubscriberData before updateLocation/updateGprsLocation
+     *     ReturnResult (TS 29.002; UL ISD on same dialogue CONTINUE).
+     * 0 = loc-up ReturnResult first, then ISD on subscriberDataMngt BEGIN. */
+    int         map_isd_before_loc_up;
     char        map_cmd_sock_path[128];   /* UNIX cmd socket (SAI test); default /tmp/iwf_cmd.sock */
 
     /* MSRN pools for ProvideRoamingNumber (optional; empty = feature off). */

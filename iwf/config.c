@@ -50,6 +50,7 @@ static void defaults(iwf_config_t *c)
     c->map_local_ssn      = 149;
     c->map_sccp_ri        = IWF_SCCP_RI_GT;
     c->map_t_dialogue_ms  = 10000;
+    c->map_isd_before_loc_up = 1;
     c->map_msrn_ttl_sec   = 30;
     c->map_msrn_consume_on_lookup = 1;
     c->map_msrn_n_pools   = 0;
@@ -486,6 +487,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
                 else
                     LOGW("config", "bad [map_iwf].sccp_ri '%s' (want gt|ssn)", val);
             } else if (!strcmp(key, "t_dialogue_ms"))  out->map_t_dialogue_ms = atoi(val);
+            else if (!strcmp(key, "isd_before_loc_up"))
+                out->map_isd_before_loc_up = (atoi(val) != 0);
             else if (!strcmp(key, "cmd_sock"))
                 copy_str(out->map_cmd_sock_path, sizeof(out->map_cmd_sock_path), val);
             else if (!strcmp(key, "msrn_ttl_sec")) {
@@ -696,12 +699,15 @@ void iwf_config_dump(const iwf_config_t *c)
          c->log_level, c->log_file);
 
     if (c->map_iwf_enabled) {
-        LOGI("config", "map_iwf: local_gt=%s local_pc=%s ssn=%u sccp_ri=%s t_dialogue=%dms cmd_sock=%s",
+        LOGI("config",
+             "map_iwf: local_gt=%s local_pc=%s ssn=%u sccp_ri=%s t_dialogue=%dms "
+             "isd_before_loc_up=%d cmd_sock=%s",
              c->map_local_gt[0] ? c->map_local_gt : "(unset)",
              c->map_local_pc[0] ? c->map_local_pc : "(unset)",
              (unsigned)c->map_local_ssn,
              c->map_sccp_ri == IWF_SCCP_RI_SSN ? "ssn" : "gt",
              c->map_t_dialogue_ms,
+             c->map_isd_before_loc_up,
              c->map_cmd_sock_path[0] ? c->map_cmd_sock_path : "(default)");
         if (c->map_msrn_n_pools > 0) {
             LOGI("config",
