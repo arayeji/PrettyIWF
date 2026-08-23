@@ -534,9 +534,12 @@ void map_msisdn_avp_to_str(const uint8_t *data, size_t n, char *out, size_t cap)
 void map_normalize_msisdn_digits(const char *in, char *out, size_t cap)
 {
     if (!out || cap == 0) return;
-    out[0] = '\0';
-    if (!in) return;
+    if (!in) {
+        out[0] = '\0';
+        return;
+    }
 
+    /* Copy digits first — callers often pass in == out. */
     char digits[MAP_MSISDN_STR_MAX];
     size_t n = 0;
     for (const char *p = in; *p && n + 1 < sizeof(digits); p++) {
@@ -544,7 +547,10 @@ void map_normalize_msisdn_digits(const char *in, char *out, size_t cap)
             digits[n++] = *p;
     }
     digits[n] = '\0';
-    if (!n) return;
+    if (!n) {
+        out[0] = '\0';
+        return;
+    }
 
     /* Strip duplicated international prefix 91 before 98 (9198… → 98…). */
     if (n > 4 && !strncmp(digits, "9198", 4)) {
