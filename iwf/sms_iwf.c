@@ -330,8 +330,7 @@ void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
 
     int conn = gsup_map_proxy_cs_conn_for_imsi(s->imsi);
     if (conn < 0) {
-        LOGI("sms", "[%s] MT-FSM: subscriber not attached -> absent",
-             s->imsi);
+        LOGI("sms", "[%s] MT-FSM: no MSC GSUP conn -> absent", s->imsi);
         sms_mt_send_end(s, 1, sms_mt_err_absent(s), NULL, 0);
         free(s);
         return;

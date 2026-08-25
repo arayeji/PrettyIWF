@@ -61,8 +61,15 @@ typedef struct {
 } gsup_imsi_conn_t;
 static gsup_imsi_conn_t *g_imsi_conn;
 
+/* Most recent conn that spoke CS-domain GSUP: MT-SMS fallback when the
+ * per-IMSI table is cold (e.g. right after an IWF restart).  The MSC
+ * knows its own VLR state and will page or reject properly. */
+static int g_last_cs_conn = -1;
+
 static void gsup_track_conn(const char *imsi, int conn_id, uint8_t cn_domain)
 {
+    if (cn_domain == GSUP_CN_DOMAIN_CS && conn_id >= 0)
+        g_last_cs_conn = conn_id;
     if (!imsi || !imsi[0] || conn_id < 0) return;
     gsup_imsi_conn_t *e = NULL;
     HASH_FIND_STR(g_imsi_conn, imsi, e);
@@ -94,7 +101,12 @@ static int gsup_conn_for_imsi(const char *imsi, uint8_t cn_domain)
 
 int gsup_map_proxy_cs_conn_for_imsi(const char *imsi)
 {
-    return gsup_conn_for_imsi(imsi, GSUP_CN_DOMAIN_CS);
+    int cid = gsup_conn_for_imsi(imsi, GSUP_CN_DOMAIN_CS);
+    if (cid >= 0)
+        return cid;
+    if (g_last_cs_conn >= 0 && gsup_server_conn_valid(g_last_cs_conn))
+        return g_last_cs_conn;
+    return -1;
 }
 
 static void gsup_forget_imsi_cn(const char *imsi, uint8_t cn_domain);
