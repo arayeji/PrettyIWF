@@ -38,6 +38,10 @@
 #define GSUP_MSG_MT_FSM_REQ     0x28
 #define GSUP_MSG_MT_FSM_ERR     0x29
 #define GSUP_MSG_MT_FSM_RES     0x2a
+/* MSC -> HLR alert when the UE is reachable / has memory again (RP-SMMA). */
+#define GSUP_MSG_READY_FOR_SM_REQ 0x2c
+#define GSUP_MSG_READY_FOR_SM_ERR 0x2d
+#define GSUP_MSG_READY_FOR_SM_RES 0x2e
 
 #define GSUP_IE_IMSI            0x01
 #define GSUP_IE_CAUSE           0x02
@@ -63,6 +67,10 @@
 #define GSUP_IE_SM_RP_UI        0x43   /* SM TPDU                          */
 #define GSUP_IE_SM_RP_CAUSE     0x44   /* GSM 04.11 RP cause               */
 #define GSUP_IE_SM_RP_MMS       0x45   /* more messages to send            */
+#define GSUP_IE_SM_ALERT_REASON 0x46   /* 1=ms-present, 2=memory available */
+
+#define GSUP_SM_ALERT_MS_PRESENT 0x01
+#define GSUP_SM_ALERT_MEM_AVAIL  0x02
 /* Session IEs (osmo GSUP session-based messages, e.g. SS/USSD). */
 #define GSUP_IE_SESSION_ID      0x30   /* 4 bytes BE                       */
 #define GSUP_IE_SESSION_STATE   0x31   /* 1 byte                           */
@@ -105,6 +113,8 @@ typedef struct {
     bool     have_sm_rp_mr;
     uint8_t  sm_rp_cause;
     bool     have_sm_rp_cause;
+    uint8_t  sm_alert_reason;
+    bool     have_sm_alert_reason;
     /* Raw SM-RP-DA/OA as carried in GSUP: [id-type][address bytes]. */
     uint8_t  sm_rp_da[24];
     uint8_t  sm_rp_da_len;
@@ -157,6 +167,11 @@ int  gsup_build_mo_fsm_res(const char *imsi, uint8_t sm_rp_mr,
                            uint8_t *out, size_t cap);
 int  gsup_build_mo_fsm_err(const char *imsi, uint8_t sm_rp_mr,
                            uint8_t rp_cause, uint8_t *out, size_t cap);
+/* READY-FOR-SM outcome toward osmo-msc (relay result from home HLR). */
+int  gsup_build_ready_for_sm_res(const char *imsi, uint8_t sm_rp_mr,
+                                 uint8_t *out, size_t cap);
+int  gsup_build_ready_for_sm_err(const char *imsi, uint8_t sm_rp_mr,
+                                 uint8_t rp_cause, uint8_t *out, size_t cap);
 
 /* SS/USSD session message (PROC_SS_REQ/RES/ERR). ss_info may be NULL for
  * a bare state transition (e.g. ERROR/END without payload). */

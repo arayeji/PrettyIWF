@@ -1125,6 +1125,8 @@ static const uint8_t AC_MS_PURGING_V3[]          = { 0x04,0x00,0x00,0x01,0x00,0x
 static const uint8_t AC_SHORT_MSG_MO_RELAY_V2[]  = { 0x04,0x00,0x00,0x01,0x00,0x15,0x02 };
 /* networkUnstructuredSsContext-v2: 0.4.0.0.1.0.19.2 */
 static const uint8_t AC_NETWORK_USSD_V2[]        = { 0x04,0x00,0x00,0x01,0x00,0x13,0x02 };
+/* mwdMngtContext-v2 (readyForSM): 0.4.0.0.1.0.24.2 */
+static const uint8_t AC_MWD_MNGT_V2[]            = { 0x04,0x00,0x00,0x01,0x00,0x18,0x02 };
 
 static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
 {
@@ -1147,6 +1149,8 @@ static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
         *out = AC_SHORT_MSG_MO_RELAY_V2;   *out_len = sizeof(AC_SHORT_MSG_MO_RELAY_V2);   break;
     case MAP_AC_NETWORK_UNSTRUCTURED_SS_V2:
         *out = AC_NETWORK_USSD_V2;         *out_len = sizeof(AC_NETWORK_USSD_V2);         break;
+    case MAP_AC_MWD_MNGT_V2:
+        *out = AC_MWD_MNGT_V2;             *out_len = sizeof(AC_MWD_MNGT_V2);             break;
     default: return -1;
     }
     return 0;
@@ -1474,6 +1478,31 @@ int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
     if (ber_enc_tlv(body, sizeof(body), &bo, 0x82, oa, (size_t)ol) < 0)
         return -1;
     if (ber_enc_tlv(body, sizeof(body), &bo, 0x04, tpdu, tpdu_len) < 0)
+        return -1;
+
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x30, body, bo) < 0) return -1;
+    return (int)off;
+}
+
+int map_encode_ready_for_sm_arg(const char *imsi_str, uint8_t alert_reason,
+                                uint8_t *out, size_t out_cap)
+{
+    /* ReadyForSM-Arg ::= SEQUENCE {
+     *   imsi        [0] IMSI,
+     *   alertReason     AlertReason (ENUMERATED ms-Present(0),
+     *                                memoryAvailable(1)) }               */
+    if (!imsi_str || !out) return -1;
+    uint8_t imsi_bcd[8];
+    int bl = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
+    if (bl <= 0) return -1;
+
+    uint8_t body[24];
+    size_t bo = 0;
+    if (ber_enc_tlv(body, sizeof(body), &bo, 0x80, imsi_bcd, (size_t)bl) < 0)
+        return -1;
+    uint8_t ar = alert_reason ? 1 : 0;
+    if (ber_enc_tlv(body, sizeof(body), &bo, 0x0A /* ENUMERATED */, &ar, 1) < 0)
         return -1;
 
     size_t off = 0;

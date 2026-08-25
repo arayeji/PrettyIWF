@@ -48,6 +48,7 @@
 #define MAP_OP_CODE_MT_FORWARD_SM           46  /* forwardSM (v1/v2) / mo-forwardSM (v3) */
 #define MAP_OP_CODE_MT_FORWARD_SM_V3        44  /* mt-forwardSM (MAP v3) */
 #define MAP_OP_CODE_PROVIDE_SUBSCRIBER_INFO 70
+#define MAP_OP_CODE_READY_FOR_SM            66  /* VLR -> HLR MW alert */
 /* USSD (TS 29.002 supplementary services). */
 #define MAP_OP_CODE_PROCESS_USS_REQ         59  /* processUnstructuredSS-Request */
 #define MAP_OP_CODE_USS_REQUEST             60  /* unstructuredSS-Request (NI)   */
@@ -171,6 +172,11 @@ int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
                              const uint8_t *tpdu, size_t tpdu_len,
                              uint8_t *out, size_t out_cap);
 
+/* ReadyForSM-Arg (our VLR -> home HLR): imsi [0], alertReason ENUMERATED
+ * (0 = ms-Present, 1 = memoryAvailable). */
+int map_encode_ready_for_sm_arg(const char *imsi_str, uint8_t alert_reason,
+                                uint8_t *out, size_t out_cap);
+
 /* provideSubscriberInfo (HLR/gsmSCF -> our VLR). */
 int map_decode_psi_arg(const uint8_t *p, size_t n,
                        char *imsi_out, size_t imsi_cap);
@@ -276,6 +282,7 @@ typedef enum {
     MAP_AC_ROAMING_NUMBER_ENQUIRY_V3 = 7, /* provideRoamingNumber           */
     MAP_AC_SHORT_MSG_MO_RELAY_V2    = 8, /* forwardSM (MO submit, v2)      */
     MAP_AC_NETWORK_UNSTRUCTURED_SS_V2 = 9, /* processUnstructuredSS (USSD) */
+    MAP_AC_MWD_MNGT_V2              = 10, /* readyForSM (MW alerting)       */
 } map_app_ctx_t;
 
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap);

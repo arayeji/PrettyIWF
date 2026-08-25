@@ -35,7 +35,11 @@ void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *msg);
  * from osmo-msc (sms-over-gsup) -> MAP forwardSM BEGIN to the SMSC in
  * SM-RP-DA -> GSUP MO result/error back to the MSC. */
 void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *msg);
-/* Returns true if the CONTINUE/END belonged to an MO-SMS dialogue. */
+/* READY-FOR-SM from osmo-msc (UE reachable / memory available again):
+ * relay MAP readyForSM to the home HLR so its SMSC retries waiting SMs. */
+void sms_iwf_on_gsup_ready_for_sm(int conn_id, const gsup_parsed_t *msg);
+/* Returns true if the CONTINUE/END belonged to an MO-SMS or readyForSM
+ * dialogue. */
 bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg);
 
 /* SS7 dispatch is via ss7_link HLR recv callback registered at init. */

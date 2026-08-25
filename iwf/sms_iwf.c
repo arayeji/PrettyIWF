@@ -7,6 +7,7 @@
 #include "gsup_client.h"
 #include "gsup_server.h"
 #include "gsup_map_proxy.h"
+#include "gsup_router.h"
 #include "smpp_server.h"
 #include "runtime.h"
 #include "config.h"
@@ -29,12 +30,14 @@
 #define SMS_DIR_OUTBOUND        2
 #define SMS_DIR_MT_IN           3   /* partner SMSC -> our roamer via MSC */
 #define SMS_DIR_MO_OUT          4   /* our subscriber -> home SMSC        */
+#define SMS_DIR_ALERT_OUT       5   /* readyForSM toward the home HLR     */
 
 #define SMS_STATE_WAIT_GSUP     1
 #define SMS_STATE_WAIT_SRI_SM   2
 #define SMS_STATE_WAIT_FWDSM    3
 #define SMS_STATE_WAIT_GSUP_MT  4
 #define SMS_STATE_WAIT_MO_FSM   5
+#define SMS_STATE_WAIT_RFSM     6
 
 #define SMS_OTID_OUTBOUND_BIT   0x80000000u
 
@@ -704,7 +707,11 @@ bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
     (void)rt;
     if (!g_rt || !tmsg->have_dtid) return false;
     sms_session_t *s = sms_sess_find(tmsg->dtid);
-    if (!s || s->direction != SMS_DIR_MO_OUT) return false;
+    if (!s || (s->direction != SMS_DIR_MO_OUT &&
+               s->direction != SMS_DIR_ALERT_OUT))
+        return false;
+    bool alert = s->direction == SMS_DIR_ALERT_OUT;
+    const char *what = alert ? "readyForSM" : "MO-FSM";
 
     uint8_t gsup[128];
     int n = -1;
@@ -712,25 +719,34 @@ bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
     for (size_t i = 0; i < tmsg->n_components && !done; i++) {
         const tcap_component_t *c = &tmsg->components[i];
         if (c->kind == TCAP_CMP_KIND_RES) {
-            LOGI("sms", "[%s] MO-FSM accepted by SMSC mr=%u",
-                 s->imsi, (unsigned)s->sm_rp_mr);
-            n = gsup_build_mo_fsm_res(s->imsi, s->sm_rp_mr,
-                                      gsup, sizeof(gsup));
+            LOGI("sms", "[%s] %s accepted mr=%u",
+                 s->imsi, what, (unsigned)s->sm_rp_mr);
+            n = alert
+                ? gsup_build_ready_for_sm_res(s->imsi, s->sm_rp_mr,
+                                              gsup, sizeof(gsup))
+                : gsup_build_mo_fsm_res(s->imsi, s->sm_rp_mr,
+                                        gsup, sizeof(gsup));
             done = true;
         } else if (c->kind == TCAP_CMP_KIND_ERR) {
-            LOGI("sms", "[%s] MO-FSM rejected by SMSC map_err=%d mr=%u",
-                 s->imsi, c->error_code, (unsigned)s->sm_rp_mr);
-            n = gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr,
-                                      41 /* temporary failure */,
-                                      gsup, sizeof(gsup));
+            LOGI("sms", "[%s] %s rejected map_err=%d mr=%u",
+                 s->imsi, what, c->error_code, (unsigned)s->sm_rp_mr);
+            n = alert
+                ? gsup_build_ready_for_sm_err(s->imsi, s->sm_rp_mr,
+                                              41 /* temporary failure */,
+                                              gsup, sizeof(gsup))
+                : gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr, 41,
+                                        gsup, sizeof(gsup));
             done = true;
         }
     }
     /* END without any component: dialogue closed without result. */
     if (!done && tmsg->type == TCAP_MSG_END) {
-        LOGW("sms", "[%s] MO-FSM: END without result", s->imsi);
-        n = gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr, 41,
-                                  gsup, sizeof(gsup));
+        LOGW("sms", "[%s] %s: END without result", s->imsi, what);
+        n = alert
+            ? gsup_build_ready_for_sm_err(s->imsi, s->sm_rp_mr, 41,
+                                          gsup, sizeof(gsup))
+            : gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr, 41,
+                                    gsup, sizeof(gsup));
         done = true;
     }
     if (done) {
@@ -739,6 +755,98 @@ bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
         sms_sess_remove(s);
     }
     return true;
+}
+
+/* ----- readyForSM relay (MSC alert -> home HLR message-waiting) --------- */
+
+static void sms_rfsm_reply_err(int conn_id, const char *imsi, uint8_t mr,
+                               uint8_t rp_cause)
+{
+    uint8_t gsup[128];
+    int n = gsup_build_ready_for_sm_err(imsi, mr, rp_cause,
+                                        gsup, sizeof(gsup));
+    if (n > 0)
+        gsup_server_send(conn_id, gsup, (size_t)n);
+}
+
+void sms_iwf_on_gsup_ready_for_sm(int conn_id, const gsup_parsed_t *m)
+{
+    if (!g_rt || !m) return;
+    uint8_t mr = m->have_sm_rp_mr ? m->sm_rp_mr : 0;
+
+    gsup_route_t route;
+    if (gsup_router_lookup(&g_rt->cfg, m->imsi, &route) < 0 ||
+        (!route.hlr_gt[0] && !route.e214_prefix[0])) {
+        LOGI("sms", "[%s] readyForSM: no MAP HLR route -> error", m->imsi);
+        sms_rfsm_reply_err(conn_id, m->imsi, mr, 38 /* net out of order */);
+        return;
+    }
+
+    /* GSUP alert reason 1 = ms-present, 2 = memory available;
+     * MAP AlertReason  0 = ms-Present, 1 = memoryAvailable. */
+    uint8_t reason = (m->have_sm_alert_reason &&
+                      m->sm_alert_reason == GSUP_SM_ALERT_MS_PRESENT) ? 0 : 1;
+
+    uint8_t arg[48];
+    int an = map_encode_ready_for_sm_arg(m->imsi, reason, arg, sizeof(arg));
+    uint8_t dlg[128];
+    int dn = map_encode_aarq(MAP_AC_MWD_MNGT_V2, dlg, sizeof(dlg));
+    if (an < 0 || dn < 0) {
+        sms_rfsm_reply_err(conn_id, m->imsi, mr, 41);
+        return;
+    }
+
+    sms_session_t *s = calloc(1, sizeof(*s));
+    if (!s) {
+        sms_rfsm_reply_err(conn_id, m->imsi, mr, 41);
+        return;
+    }
+    s->otid = sms_new_out_otid();
+    s->direction = SMS_DIR_ALERT_OUT;
+    s->state = SMS_STATE_WAIT_RFSM;
+    s->timer_fd = -1;
+    s->gsup_conn = conn_id;
+    s->sm_rp_mr = mr;
+    strncpy(s->imsi, m->imsi, sizeof(s->imsi) - 1);
+
+    /* CdPA: E.214 MGT (prefix + MSIN) or fixed HLR GT - same routing the
+     * outbound UL/USSD use. CgPA: our MSC GT, SSN 8. */
+    ss7_sccp_addr_t called, calling;
+    if (route.e214_prefix[0]) {
+        char mgt[40];
+        size_t skip = 3 + (route.mnc_digits == 3 ? 3u : 2u);
+        size_t il = strlen(route.imsi);
+        snprintf(mgt, sizeof(mgt), "%s%s", route.e214_prefix,
+                 il > skip ? route.imsi + skip : "");
+        ss7_gt_from_digits(mgt, route.hlr_ssn ? route.hlr_ssn : SS7_SSN_HLR,
+                           &called);
+        called.gt_np_e214 = true;
+    } else {
+        ss7_gt_from_digits(route.hlr_gt,
+                           route.hlr_ssn ? route.hlr_ssn : SS7_SSN_HLR,
+                           &called);
+    }
+    memset(&calling, 0, sizeof(calling));
+    const char *src_gt = route.src_gt[0] ? route.src_gt
+                                         : g_rt->cfg.map_local_gt;
+    if (src_gt && src_gt[0])
+        ss7_gt_from_digits(src_gt, SS7_SSN_MSC, &calling);
+    calling.ssn = SS7_SSN_MSC;
+
+    if (sms_send_map_begin(s->otid, MAP_OP_CODE_READY_FOR_SM,
+                           arg, (size_t)an, dlg, (size_t)dn,
+                           &called, calling.have_gt ? &calling : NULL) < 0) {
+        free(s);
+        sms_rfsm_reply_err(conn_id, m->imsi, mr, 41);
+        return;
+    }
+    HASH_ADD(hh, g_sessions, otid, sizeof(s->otid), s);
+    sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
+    LOGI("sms",
+         "[%s] RX GSUP READY-FOR-SM mr=%u reason=%s -> MAP readyForSM "
+         "otid=0x%08x cdpa=%s%s",
+         m->imsi, (unsigned)mr, reason ? "memAvail" : "msPresent",
+         s->otid, called.gt_digits, called.gt_np_e214 ? " (E.214)" : "");
 }
 
 static void on_hlr_sccp(struct iwf_runtime *rt,
@@ -799,6 +907,11 @@ void sms_iwf_on_timer(void)
             /* Home SMSC didn't answer: UE gets RP-ERROR and retries. */
             sms_mo_reply_err(s->gsup_conn, s->imsi, s->sm_rp_mr,
                              41 /* temporary failure */);
+            sms_sess_remove(s);
+        } else if (s->direction == SMS_DIR_ALERT_OUT) {
+            /* Home HLR didn't answer the alert: harmless, SMSC retries
+             * on its own timer anyway. */
+            sms_rfsm_reply_err(s->gsup_conn, s->imsi, s->sm_rp_mr, 41);
             sms_sess_remove(s);
         } else {
             sms_fail_outbound(s);

@@ -88,6 +88,12 @@ int gsup_parse_payload(const uint8_t *body, size_t len, gsup_parsed_t *out)
                 out->have_sm_rp_cause = true;
             }
             break;
+        case GSUP_IE_SM_ALERT_REASON:
+            if (l >= 1) {
+                out->sm_alert_reason = v[0];
+                out->have_sm_alert_reason = true;
+            }
+            break;
         case GSUP_IE_SM_RP_DA:
             if (l && l <= sizeof(out->sm_rp_da)) {
                 memcpy(out->sm_rp_da, v, l);
@@ -584,6 +590,32 @@ int gsup_build_mo_fsm_err(const char *imsi, uint8_t sm_rp_mr,
     if (!imsi || !out) return -1;
     size_t off = 0;
     out[off++] = GSUP_MSG_MO_FSM_ERR;
+    if (gsup_put_imsi_ie(out, cap, &off, imsi) < 0) return -1;
+    if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_MR, &sm_rp_mr, 1) < 0)
+        return -1;
+    if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_CAUSE, &rp_cause, 1) < 0)
+        return -1;
+    return (int)off;
+}
+
+int gsup_build_ready_for_sm_res(const char *imsi, uint8_t sm_rp_mr,
+                                uint8_t *out, size_t cap)
+{
+    if (!imsi || !out) return -1;
+    size_t off = 0;
+    out[off++] = GSUP_MSG_READY_FOR_SM_RES;
+    if (gsup_put_imsi_ie(out, cap, &off, imsi) < 0) return -1;
+    if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_MR, &sm_rp_mr, 1) < 0)
+        return -1;
+    return (int)off;
+}
+
+int gsup_build_ready_for_sm_err(const char *imsi, uint8_t sm_rp_mr,
+                                uint8_t rp_cause, uint8_t *out, size_t cap)
+{
+    if (!imsi || !out) return -1;
+    size_t off = 0;
+    out[off++] = GSUP_MSG_READY_FOR_SM_ERR;
     if (gsup_put_imsi_ie(out, cap, &off, imsi) < 0) return -1;
     if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_MR, &sm_rp_mr, 1) < 0)
         return -1;

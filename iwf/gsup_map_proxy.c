@@ -765,6 +765,14 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
         sms_iwf_on_gsup_mo_req(conn_id, &req);
         return;
     }
+
+    /* UE reachable / memory available again: alert the home HLR so its
+     * SMSC retries waiting messages (MAP readyForSM). */
+    if (req.msg_type == GSUP_MSG_READY_FOR_SM_REQ) {
+        gsup_track_conn(req.imsi, conn_id, GSUP_CN_DOMAIN_CS);
+        sms_iwf_on_gsup_ready_for_sm(conn_id, &req);
+        return;
+    }
 #endif
 
     /* Session-based SS/USSD from the MSC. */
