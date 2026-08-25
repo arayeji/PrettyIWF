@@ -11,6 +11,9 @@
 #include "logging.h"
 #include "imsi_trace.h"
 #include "uthash.h"
+#ifdef SMS_IWF_ENABLED
+#include "sms_iwf.h"
+#endif
 
 #include <arpa/inet.h>
 #include <stdlib.h>
@@ -87,6 +90,11 @@ static int gsup_conn_for_imsi(const char *imsi, uint8_t cn_domain)
     if (cid < 0 || !gsup_server_conn_valid(cid))
         return -1;
     return cid;
+}
+
+int gsup_map_proxy_cs_conn_for_imsi(const char *imsi)
+{
+    return gsup_conn_for_imsi(imsi, GSUP_CN_DOMAIN_CS);
 }
 
 static void gsup_forget_imsi_cn(const char *imsi, uint8_t cn_domain);
@@ -816,6 +824,15 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
         gsup_map_proxy_finish_ugl(rt, s);
         return;
     }
+
+#ifdef SMS_IWF_ENABLED
+    /* MT-SMS delivery outcome from the MSC (sms-over-gsup). */
+    if (req.msg_type == GSUP_MSG_MT_FSM_RES ||
+        req.msg_type == GSUP_MSG_MT_FSM_ERR) {
+        sms_iwf_on_gsup_mt_resp(&req);
+        return;
+    }
+#endif
 
     if (req.msg_type != GSUP_MSG_SAI_REQ && req.msg_type != GSUP_MSG_UL_REQ) {
         LOGD("gsup",

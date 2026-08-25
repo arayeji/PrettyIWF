@@ -5,6 +5,8 @@
 #include "sms_iwf.h"
 #include "map_iwf.h"
 #include "gsup_client.h"
+#include "gsup_server.h"
+#include "gsup_map_proxy.h"
 #include "smpp_server.h"
 #include "runtime.h"
 #include "config.h"
@@ -25,10 +27,12 @@
 
 #define SMS_DIR_INBOUND         1
 #define SMS_DIR_OUTBOUND        2
+#define SMS_DIR_MT_IN           3   /* partner SMSC -> our roamer via MSC */
 
 #define SMS_STATE_WAIT_GSUP     1
 #define SMS_STATE_WAIT_SRI_SM   2
 #define SMS_STATE_WAIT_FWDSM    3
+#define SMS_STATE_WAIT_GSUP_MT  4
 
 #define SMS_OTID_OUTBOUND_BIT   0x80000000u
 
@@ -54,11 +58,17 @@ typedef struct sms_session {
     uint32_t            peer_otid;
     bool                have_peer_otid;
     int                 timer_fd;
+    /* MT-in (partner SMSC -> roamer) */
+    int                 mt_op;          /* invoke opcode to echo (44 or 46) */
+    uint8_t             sm_rp_mr;       /* GSUP correlation                  */
+    uint8_t             aare_oid[16];   /* AC OID from AARQ, echoed in AARE  */
+    uint8_t             aare_oid_len;
 } sms_session_t;
 
 static struct iwf_runtime *g_rt;
 static sms_session_t *g_sessions;
 static uint32_t g_out_otid = SMS_OTID_OUTBOUND_BIT;
+static uint8_t g_mt_mr;
 static int g_epfd = -1;
 
 static sms_session_t *sms_sess_find(uint32_t otid)
@@ -218,6 +228,163 @@ static void sms_fail_outbound(sms_session_t *s)
     if (s->smpp_seq)
         smpp_server_send_submit_resp(s->smpp_seq, SMPP_ESME_RSUBMITFAIL);
     sms_sess_remove(s);
+}
+
+/* ----- Inbound MT-SMS delivery (partner SMSC -> our roamer) ------------ */
+
+/* TCAP END back to the SMSC: returnResult(op) or returnError(code), with an
+ * AARE echoing the AC OID proposed in the BEGIN (required first backward
+ * message on a structured dialogue). */
+static int sms_mt_send_end(sms_session_t *s, int is_error, int code,
+                           const uint8_t *params, size_t plen)
+{
+    uint8_t cmp[300];
+    size_t co = 0;
+    int rc;
+    if (is_error)
+        rc = tcap_enc_return_error(cmp, sizeof(cmp), &co, s->peer_invoke_id,
+                                   code, NULL, 0);
+    else
+        rc = tcap_enc_return_result(cmp, sizeof(cmp), &co, s->peer_invoke_id,
+                                    code, params, plen);
+    if (rc < 0) return -1;
+
+    uint8_t dlg[128];
+    int dn = 0;
+    if (s->aare_oid_len)
+        dn = map_encode_aare_oid(s->aare_oid, s->aare_oid_len,
+                                 dlg, sizeof(dlg));
+    if (dn < 0) dn = 0;
+
+    uint8_t out[512];
+    int n = tcap_encode_message(TCAP_MSG_END, 0, false,
+                                s->peer_otid, s->have_peer_otid,
+                                dn > 0 ? dlg : NULL, dn > 0 ? (size_t)dn : 0,
+                                cmp, co, out, sizeof(out));
+    if (n < 0) return -1;
+
+    /* CgPA = the MSC GT the SMSC addressed (our local GT), SSN 8. */
+    ss7_sccp_addr_t calling;
+    memset(&calling, 0, sizeof(calling));
+    if (g_rt->cfg.map_local_gt[0])
+        ss7_gt_from_digits(g_rt->cfg.map_local_gt, SS7_SSN_MSC, &calling);
+    calling.ssn = SS7_SSN_MSC;
+    return ss7_link_send_tcap_ex(g_rt, &s->ret_addr,
+                                 calling.have_gt ? &calling : NULL,
+                                 out, (size_t)n);
+}
+
+static int sms_mt_err_absent(const sms_session_t *s)
+{
+    return s->mt_op == MAP_OP_CODE_MT_FORWARD_SM_V3
+           ? MAP_ERR_ABSENT_SUBSCRIBER_SM : MAP_ERR_ABSENT_SUBSCRIBER;
+}
+
+void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
+                       const ss7_sccp_addr_t *calling,
+                       const tcap_msg_t *tmsg,
+                       const tcap_component_t *c)
+{
+    (void)rt;
+    if (!g_rt || !calling || !tmsg->have_otid) return;
+
+    if (sms_sess_find(tmsg->otid & ~SMS_OTID_OUTBOUND_BIT))
+        return;  /* retransmission of an in-flight dialogue */
+
+    sms_session_t *s = calloc(1, sizeof(*s));
+    if (!s) return;
+    s->otid = tmsg->otid & ~SMS_OTID_OUTBOUND_BIT;
+    s->direction = SMS_DIR_MT_IN;
+    s->state = SMS_STATE_WAIT_GSUP_MT;
+    s->peer_otid = tmsg->otid;
+    s->have_peer_otid = true;
+    s->peer_invoke_id = c->invoke_id;
+    s->ret_addr = *calling;
+    s->timer_fd = -1;
+    s->mt_op = c->opcode;
+    if (tmsg->dialogue && tmsg->dialogue_len) {
+        size_t ol = 0;
+        if (map_decode_aarq_ac_raw(tmsg->dialogue, tmsg->dialogue_len,
+                                   s->aare_oid, sizeof(s->aare_oid), &ol) == 0)
+            s->aare_oid_len = (uint8_t)ol;
+    }
+
+    uint8_t sc_addr[12];
+    size_t sc_len = 0;
+    const uint8_t *ui = NULL;
+    size_t ui_len = 0;
+    int more = 0;
+    if (map_decode_mt_fsm_arg(c->parameters, c->parameters_len,
+                              s->imsi, sizeof(s->imsi),
+                              sc_addr, sizeof(sc_addr), &sc_len,
+                              &ui, &ui_len, &more) < 0 || ui_len > 255) {
+        LOGW("sms", "MT-FSM op=%d: bad argument", c->opcode);
+        sms_mt_send_end(s, 1, MAP_ERR_UNEXPECTED_DATA_VALUE, NULL, 0);
+        free(s);
+        return;
+    }
+
+    int conn = gsup_map_proxy_cs_conn_for_imsi(s->imsi);
+    if (conn < 0) {
+        LOGI("sms", "[%s] MT-FSM: subscriber not attached -> absent",
+             s->imsi);
+        sms_mt_send_end(s, 1, sms_mt_err_absent(s), NULL, 0);
+        free(s);
+        return;
+    }
+
+    s->sm_rp_mr = g_mt_mr++;
+    uint8_t gsup[512];
+    int n = gsup_build_mt_fsm_req(s->imsi, s->sm_rp_mr,
+                                  sc_len ? sc_addr : NULL, sc_len,
+                                  ui, ui_len, more, gsup, sizeof(gsup));
+    if (n < 0 || gsup_server_send(conn, gsup, (size_t)n) < 0) {
+        LOGW("sms", "[%s] MT-FSM: GSUP MT req failed conn=%d", s->imsi, conn);
+        sms_mt_send_end(s, 1, MAP_ERR_SYSTEM_FAILURE, NULL, 0);
+        free(s);
+        return;
+    }
+
+    HASH_ADD(hh, g_sessions, otid, sizeof(s->otid), s);
+    sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
+    LOGI("sms",
+         "[%s] RX MT-FSM op=%d otid=0x%08x ui_len=%zu more=%d -> GSUP conn=%d mr=%u",
+         s->imsi, s->mt_op, s->peer_otid, ui_len, more, conn,
+         (unsigned)s->sm_rp_mr);
+}
+
+void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *m)
+{
+    if (!g_rt || !m) return;
+    sms_session_t *s, *tmp, *found = NULL;
+    HASH_ITER(hh, g_sessions, s, tmp) {
+        if (s->direction != SMS_DIR_MT_IN) continue;
+        if (m->have_sm_rp_mr && s->sm_rp_mr != m->sm_rp_mr) continue;
+        if (m->have_imsi && s->imsi[0] && strcmp(s->imsi, m->imsi) != 0)
+            continue;
+        found = s;
+        break;
+    }
+    if (!found) {
+        LOGD("sms", "MT-FSM resp without session (mr=%u imsi=%s)",
+             (unsigned)m->sm_rp_mr, m->have_imsi ? m->imsi : "?");
+        return;
+    }
+    if (m->msg_type == GSUP_MSG_MT_FSM_RES) {
+        LOGI("sms", "[%s] MT-FSM delivered mr=%u -> result to SMSC",
+             found->imsi, (unsigned)found->sm_rp_mr);
+        sms_mt_send_end(found, 0, found->mt_op, NULL, 0);
+    } else {
+        /* GSM 04.11 RP causes 27/28/30 mean the UE is unreachable/unknown
+         * here -> absentSubscriber so the SMSC retries + sets MWD. */
+        uint8_t rp = m->have_sm_rp_cause ? m->sm_rp_cause : 38;
+        int ec = (rp == 27 || rp == 28 || rp == 30)
+                 ? sms_mt_err_absent(found) : MAP_ERR_SYSTEM_FAILURE;
+        LOGI("sms", "[%s] MT-FSM failed rp_cause=%u -> MAP err=%d",
+             found->imsi, (unsigned)rp, ec);
+        sms_mt_send_end(found, 1, ec, NULL, 0);
+    }
+    sms_sess_remove(found);
 }
 
 static void on_gsup_result(uint32_t corr_id, int error, const char *imsi)
@@ -474,10 +641,15 @@ void sms_iwf_on_timer(void)
         if (r != (ssize_t)sizeof(exp))
             continue;
         LOGW("sms", "session timeout otid=0x%08x state=%u", s->otid, s->state);
-        if (s->direction == SMS_DIR_INBOUND)
+        if (s->direction == SMS_DIR_INBOUND) {
             sms_fail_inbound(s);
-        else
+        } else if (s->direction == SMS_DIR_MT_IN) {
+            /* MSC didn't answer (paging?): transient -> SMSC will retry. */
+            sms_mt_send_end(s, 1, MAP_ERR_SYSTEM_FAILURE, NULL, 0);
+            sms_sess_remove(s);
+        } else {
             sms_fail_outbound(s);
+        }
         return;
     }
 }

@@ -27,6 +27,13 @@
 #define GSUP_MSG_ISD_ERR        0x11
 #define GSUP_MSG_ISD_RES        0x12
 #define GSUP_MSG_LOC_CANCEL_REQ 0x1c
+/* SMS over GSUP (osmo-msc `sms-over-gsup`). */
+#define GSUP_MSG_MO_FSM_REQ     0x24
+#define GSUP_MSG_MO_FSM_ERR     0x25
+#define GSUP_MSG_MO_FSM_RES     0x26
+#define GSUP_MSG_MT_FSM_REQ     0x28
+#define GSUP_MSG_MT_FSM_ERR     0x29
+#define GSUP_MSG_MT_FSM_RES     0x2a
 
 #define GSUP_IE_IMSI            0x01
 #define GSUP_IE_CAUSE           0x02
@@ -45,6 +52,13 @@
 #define GSUP_IE_RAND            0x20   /* osmo GSUP resync (top-level IE) */
 #define GSUP_IE_AUTS            0x26
 #define GSUP_IE_NUM_VECTORS_REQ 0x52   /* OSMO_GSUP_NUM_VECTORS_REQ_IE */
+/* SMS over GSUP IEs (osmo gsup_sms). */
+#define GSUP_IE_SM_RP_MR        0x40   /* message reference (1 byte)      */
+#define GSUP_IE_SM_RP_DA        0x41   /* [id-type][addr]; 0x01 = IMSI    */
+#define GSUP_IE_SM_RP_OA        0x42   /* [id-type][addr]; 0x03 = SMSC    */
+#define GSUP_IE_SM_RP_UI        0x43   /* SM TPDU                          */
+#define GSUP_IE_SM_RP_CAUSE     0x44   /* GSM 04.11 RP cause               */
+#define GSUP_IE_SM_RP_MMS       0x45   /* more messages to send            */
 
 #define GSUP_RESYNC_RAND_LEN    16
 #define GSUP_RESYNC_AUTS_LEN    14
@@ -74,6 +88,10 @@ typedef struct {
     uint8_t  resync_auts[GSUP_RESYNC_AUTS_LEN];
     bool     have_resync_rand;
     bool     have_resync_auts;
+    uint8_t  sm_rp_mr;
+    bool     have_sm_rp_mr;
+    uint8_t  sm_rp_cause;
+    bool     have_sm_rp_cause;
 } gsup_parsed_t;
 
 #define gsup_parsed_have_resync(p) \
@@ -100,6 +118,13 @@ int  gsup_build_isd_req(const char *imsi, const char *msisdn,
                         uint8_t *out, size_t cap);
 int  gsup_build_loc_cancel_req(const char *imsi, uint8_t cancel_type,
                                uint8_t *out, size_t cap);
+/* MT-ForwardSM req toward osmo-msc. sc_addr = MAP AddressString
+ * (TON/NPI byte + TBCD digits) of the originating SMSC. */
+int  gsup_build_mt_fsm_req(const char *imsi, uint8_t sm_rp_mr,
+                           const uint8_t *sc_addr, size_t sc_addr_len,
+                           const uint8_t *tpdu, size_t tpdu_len,
+                           int more_to_send,
+                           uint8_t *out, size_t cap);
 
 int  gsup_ipa_wrap(const uint8_t *gsup, size_t gsup_len,
                    uint8_t *out, size_t cap);

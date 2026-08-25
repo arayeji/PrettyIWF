@@ -52,6 +52,9 @@ bool gsup_map_proxy_hss_idr(struct iwf_runtime *rt, const char *imsi,
  * if cn_domain == 0). */
 bool gsup_map_proxy_imsi_known(const char *imsi, uint8_t cn_domain);
 
+/* Tracked CS-domain GSUP conn for IMSI (MT-SMS delivery), or -1. */
+int gsup_map_proxy_cs_conn_for_imsi(const char *imsi);
+
 /* HSS IDR(URRP-MME): report UE reachability via S6a NOR. */
 void gsup_map_proxy_on_urrp(struct iwf_runtime *rt, const char *imsi,
                             const char *diam_origin_host);

@@ -76,6 +76,18 @@ int gsup_parse_payload(const uint8_t *body, size_t len, gsup_parsed_t *out)
                 out->have_cn_domain = true;
             }
             break;
+        case GSUP_IE_SM_RP_MR:
+            if (l >= 1) {
+                out->sm_rp_mr = v[0];
+                out->have_sm_rp_mr = true;
+            }
+            break;
+        case GSUP_IE_SM_RP_CAUSE:
+            if (l >= 1) {
+                out->sm_rp_cause = v[0];
+                out->have_sm_rp_cause = true;
+            }
+            break;
         default:
             break;
         }
@@ -465,6 +477,54 @@ int gsup_build_isd_req(const char *imsi, const char *msisdn,
     if (gsup_enc_subscriber_data_ies(out, cap, &off, msisdn, hlr_number,
                                      cn_domain, apns, n_apns) < 0)
         return -1;
+    return (int)off;
+}
+
+int gsup_build_mt_fsm_req(const char *imsi, uint8_t sm_rp_mr,
+                          const uint8_t *sc_addr, size_t sc_addr_len,
+                          const uint8_t *tpdu, size_t tpdu_len,
+                          int more_to_send,
+                          uint8_t *out, size_t cap)
+{
+    if (!imsi || !tpdu || !tpdu_len || tpdu_len > 255 || !out) return -1;
+    size_t off = 0;
+    out[off++] = GSUP_MSG_MT_FSM_REQ;
+    if (gsup_put_imsi_ie(out, cap, &off, imsi) < 0) return -1;
+
+    if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_MR, &sm_rp_mr, 1) < 0)
+        return -1;
+
+    /* SM-RP-DA: [0x01 = IMSI][TBCD digits]. */
+    {
+        uint8_t da[10];
+        da[0] = 0x01;
+        int bl = map_str_to_bcd(imsi, da + 1, sizeof(da) - 1);
+        if (bl < 0) return -1;
+        if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_DA, da,
+                        (size_t)(1 + bl)) < 0)
+            return -1;
+    }
+
+    /* SM-RP-OA: [0x03 = SMSC address][len][TON/NPI + TBCD] (GSM 04.11 style,
+     * length byte counts the TON/NPI byte plus digit octets). */
+    if (sc_addr && sc_addr_len && sc_addr_len <= 12) {
+        uint8_t oa[16];
+        oa[0] = 0x03;
+        oa[1] = (uint8_t)sc_addr_len;
+        memcpy(oa + 2, sc_addr, sc_addr_len);
+        if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_OA, oa,
+                        2 + sc_addr_len) < 0)
+            return -1;
+    }
+
+    if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_UI, tpdu, tpdu_len) < 0)
+        return -1;
+
+    if (more_to_send) {
+        uint8_t mms = 1;
+        if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_MMS, &mms, 1) < 0)
+            return -1;
+    }
     return (int)off;
 }
 

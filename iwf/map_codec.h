@@ -45,10 +45,13 @@
 #define MAP_OP_CODE_SEND_AUTH_INFO          56
 #define MAP_OP_CODE_PURGE_MS                67
 #define MAP_OP_CODE_SEND_ROUTING_INFO_SM    45
-#define MAP_OP_CODE_MT_FORWARD_SM           46
+#define MAP_OP_CODE_MT_FORWARD_SM           46  /* forwardSM (v1/v2) / mo-forwardSM (v3) */
+#define MAP_OP_CODE_MT_FORWARD_SM_V3        44  /* mt-forwardSM (MAP v3) */
 
 /* MAP error codes we may receive/send (TS 29.002 §17.6). */
 #define MAP_ERR_UNKNOWN_SUBSCRIBER          1
+#define MAP_ERR_ABSENT_SUBSCRIBER_SM        6   /* MAP v3 SMS */
+#define MAP_ERR_ABSENT_SUBSCRIBER           27  /* MAP v1/v2 SMS */
 #define MAP_ERR_ROAMING_NOT_ALLOWED         8
 #define MAP_ERR_FACILITY_NOT_SUPPORTED      21
 #define MAP_ERR_DELIVERY_FAILURE            32
@@ -149,6 +152,14 @@ int map_encode_sri_sm_res(const char *imsi_digits, const char *msc_gt_digits,
 int map_encode_mt_fwd_sm_arg(const char *imsi_digits, const char *smsc_gt_digits,
                              const uint8_t *tpdu, size_t tpdu_len,
                              uint8_t *out, size_t out_cap);
+/* Decode inbound MT-ForwardSM-Arg / ForwardSM-Arg (delivery to our roamer):
+ * sm-RP-DA imsi [0], sm-RP-OA serviceCentreAddressOA [4] (raw AddressString
+ * incl. TON/NPI byte), sm-RP-UI OCTET STRING, moreMessagesToSend NULL. */
+int map_decode_mt_fsm_arg(const uint8_t *p, size_t n,
+                          char *imsi_out, size_t imsi_cap,
+                          uint8_t *sc_addr, size_t sc_cap, size_t *sc_len,
+                          const uint8_t **ui, size_t *ui_len,
+                          int *more);
 
 /* ----- encoders (for the IWF -> SGSN direction) ------------------- */
 
@@ -252,5 +263,12 @@ typedef enum {
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap);
 int map_encode_aare(map_app_ctx_t ac, uint8_t *out, size_t out_cap);
 int map_decode_aarq_ac(const uint8_t *p, size_t n, map_app_ctx_t *out);
+/* Extract the raw application-context OID from an AARQ dialogue blob, and
+ * build an AARE (accepted) echoing an arbitrary AC OID - used to answer
+ * dialogues whose AC we don't model (e.g. shortMsgMT-Relay v1/v2/v3). */
+int map_decode_aarq_ac_raw(const uint8_t *p, size_t n,
+                           uint8_t *oid_out, size_t cap, size_t *oid_len);
+int map_encode_aare_oid(const uint8_t *ac_oid, size_t ac_oid_len,
+                        uint8_t *out, size_t out_cap);
 
 #endif /* IWF_MAP_CODEC_H */

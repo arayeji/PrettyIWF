@@ -87,6 +87,9 @@
 #ifdef GSUP_PROXY_ENABLED
 #include "gsup_map_proxy.h"
 #endif
+#ifdef SMS_IWF_ENABLED
+#include "sms_iwf.h"
+#endif
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -667,6 +670,16 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
         case MAP_OP_CODE_PURGE_MS:              handle_begin_purge(rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_CANCEL_LOCATION:       handle_begin_cl   (rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_PROVIDE_ROAMING_NUMBER: handle_begin_prn (rt, calling, &tmsg, c); break;
+#ifdef SMS_IWF_ENABLED
+        case MAP_OP_CODE_MT_FORWARD_SM_V3:      /* mt-forwardSM (v3)      */
+        case MAP_OP_CODE_MT_FORWARD_SM:         /* forwardSM (v1/v2)      */
+            if (sms_iwf_enabled(rt)) {
+                sms_iwf_on_mt_fsm(rt, calling, &tmsg, c);
+                break;
+            }
+            LOGW("map", "MT forwardSM received but SMS-IWF disabled");
+            break;
+#endif
         default:
             LOGW("map", "unsupported MAP opcode=%d ac=%d in BEGIN",
                  c->opcode, ac);

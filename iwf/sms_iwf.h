@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "ss7_link.h"
+#include "tcap.h"
+#include "gsup_proto.h"
+
 struct iwf_runtime;
 
 enum sms_iwf_epoll_role {
@@ -17,6 +21,15 @@ enum sms_iwf_epoll_role {
 int  sms_iwf_init(struct iwf_runtime *rt, int epfd);
 void sms_iwf_shutdown(struct iwf_runtime *rt);
 bool sms_iwf_enabled(const struct iwf_runtime *rt);
+
+/* Inbound MT-SMS delivery (partner SMSC -> our roamer): MAP [mt-]forwardSM
+ * BEGIN dispatched from map_iwf, delivered to osmo-msc via GSUP
+ * MT-ForwardSM (requires `sms-over-gsup` on the MSC). */
+void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
+                       const ss7_sccp_addr_t *calling,
+                       const tcap_msg_t *tmsg,
+                       const tcap_component_t *c);
+void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *msg);
 
 /* SS7 dispatch is via ss7_link HLR recv callback registered at init. */
 void sms_iwf_on_smpp_srv_readable(void);

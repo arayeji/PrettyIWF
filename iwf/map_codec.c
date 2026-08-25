@@ -1148,13 +1148,9 @@ static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
  * Stored as the EXTERNAL.direct-reference. */
 static const uint8_t DIALOGUE_AS_ID[] = { 0x00,0x11,0x86,0x05,0x01,0x01,0x01 };
 
-static int enc_aaXX(uint8_t apdu_tag, map_app_ctx_t ac,
-                    uint8_t *out, size_t out_cap)
+static int enc_aaXX_oid(uint8_t apdu_tag, const uint8_t *ac_oid, size_t ac_len,
+                        uint8_t *out, size_t out_cap)
 {
-    const uint8_t *ac_oid;
-    size_t ac_len;
-    if (oid_for_ac(ac, &ac_oid, &ac_len) < 0) return -1;
-
     /* AARQ/AARE body (ITU-T Q.773):
      *   [0] IMPLICIT protocol-version: { version1 (0) }   -> 80 02 07 80
      *   [1] EXPLICIT application-context-name OID         -> A1 <len> 06 <len> <oid>
@@ -1227,6 +1223,15 @@ static int enc_aaXX(uint8_t apdu_tag, map_app_ctx_t ac,
     return (int)off;
 }
 
+static int enc_aaXX(uint8_t apdu_tag, map_app_ctx_t ac,
+                    uint8_t *out, size_t out_cap)
+{
+    const uint8_t *ac_oid;
+    size_t ac_len;
+    if (oid_for_ac(ac, &ac_oid, &ac_len) < 0) return -1;
+    return enc_aaXX_oid(apdu_tag, ac_oid, ac_len, out, out_cap);
+}
+
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap)
 {
     return enc_aaXX(0x60 /* [APPLICATION 0] AARQ */, ac, out, out_cap);
@@ -1235,6 +1240,29 @@ int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap)
 int map_encode_aare(map_app_ctx_t ac, uint8_t *out, size_t out_cap)
 {
     return enc_aaXX(0x61 /* [APPLICATION 1] AARE */, ac, out, out_cap);
+}
+
+int map_encode_aare_oid(const uint8_t *ac_oid, size_t ac_oid_len,
+                        uint8_t *out, size_t out_cap)
+{
+    if (!ac_oid || !ac_oid_len || ac_oid_len > 16) return -1;
+    return enc_aaXX_oid(0x61 /* AARE */, ac_oid, ac_oid_len, out, out_cap);
+}
+
+int map_decode_aarq_ac_raw(const uint8_t *p, size_t n,
+                           uint8_t *oid_out, size_t cap, size_t *oid_len)
+{
+    if (!p || !oid_out || !oid_len) return -1;
+    for (size_t i = 0; i + 4 < n; i++) {
+        if (p[i] == 0xA1 && p[i + 2] == 0x06) {
+            size_t l = p[i + 3];
+            if (!l || l > cap || i + 4 + l > n) continue;
+            memcpy(oid_out, p + i + 4, l);
+            *oid_len = l;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 /* ====================================================================== */
@@ -1378,6 +1406,61 @@ int map_encode_mt_fwd_sm_arg(const char *imsi_digits, const char *smsc_gt_digits
     if (ber_enc_tlv(out, out_cap, &off, 0x04, oa_inner, oio) < 0) return -1;
     if (ber_enc_tlv(out, out_cap, &off, 0x03, tpdu, tpdu_len) < 0) return -1;
     return (int)off;
+}
+
+int map_decode_mt_fsm_arg(const uint8_t *p, size_t n,
+                          char *imsi_out, size_t imsi_cap,
+                          uint8_t *sc_addr, size_t sc_cap, size_t *sc_len,
+                          const uint8_t **ui, size_t *ui_len,
+                          int *more)
+{
+    /* [MT-]ForwardSM-Arg ::= SEQUENCE {
+     *   sm-RP-DA CHOICE { imsi [0], lmsi [1], serviceCentreAddressDA [4],
+     *                     noSM-RP-DA [5] },
+     *   sm-RP-OA CHOICE { msisdn [2], serviceCentreAddressOA [4],
+     *                     noSM-RP-OA [5] },
+     *   sm-RP-UI OCTET STRING,
+     *   moreMessagesToSend NULL OPTIONAL }                                */
+    if (!p || !imsi_out || !imsi_cap || !ui || !ui_len) return -1;
+    imsi_out[0] = '\0';
+    if (sc_len) *sc_len = 0;
+    *ui = NULL; *ui_len = 0;
+    if (more) *more = 0;
+
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && (p[0] == 0x30 || (p[0] & 0x20)))
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+
+    size_t off = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *v;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &v, &l) < 0) break;
+        switch (tag) {
+        case 0x80:  /* sm-RP-DA imsi (some stacks emit [1]) */
+        case 0x81:
+            if (!imsi_out[0])
+                map_bcd_to_str(v, l, imsi_out, imsi_cap);
+            break;
+        case 0x84:  /* sm-RP-OA serviceCentreAddressOA (raw AddressString) */
+            if (sc_addr && sc_len && !*sc_len && l && l <= sc_cap) {
+                memcpy(sc_addr, v, l);
+                *sc_len = l;
+            }
+            break;
+        case 0x04:  /* sm-RP-UI */
+            if (!*ui) { *ui = v; *ui_len = l; }
+            break;
+        case 0x05:  /* moreMessagesToSend NULL */
+            if (more) *more = 1;
+            break;
+        default:
+            break;
+        }
+    }
+    return (imsi_out[0] && *ui && *ui_len) ? 0 : -1;
 }
 
 int map_decode_aarq_ac(const uint8_t *p, size_t n, map_app_ctx_t *out)
