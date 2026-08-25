@@ -31,6 +31,7 @@ typedef struct gsup_pending {
     map_op_t    map_op;
     uint8_t     invoke_id;          /* our outbound Invoke id */
     uint8_t     isd_invoke_id;      /* HLR ISD Invoke id to ack */
+    int         isd_forwarded;      /* primary ISD already sent to MSC */
     uint8_t     cn_domain;
     gsup_pend_state_t state;
     char        msisdn[24];
@@ -1045,14 +1046,15 @@ static int map_pending_send_isd_gsup(gsup_pending_t *p)
     return 0;
 }
 
-/* After MSC ISD_RES: ReturnResult ISD toward HLR, keep dialogue open for UL Res. */
-static int map_pending_ack_isd(gsup_pending_t *p)
+/* Send a TCAP CONTINUE with a ReturnResult for one ISD Invoke id.
+ * Segmented ISD: the HLR expects a ReturnResult per Invoke it sent. */
+static int map_pending_send_isd_rr(gsup_pending_t *p, uint8_t inv_id)
 {
     if (!p || !p->have_peer_otid || !p->have_peer_addr) return -1;
 
     uint8_t cmp[64];
     size_t co = 0;
-    if (tcap_enc_return_result(cmp, sizeof(cmp), &co, p->isd_invoke_id,
+    if (tcap_enc_return_result(cmp, sizeof(cmp), &co, inv_id,
                                MAP_OP_CODE_INSERT_SUBSCRIBER_DATA,
                                NULL, 0) < 0)
         return -1;
@@ -1074,9 +1076,15 @@ static int map_pending_ack_isd(gsup_pending_t *p)
         ss7_link_make_local_addr(g_rt, &calling);
     calling.ssn = ssn;
 
-    if (ss7_link_send_tcap_ex(g_rt, &p->peer_addr,
-                              calling.have_gt ? &calling : NULL,
-                              out, (size_t)n) < 0)
+    return ss7_link_send_tcap_ex(g_rt, &p->peer_addr,
+                                 calling.have_gt ? &calling : NULL,
+                                 out, (size_t)n);
+}
+
+/* After MSC ISD_RES: ReturnResult ISD toward HLR, keep dialogue open for UL Res. */
+static int map_pending_ack_isd(gsup_pending_t *p)
+{
+    if (map_pending_send_isd_rr(p, p->isd_invoke_id) < 0)
         return -1;
 
     p->state = GPEND_WAIT_MAP;
@@ -1099,14 +1107,6 @@ static int map_pending_on_isd_invoke(gsup_pending_t *p,
                                      const tcap_msg_t *tmsg,
                                      const tcap_component_t *c)
 {
-    char msisdn[24] = {0};
-    if (map_decode_isd_arg(c->parameters, c->parameters_len,
-                           NULL, 0, msisdn, sizeof(msisdn)) < 0 || !msisdn[0]) {
-        LOGW("gsup", "[%s] MAP ISD Invoke without MSISDN", p->imsi);
-        return -1;
-    }
-    strncpy(p->msisdn, msisdn, sizeof(p->msisdn) - 1);
-    p->isd_invoke_id = c->invoke_id;
     if (tmsg->have_otid) {
         p->peer_otid = tmsg->otid;
         p->have_peer_otid = 1;
@@ -1115,7 +1115,30 @@ static int map_pending_on_isd_invoke(gsup_pending_t *p,
         p->peer_addr = *calling;
         p->have_peer_addr = 1;
     }
-    return map_pending_send_isd_gsup(p);
+
+    char msisdn[24] = {0};
+    (void)map_decode_isd_arg(c->parameters, c->parameters_len,
+                             NULL, 0, msisdn, sizeof(msisdn));
+
+    /* Primary ISD (carries the MSISDN): forward to the MSC over GSUP and
+     * ack toward the HLR only after the MSC's ISD_RES. */
+    if (msisdn[0] && !p->isd_forwarded) {
+        strncpy(p->msisdn, msisdn, sizeof(p->msisdn) - 1);
+        p->isd_invoke_id = c->invoke_id;
+        p->isd_forwarded = 1;
+        return map_pending_send_isd_gsup(p);
+    }
+
+    /* Secondary/segmented ISD (no MSISDN, e.g. teleservice/GPRS segment, or
+     * primary already forwarded): the MSC needs nothing from it, but the HLR
+     * still requires a per-Invoke ReturnResult or it aborts the whole
+     * dialogue with systemFailure. Ack it right away. */
+    LOGI("gsup",
+         "[%s] MAP ISD segment invokeId=%u (msisdn=%s) -> immediate ack",
+         p->imsi,
+         (unsigned)c->invoke_id,
+         msisdn[0] ? msisdn : "none");
+    return map_pending_send_isd_rr(p, c->invoke_id);
 }
 
 bool gsup_map_proxy_on_tcap(iwf_runtime_t *rt,
@@ -1142,9 +1165,10 @@ bool gsup_map_proxy_on_tcap(iwf_runtime_t *rt,
     }
 
     if (tmsg->type == TCAP_MSG_ABORT) {
+        /* Abort is transient (HLR gave up on the dialogue), not IMSI-unknown. */
         reply_gsup_err(p->conn_id, p->imsi,
                        p->map_op == MAP_OP_SAI ? GSUP_MSG_SAI_REQ : GSUP_MSG_UL_REQ,
-                       GSUP_CAUSE_IMSI_UNKNOWN);
+                       GSUP_CAUSE_NET_FAIL);
         pending_remove(p);
         return true;
     }
@@ -1204,8 +1228,9 @@ bool gsup_map_proxy_on_tcap(iwf_runtime_t *rt,
             map_to_gsup_sai(p, c->parameters, c->parameters_len);
             finished = 1;
         } else if (p->map_op == MAP_OP_UL || p->map_op == MAP_OP_UGL) {
-            /* Defer UL_RES until after MSC ISD_RES when ISD was in this PDU. */
-            if (saw_isd || p->state == GPEND_WAIT_GSUP_ISD) {
+            /* Defer UL_RES until MSC ISD_RES, but only when a forwarded ISD
+             * is actually in flight (immediate-acked segments don't wait). */
+            if (p->state == GPEND_WAIT_GSUP_ISD) {
                 size_t copy = c->parameters_len;
                 if (copy > sizeof(p->deferred_ul_res))
                     copy = sizeof(p->deferred_ul_res);
