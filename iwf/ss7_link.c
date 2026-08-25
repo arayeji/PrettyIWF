@@ -649,8 +649,8 @@ int ss7_link_init(struct iwf_runtime *rt)
     ctx->stp_dpc  = pack_dotted_pc(rt->cfg.stp_remote_pc);
     ctx->network_indicator = rt->cfg.stp_network_indicator;
     ctx->sccp_ri  = rt->cfg.map_sccp_ri;
-    LOGI("ss7", "outbound MAP: sccp_ri=%s RI=%s, SCCP PCI=0 (no PC in "
-         "CdPA/CgPA); M3UA DPC set via MTP-TRANSFER to STP PC=%s",
+    LOGI("ss7", "outbound MAP: CdPA sccp_ri=%s RI=%s, CgPA RI=SSN+GT "
+         "(PCI=0); M3UA DPC via MTP-TRANSFER to STP PC=%s",
          ctx->sccp_ri == IWF_SCCP_RI_SSN ? "ssn" : "gt",
          ctx->sccp_ri == IWF_SCCP_RI_SSN ? "SSN" : "GT (when GT present)",
          osmo_ss7_pc_is_valid(ctx->stp_dpc) ? rt->cfg.stp_remote_pc : "0");
@@ -809,15 +809,21 @@ static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
     (void)user;
     ss7_encode_outbound_called(called, &called_addr, ctx->stp_dpc, ctx->sccp_ri);
     ss7_to_osmo_addr(calling, &calling_addr, ctx->sccp_ri);
-    /* Never embed PC in CgPA (PCI=0); partners often copy CgPA→answer CdPA.
-     * sccp_ri selects RI only: GT when GT present, else SSN. */
+    /* Never embed PC in CgPA (PCI=0). Partners copy CgPA → answer CdPA.
+     *
+     * CdPA toward the peer still follows [map_iwf].sccp_ri (usually GT) so
+     * the STP can GTT internationally.
+     *
+     * CgPA MUST keep our GT (for STP GTT of the reply) but advertise RI=SSN:
+     * peers echo CgPA into answer CdPA. If we strip GT, they cannot route
+     * the ISD ack back (allstp1245: 19 ISD Cont, 0 ISD ack). If we advertise
+     * RI=GT, they echo RI=GT and local osmo-sccp drops ("GT Routing not
+     * implemented"). RI=SSN + GT is the compromise; MTP DPC is already us. */
     calling_addr.pc = 0;
     calling_addr.presence &= ~OSMO_SCCP_ADDR_T_PC;
-    if (calling && calling->have_gt) {
+    if (calling && calling->have_gt)
         calling_addr.presence |= OSMO_SCCP_ADDR_T_GT;
-        calling_addr.ri = (ctx->sccp_ri == IWF_SCCP_RI_SSN) ? OSMO_SCCP_RI_SSN_PC
-                                                           : OSMO_SCCP_RI_GT;
-    }
+    calling_addr.ri = OSMO_SCCP_RI_SSN_PC;
 
     return ss7_tx_unitdata_mtp(ctx, &calling_addr, &called_addr,
                                tcap, tcap_len);

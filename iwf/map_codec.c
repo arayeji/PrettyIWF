@@ -998,15 +998,16 @@ int map_encode_isd_arg(const char *imsi_str,
             }
             if (awi < 2)
                 continue;
+
+            /* ASN.1 order in PDP-Context: [19] vplmnAddressAllowed before [20] apn.
+             * Emitting apn first makes Wireshark flag "beyond known sequence". */
+            if (ber_enc_tlv(pdp, sizeof(pdp), &po,
+                            map_ctx_tag_prim(19) /* [19] vplmnAddressAllowed */,
+                            NULL, 0) < 0)
+                return -1;
             if (ber_enc_tlv(pdp, sizeof(pdp), &po,
                             map_ctx_tag_prim(20) /* [20] apn */,
                             apn_wire, awi) < 0)
-                return -1;
-
-            /* vplmnAddressAllowed [19] NULL — roaming PDP activation permitted. */
-            if (ber_enc_tlv(pdp, sizeof(pdp), &po,
-                            map_ctx_tag_prim(19),
-                            NULL, 0) < 0)
                 return -1;
 
             if (ber_enc_tlv(gprs_list, sizeof(gprs_list), &gl,
