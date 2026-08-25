@@ -48,6 +48,10 @@
 #define MAP_OP_CODE_MT_FORWARD_SM           46  /* forwardSM (v1/v2) / mo-forwardSM (v3) */
 #define MAP_OP_CODE_MT_FORWARD_SM_V3        44  /* mt-forwardSM (MAP v3) */
 #define MAP_OP_CODE_PROVIDE_SUBSCRIBER_INFO 70
+/* USSD (TS 29.002 supplementary services). */
+#define MAP_OP_CODE_PROCESS_USS_REQ         59  /* processUnstructuredSS-Request */
+#define MAP_OP_CODE_USS_REQUEST             60  /* unstructuredSS-Request (NI)   */
+#define MAP_OP_CODE_USS_NOTIFY              61  /* unstructuredSS-Notify (NI)    */
 
 /* MAP error codes we may receive/send (TS 29.002 §17.6). */
 #define MAP_ERR_UNKNOWN_SUBSCRIBER          1
@@ -271,6 +275,7 @@ typedef enum {
     MAP_AC_NETWORK_LOC_UP_V3        = 6, /* updateLocation (MAP-C)         */
     MAP_AC_ROAMING_NUMBER_ENQUIRY_V3 = 7, /* provideRoamingNumber           */
     MAP_AC_SHORT_MSG_MO_RELAY_V2    = 8, /* forwardSM (MO submit, v2)      */
+    MAP_AC_NETWORK_UNSTRUCTURED_SS_V2 = 9, /* processUnstructuredSS (USSD) */
 } map_app_ctx_t;
 
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap);
@@ -283,5 +288,9 @@ int map_decode_aarq_ac_raw(const uint8_t *p, size_t n,
                            uint8_t *oid_out, size_t cap, size_t *oid_len);
 int map_encode_aare_oid(const uint8_t *ac_oid, size_t ac_oid_len,
                         uint8_t *out, size_t out_cap);
+/* Target IMSI from the MAP-open destinationReference (network-initiated
+ * USSD). Returns 0 and fills imsi_out on success. */
+int map_decode_dialogue_dest_ref(const uint8_t *p, size_t n,
+                                 char *imsi_out, size_t cap);
 
 #endif /* IWF_MAP_CODEC_H */

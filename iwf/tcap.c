@@ -161,6 +161,7 @@ static int decode_components(const uint8_t *buf, size_t len, tcap_msg_t *out)
 {
     size_t off = 0;
     while (off < len && out->n_components < TCAP_MAX_COMPONENTS) {
+        size_t start = off;
         uint8_t tag;
         const uint8_t *val;
         size_t val_len;
@@ -170,6 +171,8 @@ static int decode_components(const uint8_t *buf, size_t len, tcap_msg_t *out)
         memset(c, 0, sizeof(*c));
         c->opcode = -1;
         c->error_code = -1;
+        c->raw = buf + start;
+        c->raw_len = off - start;
 
         switch (tag) {
         case TCAP_CMP_INVOKE:        c->kind = TCAP_CMP_KIND_INVOKE; break;

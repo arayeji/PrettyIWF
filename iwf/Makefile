@@ -58,8 +58,8 @@ ifeq ($(MAP_IWF_ENABLED),1)
   PKG_OSMO_LIBS   := $(shell pkg-config --libs   libosmocore libosmo-sigtran libosmo-sccp 2>/dev/null)
   CFLAGS  += -DMAP_IWF_WITH_OSMO_SIGTRAN -DGSUP_PROXY_ENABLED $(PKG_OSMO_CFLAGS)
   LDLIBS  += $(PKG_OSMO_LIBS)
-  SRCS    += gsup_proto.c gsup_router.c gsup_server.c gsup_map_proxy.c
-  HDRS    += gsup_proto.h gsup_router.h gsup_server.h gsup_map_proxy.h
+  SRCS    += gsup_proto.c gsup_router.c gsup_server.c gsup_map_proxy.c ussd_iwf.c
+  HDRS    += gsup_proto.h gsup_router.h gsup_server.h gsup_map_proxy.h ussd_iwf.h
   ifeq ($(strip $(PKG_OSMO_LIBS)),)
     $(error MAP_IWF_ENABLED=1 but pkg-config cannot find libosmocore/libosmo-sigtran/libosmo-sccp. \
             Install: sudo apt install libosmocore-dev libosmo-sccp-dev libosmo-sigtran-dev)

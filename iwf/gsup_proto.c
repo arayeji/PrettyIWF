@@ -106,6 +106,26 @@ int gsup_parse_payload(const uint8_t *body, size_t len, gsup_parsed_t *out)
                 out->sm_rp_ui_len = (uint16_t)l;
             }
             break;
+        case GSUP_IE_SESSION_ID:
+            if (l == 4) {
+                out->session_id = ((uint32_t)v[0] << 24) |
+                                  ((uint32_t)v[1] << 16) |
+                                  ((uint32_t)v[2] << 8)  | v[3];
+                out->have_session_id = true;
+            }
+            break;
+        case GSUP_IE_SESSION_STATE:
+            if (l >= 1) {
+                out->session_state = v[0];
+                out->have_session_state = true;
+            }
+            break;
+        case GSUP_IE_SS_INFO:
+            if (l && l <= sizeof(out->ss_info)) {
+                memcpy(out->ss_info, v, l);
+                out->ss_info_len = (uint16_t)l;
+            }
+            break;
         default:
             break;
         }
@@ -569,6 +589,34 @@ int gsup_build_mo_fsm_err(const char *imsi, uint8_t sm_rp_mr,
         return -1;
     if (gsup_put_ie(out, cap, &off, GSUP_IE_SM_RP_CAUSE, &rp_cause, 1) < 0)
         return -1;
+    return (int)off;
+}
+
+int gsup_build_proc_ss(uint8_t msg_type, const char *imsi,
+                       uint32_t session_id, uint8_t session_state,
+                       const uint8_t *ss_info, size_t ss_info_len,
+                       uint8_t *out, size_t cap)
+{
+    if (!imsi || !out) return -1;
+    size_t off = 0;
+    if (cap < 1) return -1;
+    out[off++] = msg_type;
+    if (gsup_put_imsi_ie(out, cap, &off, imsi) < 0) return -1;
+    uint8_t sid[4] = {
+        (uint8_t)(session_id >> 24), (uint8_t)(session_id >> 16),
+        (uint8_t)(session_id >> 8),  (uint8_t)session_id
+    };
+    if (gsup_put_ie(out, cap, &off, GSUP_IE_SESSION_ID, sid, 4) < 0)
+        return -1;
+    if (gsup_put_ie(out, cap, &off, GSUP_IE_SESSION_STATE,
+                    &session_state, 1) < 0)
+        return -1;
+    if (ss_info && ss_info_len) {
+        if (ss_info_len > 255) return -1;   /* single-byte IE length */
+        if (gsup_put_ie(out, cap, &off, GSUP_IE_SS_INFO,
+                        ss_info, ss_info_len) < 0)
+            return -1;
+    }
     return (int)off;
 }
 

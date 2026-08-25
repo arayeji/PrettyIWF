@@ -27,6 +27,10 @@
 #define GSUP_MSG_ISD_ERR        0x11
 #define GSUP_MSG_ISD_RES        0x12
 #define GSUP_MSG_LOC_CANCEL_REQ 0x1c
+/* SS/USSD over GSUP (osmo session-based supplementary services). */
+#define GSUP_MSG_PROC_SS_REQ    0x20
+#define GSUP_MSG_PROC_SS_ERR    0x21
+#define GSUP_MSG_PROC_SS_RES    0x22
 /* SMS over GSUP (osmo-msc `sms-over-gsup`). */
 #define GSUP_MSG_MO_FSM_REQ     0x24
 #define GSUP_MSG_MO_FSM_ERR     0x25
@@ -59,6 +63,15 @@
 #define GSUP_IE_SM_RP_UI        0x43   /* SM TPDU                          */
 #define GSUP_IE_SM_RP_CAUSE     0x44   /* GSM 04.11 RP cause               */
 #define GSUP_IE_SM_RP_MMS       0x45   /* more messages to send            */
+/* Session IEs (osmo GSUP session-based messages, e.g. SS/USSD). */
+#define GSUP_IE_SESSION_ID      0x30   /* 4 bytes BE                       */
+#define GSUP_IE_SESSION_STATE   0x31   /* 1 byte                           */
+#define GSUP_IE_SS_INFO         0x35   /* raw GSM 04.80 facility component */
+
+#define GSUP_SESSION_STATE_NONE     0x00
+#define GSUP_SESSION_STATE_BEGIN    0x01
+#define GSUP_SESSION_STATE_CONTINUE 0x02
+#define GSUP_SESSION_STATE_END      0x03
 
 #define GSUP_RESYNC_RAND_LEN    16
 #define GSUP_RESYNC_AUTS_LEN    14
@@ -99,6 +112,13 @@ typedef struct {
     uint8_t  sm_rp_oa_len;
     uint8_t  sm_rp_ui[256];
     uint16_t sm_rp_ui_len;
+    /* SS/USSD session (PROC_SS_*). */
+    uint32_t session_id;
+    bool     have_session_id;
+    uint8_t  session_state;
+    bool     have_session_state;
+    uint8_t  ss_info[512];
+    uint16_t ss_info_len;
 } gsup_parsed_t;
 
 #define gsup_parsed_have_resync(p) \
@@ -137,6 +157,13 @@ int  gsup_build_mo_fsm_res(const char *imsi, uint8_t sm_rp_mr,
                            uint8_t *out, size_t cap);
 int  gsup_build_mo_fsm_err(const char *imsi, uint8_t sm_rp_mr,
                            uint8_t rp_cause, uint8_t *out, size_t cap);
+
+/* SS/USSD session message (PROC_SS_REQ/RES/ERR). ss_info may be NULL for
+ * a bare state transition (e.g. ERROR/END without payload). */
+int  gsup_build_proc_ss(uint8_t msg_type, const char *imsi,
+                        uint32_t session_id, uint8_t session_state,
+                        const uint8_t *ss_info, size_t ss_info_len,
+                        uint8_t *out, size_t cap);
 
 int  gsup_ipa_wrap(const uint8_t *gsup, size_t gsup_len,
                    uint8_t *out, size_t cap);

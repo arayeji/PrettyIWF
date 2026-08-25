@@ -86,6 +86,7 @@
 #include "gsup_proto.h"
 #ifdef GSUP_PROXY_ENABLED
 #include "gsup_map_proxy.h"
+#include "ussd_iwf.h"
 #endif
 #ifdef SMS_IWF_ENABLED
 #include "sms_iwf.h"
@@ -738,6 +739,20 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
             LOGW("map", "MT forwardSM received but SMS-IWF disabled");
             break;
 #endif
+#ifdef GSUP_PROXY_ENABLED
+        case MAP_OP_CODE_USS_REQUEST:           /* network-initiated USSD */
+        case MAP_OP_CODE_USS_NOTIFY:
+            ussd_iwf_on_ni_begin(rt, calling, &tmsg, c);
+            break;
+        case MAP_OP_CODE_PROCESS_USS_REQ:
+            /* MO USSD from one of our home subscribers roaming abroad -
+             * no USSD application behind the IWF to serve it. */
+            LOGI("map", "processUnstructuredSS for home subscriber -> "
+                 "facilityNotSupported");
+            ussd_iwf_reject_begin(rt, calling, &tmsg, c,
+                                  MAP_ERR_FACILITY_NOT_SUPPORTED);
+            break;
+#endif
         default:
             LOGW("map", "unsupported MAP opcode=%d ac=%d in BEGIN",
                  c->opcode, ac);
@@ -752,6 +767,8 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
             return;
 #endif
 #ifdef GSUP_PROXY_ENABLED
+        if (ussd_iwf_on_tcap(rt, calling, &tmsg))
+            return;
         if (gsup_map_proxy_on_tcap(rt, calling, &tmsg))
             return;
 #endif
@@ -760,6 +777,8 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
     }
     if (tmsg.type == TCAP_MSG_ABORT) {
 #ifdef GSUP_PROXY_ENABLED
+        if (ussd_iwf_on_tcap(rt, calling, &tmsg))
+            return;
         if (gsup_map_proxy_on_tcap(rt, calling, &tmsg))
             return;
 #endif

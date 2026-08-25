@@ -1123,6 +1123,8 @@ static const uint8_t AC_GPRS_LOC_CANCEL_V3[]     = { 0x04,0x00,0x00,0x01,0x00,0x
 static const uint8_t AC_MS_PURGING_V3[]          = { 0x04,0x00,0x00,0x01,0x00,0x1b,0x03 };
 /* shortMsgMO-RelayContext-v2: 0.4.0.0.1.0.21.2 */
 static const uint8_t AC_SHORT_MSG_MO_RELAY_V2[]  = { 0x04,0x00,0x00,0x01,0x00,0x15,0x02 };
+/* networkUnstructuredSsContext-v2: 0.4.0.0.1.0.19.2 */
+static const uint8_t AC_NETWORK_USSD_V2[]        = { 0x04,0x00,0x00,0x01,0x00,0x13,0x02 };
 
 static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
 {
@@ -1143,6 +1145,8 @@ static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
         *out = AC_MS_PURGING_V3;           *out_len = sizeof(AC_MS_PURGING_V3);           break;
     case MAP_AC_SHORT_MSG_MO_RELAY_V2:
         *out = AC_SHORT_MSG_MO_RELAY_V2;   *out_len = sizeof(AC_SHORT_MSG_MO_RELAY_V2);   break;
+    case MAP_AC_NETWORK_UNSTRUCTURED_SS_V2:
+        *out = AC_NETWORK_USSD_V2;         *out_len = sizeof(AC_NETWORK_USSD_V2);         break;
     default: return -1;
     }
     return 0;
@@ -1266,6 +1270,32 @@ int map_decode_aarq_ac_raw(const uint8_t *p, size_t n,
             *oid_len = l;
             return 0;
         }
+    }
+    return -1;
+}
+
+int map_decode_dialogue_dest_ref(const uint8_t *p, size_t n,
+                                 char *imsi_out, size_t cap)
+{
+    /* Network-initiated USSD carries the target IMSI as the MAP-open
+     * destinationReference inside the AARQ user-information:
+     *   BE .. 28 .. 06 .. <map-DialogueAS> A0 .. A0(map-open) .. 80(destRef)
+     * We scan for the map-open [0] wrapper directly followed by the
+     * [0] destinationReference AddressString and TBCD-decode it. */
+    if (!p || !imsi_out || cap == 0) return -1;
+    imsi_out[0] = '\0';
+    for (size_t i = 0; i + 4 < n; i++) {
+        if (p[i] != 0xA0 || p[i + 2] != 0x80) continue;
+        size_t l = p[i + 3];
+        if (!l || l > 10 || i + 4 + l > n) continue;
+        const uint8_t *v = p + i + 4;
+        size_t off = 0;
+        if (v[0] & 0x80) off = 1;       /* optional TON/NPI octet */
+        if (l <= off) continue;
+        map_bcd_to_str(v + off, l - off, imsi_out, cap);
+        if (strlen(imsi_out) >= 6)
+            return 0;
+        imsi_out[0] = '\0';
     }
     return -1;
 }

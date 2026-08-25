@@ -14,6 +14,7 @@
 #ifdef SMS_IWF_ENABLED
 #include "sms_iwf.h"
 #endif
+#include "ussd_iwf.h"
 
 #include <arpa/inet.h>
 #include <stdlib.h>
@@ -758,6 +759,14 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
         return;
     }
 #endif
+
+    /* Session-based SS/USSD from the MSC. */
+    if (req.msg_type == GSUP_MSG_PROC_SS_REQ ||
+        req.msg_type == GSUP_MSG_PROC_SS_RES ||
+        req.msg_type == GSUP_MSG_PROC_SS_ERR) {
+        ussd_iwf_on_gsup_ss(rt, conn_id, &req);
+        return;
+    }
 
     gsup_route_t route;
     if (gsup_router_lookup(&rt->cfg, req.imsi, &route) < 0) {

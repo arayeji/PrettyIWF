@@ -89,6 +89,10 @@ typedef struct {
     int       error_code;           /* local code for ReturnError (or -1)     */
     const uint8_t *parameters;      /* points into the caller buffer          */
     size_t    parameters_len;
+    /* Complete component TLV as received (for opaque relay, e.g. USSD
+     * facility pass-through over GSUP). Points into the caller buffer. */
+    const uint8_t *raw;
+    size_t    raw_len;
 } tcap_component_t;
 
 #define TCAP_MAX_COMPONENTS         4
