@@ -29,12 +29,15 @@ struct iwf_runtime;
 void ussd_iwf_on_gsup_ss(struct iwf_runtime *rt, int conn_id,
                          const gsup_parsed_t *m);
 
-/* Inbound TCAP BEGIN with unstructuredSS-Request/-Notify (network
- * initiated USSD toward a roamer on our network). */
+/* Inbound TCAP invoke of unstructuredSS-Request/-Notify (network
+ * initiated USSD toward a roamer on our network), either directly in a
+ * BEGIN or as the deferred invoke of an established dialogue.  Set
+ * aare_done when the AARE was already sent (dialogue establishment):
+ * backward messages then omit the dialogue portion. */
 void ussd_iwf_on_ni_begin(struct iwf_runtime *rt,
                           const ss7_sccp_addr_t *calling,
                           const tcap_msg_t *tmsg,
-                          const tcap_component_t *c);
+                          const tcap_component_t *c, bool aare_done);
 
 /* TCAP CONTINUE/END/ABORT routing: returns true if the dtid belongs to a
  * USSD session (message consumed). */

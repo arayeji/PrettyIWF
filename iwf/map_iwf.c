@@ -693,6 +693,167 @@ static void handle_abort(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
     map_sess_remove(s);
 }
 
+/* ----- TC dialogue establishment (empty BEGIN) ---------------------- */
+/* Some peers (a roaming partner SMSC/USSD-GW) open the dialogue with an empty
+ * BEGIN (AARQ only) and send the actual invoke in a CONTINUE once we
+ * confirm with AARE - used when BEGIN + invoke would not fit one UDT.
+ * We accept, remember the peer, and route the deferred invoke to the
+ * SMS/USSD handlers when it arrives. */
+
+#define DLG_EST_ENTRIES   16
+#define DLG_EST_TTL_S     15
+#define DLG_EST_OTID_BIT  0x20000000u
+
+struct dlg_est_ent {
+    bool            used;
+    uint32_t        our_otid;
+    uint32_t        peer_otid;
+    ss7_sccp_addr_t peer;
+    uint8_t         dialogue[240];   /* original AARQ (AC + destinationReference) */
+    uint16_t        dlen;
+    time_t          ts;
+};
+
+static struct dlg_est_ent g_dlg_est[DLG_EST_ENTRIES];
+static uint32_t g_dlg_est_ctr;
+
+static struct dlg_est_ent *dlg_est_alloc(void)
+{
+    time_t now = time(NULL);
+    struct dlg_est_ent *free_e = NULL;
+    for (int i = 0; i < DLG_EST_ENTRIES; i++) {
+        struct dlg_est_ent *e = &g_dlg_est[i];
+        if (e->used && now - e->ts > DLG_EST_TTL_S)
+            e->used = false;
+        if (!e->used && !free_e)
+            free_e = e;
+    }
+    return free_e;
+}
+
+static void handle_empty_begin(struct iwf_runtime *rt,
+                               const ss7_sccp_addr_t *calling,
+                               const tcap_msg_t *tmsg)
+{
+    uint8_t oid[16];
+    size_t ol = 0;
+    if (!tmsg->have_otid || !tmsg->dialogue ||
+        tmsg->dialogue_len > sizeof(((struct dlg_est_ent *)0)->dialogue) ||
+        map_decode_aarq_ac_raw(tmsg->dialogue, tmsg->dialogue_len,
+                               oid, sizeof(oid), &ol) < 0) {
+        LOGW("map", "BEGIN without Invoke component (no usable AARQ)");
+        return;
+    }
+    /* Only accept ACs whose deferred invoke we can actually serve:
+     * shortMsgMT-Relay v1/v2/v3 (0.4.0.0.1.0.25.x) and
+     * networkUnstructuredSs v2 (0.4.0.0.1.0.19.2). */
+    static const uint8_t pre_smsg[6] = { 0x04,0x00,0x00,0x01,0x00,0x19 };
+    static const uint8_t pre_ussd[7] = { 0x04,0x00,0x00,0x01,0x00,0x13,0x02 };
+    if (!(ol == 7 && (!memcmp(oid, pre_smsg, sizeof(pre_smsg)) ||
+                      !memcmp(oid, pre_ussd, sizeof(pre_ussd))))) {
+        LOGW("map", "empty BEGIN with unsupported AC (len=%zu); ignoring", ol);
+        return;
+    }
+
+    struct dlg_est_ent *e = dlg_est_alloc();
+    if (!e) {
+        LOGW("map", "dialogue-establishment table full; dropping BEGIN");
+        return;
+    }
+
+    uint8_t dlg[128];
+    int dn = map_encode_aare_oid(oid, ol, dlg, sizeof(dlg));
+    if (dn < 0) return;
+
+    uint32_t our = DLG_EST_OTID_BIT | (++g_dlg_est_ctr & 0x0fffffffu);
+    uint8_t out[256];
+    int n = tcap_encode_message(TCAP_MSG_CONTINUE, our, true,
+                                tmsg->otid, true,
+                                dlg, (size_t)dn, NULL, 0, out, sizeof(out));
+    if (n < 0) return;
+
+    ss7_sccp_addr_t cg;
+    memset(&cg, 0, sizeof(cg));
+    if (rt->cfg.map_local_gt[0])
+        ss7_gt_from_digits(rt->cfg.map_local_gt, SS7_SSN_MSC, &cg);
+    cg.ssn = SS7_SSN_MSC;
+    if (ss7_link_send_tcap_ex(rt, calling, cg.have_gt ? &cg : NULL,
+                              out, (size_t)n) < 0)
+        return;
+
+    memset(e, 0, sizeof(*e));
+    e->used = true;
+    e->our_otid = our;
+    e->peer_otid = tmsg->otid;
+    e->peer = *calling;
+    memcpy(e->dialogue, tmsg->dialogue, tmsg->dialogue_len);
+    e->dlen = (uint16_t)tmsg->dialogue_len;
+    e->ts = time(NULL);
+    LOGI("map",
+         "empty BEGIN peer_otid=0x%08x -> TX CONTINUE AARE (our_otid=0x%08x)",
+         tmsg->otid, our);
+}
+
+/* CONTINUE carrying the deferred invoke of an established dialogue.
+ * Returns true if the message belonged to (and consumed) an entry. */
+static bool dlg_est_on_tcap(struct iwf_runtime *rt,
+                            const ss7_sccp_addr_t *calling,
+                            const tcap_msg_t *tmsg)
+{
+    if (!tmsg->have_dtid) return false;
+    struct dlg_est_ent *e = NULL;
+    for (int i = 0; i < DLG_EST_ENTRIES; i++) {
+        if (g_dlg_est[i].used && g_dlg_est[i].our_otid == tmsg->dtid) {
+            e = &g_dlg_est[i];
+            break;
+        }
+    }
+    if (!e) return false;
+    e->used = false;
+
+    if (tmsg->type != TCAP_MSG_CONTINUE || tmsg->n_components == 0 ||
+        tmsg->components[0].kind != TCAP_CMP_KIND_INVOKE) {
+        LOGI("map", "established dialogue 0x%08x closed without invoke",
+             tmsg->dtid);
+        return true;
+    }
+    const tcap_component_t *c = &tmsg->components[0];
+    LOGI("map", "established dialogue 0x%08x: deferred invoke op=%d",
+         tmsg->dtid, c->opcode);
+
+    switch (c->opcode) {
+#ifdef SMS_IWF_ENABLED
+    case MAP_OP_CODE_MT_FORWARD_SM_V3:
+    case MAP_OP_CODE_MT_FORWARD_SM:
+        if (sms_iwf_enabled(rt)) {
+            /* AARE already sent in our CONTINUE: strip the dialogue so
+             * the SMS handler's END does not repeat it. */
+            tcap_msg_t t2 = *tmsg;
+            t2.dialogue = NULL;
+            t2.dialogue_len = 0;
+            sms_iwf_on_mt_fsm(rt, calling, &t2, c);
+        }
+        break;
+#endif
+#ifdef GSUP_PROXY_ENABLED
+    case MAP_OP_CODE_USS_REQUEST:
+    case MAP_OP_CODE_USS_NOTIFY:
+    case MAP_OP_CODE_PROCESS_USS_REQ: {
+        /* destinationReference (IMSI) came in the original AARQ. */
+        tcap_msg_t t2 = *tmsg;
+        t2.dialogue = e->dialogue;
+        t2.dialogue_len = e->dlen;
+        ussd_iwf_on_ni_begin(rt, calling, &t2, c, true /* aare_done */);
+        break;
+    }
+#endif
+    default:
+        LOGW("map", "deferred invoke op=%d unsupported; dropping", c->opcode);
+        break;
+    }
+    return true;
+}
+
 /* ----- SCCP receive entrypoint (set on ss7_link at init) ----------- */
 
 static void on_sccp_pdu(struct iwf_runtime *rt,
@@ -717,7 +878,9 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
 
         if (tmsg.n_components == 0 ||
             tmsg.components[0].kind != TCAP_CMP_KIND_INVOKE) {
-            LOGW("map", "BEGIN without Invoke component (n=%zu)", tmsg.n_components);
+            /* Dialogue establishment: AARQ only, invoke follows in a
+             * CONTINUE after we confirm (a roaming partner SMSC/USSD pattern). */
+            handle_empty_begin(rt, calling, &tmsg);
             return;
         }
         const tcap_component_t *c = &tmsg.components[0];
@@ -742,7 +905,7 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
 #ifdef GSUP_PROXY_ENABLED
         case MAP_OP_CODE_USS_REQUEST:           /* network-initiated USSD */
         case MAP_OP_CODE_USS_NOTIFY:
-            ussd_iwf_on_ni_begin(rt, calling, &tmsg, c);
+            ussd_iwf_on_ni_begin(rt, calling, &tmsg, c, false);
             break;
         case MAP_OP_CODE_PROCESS_USS_REQ:
             /* MO USSD from one of our home subscribers roaming abroad -
@@ -762,6 +925,8 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
     }
 
     if (tmsg.type == TCAP_MSG_CONTINUE || tmsg.type == TCAP_MSG_END) {
+        if (dlg_est_on_tcap(rt, calling, &tmsg))
+            return;
 #ifdef SMS_IWF_ENABLED
         if (sms_iwf_enabled(rt) && sms_iwf_on_mo_tcap(rt, &tmsg))
             return;

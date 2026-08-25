@@ -105,6 +105,11 @@ int gsup_map_proxy_cs_conn_for_imsi(const char *imsi)
     int cid = gsup_conn_for_imsi(imsi, GSUP_CN_DOMAIN_CS);
     if (cid >= 0)
         return cid;
+    /* Conn identified as the MSC via its IPA unit name (works right
+     * after (re)start, before any CS GSUP message has been seen). */
+    cid = gsup_server_find_conn_by_unit_prefix("MSC");
+    if (cid >= 0)
+        return cid;
     if (g_last_cs_conn >= 0 && gsup_server_conn_valid(g_last_cs_conn))
         return g_last_cs_conn;
     return -1;

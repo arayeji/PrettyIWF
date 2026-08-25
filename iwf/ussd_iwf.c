@@ -349,11 +349,15 @@ void ussd_iwf_reject_begin(struct iwf_runtime *rt,
 void ussd_iwf_on_ni_begin(struct iwf_runtime *rt,
                           const ss7_sccp_addr_t *calling,
                           const tcap_msg_t *tmsg,
-                          const tcap_component_t *c)
+                          const tcap_component_t *c, bool aare_done)
 {
     if (!rt || !calling || !tmsg->have_otid || !c->raw || !c->raw_len)
         return;
     ussd_expire(rt);
+
+    /* Error replies must not repeat the AARE once it has been sent. */
+    const uint8_t *err_dlg = aare_done ? NULL : tmsg->dialogue;
+    size_t err_dlen = aare_done ? 0 : tmsg->dialogue_len;
 
     char imsi[16];
     if (map_decode_dialogue_dest_ref(tmsg->dialogue, tmsg->dialogue_len,
@@ -361,8 +365,7 @@ void ussd_iwf_on_ni_begin(struct iwf_runtime *rt,
         LOGW("ussd", "NI USSD op=%d: no destinationReference IMSI -> error",
              c->opcode);
         ussd_ni_reply_error(rt, calling, tmsg->otid, c->invoke_id,
-                            tmsg->dialogue, tmsg->dialogue_len,
-                            MAP_ERR_SYSTEM_FAILURE);
+                            err_dlg, err_dlen, MAP_ERR_SYSTEM_FAILURE);
         return;
     }
 
@@ -371,8 +374,7 @@ void ussd_iwf_on_ni_begin(struct iwf_runtime *rt,
         LOGI("ussd", "[%s] NI USSD op=%d: no MSC GSUP conn -> absent",
              imsi, c->opcode);
         ussd_ni_reply_error(rt, calling, tmsg->otid, c->invoke_id,
-                            tmsg->dialogue, tmsg->dialogue_len,
-                            MAP_ERR_ABSENT_SUBSCRIBER);
+                            err_dlg, err_dlen, MAP_ERR_ABSENT_SUBSCRIBER);
         return;
     }
 
@@ -386,10 +388,10 @@ void ussd_iwf_on_ni_begin(struct iwf_runtime *rt,
     s->have_peer_otid = true;
     s->peer_invoke_id = c->invoke_id;
     s->peer_addr = *calling;
-    s->aare_pending = true;
+    s->aare_pending = !aare_done;
     s->created = time(NULL);
     strncpy(s->imsi, imsi, sizeof(s->imsi) - 1);
-    if (tmsg->dialogue && tmsg->dialogue_len) {
+    if (!aare_done && tmsg->dialogue && tmsg->dialogue_len) {
         size_t ol = 0;
         if (map_decode_aarq_ac_raw(tmsg->dialogue, tmsg->dialogue_len,
                                    s->aare_oid, sizeof(s->aare_oid),

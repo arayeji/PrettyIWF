@@ -10,6 +10,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
@@ -19,6 +20,9 @@
 #define GSUP_RX_CAP         8192
 #define GSUP_IPA_PROTO_CCM  0xFE
 #define CCM_PONG            0x01
+#define CCM_ID_GET          0x04
+#define CCM_ID_RESP         0x05
+#define IPA_IDTAG_UNITNAME  0x01
 
 typedef struct {
     int         fd;
@@ -26,6 +30,9 @@ typedef struct {
     char        bind_ip[64];
     char        peer_ip[64];
     uint16_t    peer_port;
+    /* IPA unit name from ID RESP, e.g. "MSC-00-..." / "SGSN-00-...".
+     * Identifies the peer role before any GSUP message arrives. */
+    char        unit_name[64];
     uint8_t     rx[GSUP_RX_CAP];
     size_t      rx_used;
     bool        in_use;
@@ -85,16 +92,38 @@ static void dispatch_gsup(int conn_id, const uint8_t *gsup, size_t len)
     gsup_map_proxy_on_gsup(g_srv.rt, conn_id, gsup, len);
 }
 
+/* ID RESP payload: series of [u16 len][u8 tag][len-1 bytes value]. */
+static void ccm_parse_id_resp(int conn_id, const uint8_t *p, size_t len)
+{
+    gsup_conn_t *c = &g_srv.conn[conn_id];
+    size_t off = 0;
+    while (off + 3 <= len) {
+        size_t l = ((size_t)p[off] << 8) | p[off + 1];
+        uint8_t tag = p[off + 2];
+        if (l < 1 || off + 2 + l > len) return;
+        if (tag == IPA_IDTAG_UNITNAME) {
+            size_t vl = l - 1;
+            if (vl >= sizeof(c->unit_name)) vl = sizeof(c->unit_name) - 1;
+            memcpy(c->unit_name, p + off + 3, vl);
+            c->unit_name[vl] = '\0';
+            LOGI("gsup", "conn=%d IPA unit name: %s", conn_id, c->unit_name);
+        }
+        off += 2 + l;
+    }
+}
+
 static void handle_ipa_frame(int conn_id, const uint8_t *frame, size_t flen)
 {
     if (flen < 4) return;
     uint8_t proto = frame[2];
     if (proto == GSUP_IPA_PROTO_CCM) {
-        if (flen >= 4 && frame[3] == 0x00) { /* PING */
+        if (frame[3] == 0x00) { /* PING */
             uint8_t pong[] = { 0x00, 0x01, GSUP_IPA_PROTO_CCM, CCM_PONG };
             gsup_conn_t *c = &g_srv.conn[conn_id];
             if (c->fd >= 0)
                 (void)send(c->fd, pong, sizeof(pong), MSG_NOSIGNAL);
+        } else if (frame[3] == CCM_ID_RESP && flen > 4) {
+            ccm_parse_id_resp(conn_id, frame + 4, flen - 4);
         }
         return;
     }
@@ -185,6 +214,14 @@ static void accept_on_listen(int li)
              cid, cfd, nc->peer_ip, (unsigned)nc->peer_port,
              g_srv.listen_ip[li],
              (unsigned)(g_srv.rt ? g_srv.rt->cfg.gsup_listen_port : 0));
+        /* Ask the peer to identify (osmo GSUP clients answer with an
+         * ID RESP carrying their unit name, e.g. "MSC-..."/"SGSN-...").
+         * ID GET payload: msg type + one [len][tag] request per tag. */
+        static const uint8_t id_get[] = {
+            0x00, 0x03, GSUP_IPA_PROTO_CCM, CCM_ID_GET,
+            0x01, IPA_IDTAG_UNITNAME
+        };
+        (void)send(cfd, id_get, sizeof(id_get), MSG_NOSIGNAL);
     }
 }
 
@@ -231,6 +268,20 @@ bool gsup_server_conn_valid(int conn_id)
         return false;
     gsup_conn_t *c = &g_srv.conn[conn_id];
     return c->in_use && c->fd >= 0;
+}
+
+int gsup_server_find_conn_by_unit_prefix(const char *prefix)
+{
+    if (!prefix || !prefix[0])
+        return -1;
+    size_t n = strlen(prefix);
+    for (int i = 0; i < GSUP_MAX_CONN; i++) {
+        gsup_conn_t *c = &g_srv.conn[i];
+        if (c->in_use && c->fd >= 0 &&
+            strncasecmp(c->unit_name, prefix, n) == 0)
+            return i;
+    }
+    return -1;
 }
 
 const char *gsup_server_conn_peer(int conn_id)

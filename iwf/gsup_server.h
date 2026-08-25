@@ -31,5 +31,8 @@ int  gsup_server_send(int conn_id, const uint8_t *gsup, size_t len);
 const char *gsup_server_conn_bind_ip(int conn_id);
 const char *gsup_server_conn_peer(int conn_id);
 bool gsup_server_conn_valid(int conn_id);
+/* First live conn whose IPA unit name starts with prefix ("MSC"/"SGSN"),
+ * or -1. Identifies the peer role right after connect (ID RESP). */
+int  gsup_server_find_conn_by_unit_prefix(const char *prefix);
 
 #endif /* IWF_GSUP_SERVER_H */
