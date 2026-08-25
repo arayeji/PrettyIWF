@@ -755,6 +755,8 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
     /* MO-SMS submission from the MSC (sms-over-gsup): relay to the SMSC
      * addressed in SM-RP-DA; no IMSI route needed. */
     if (req.msg_type == GSUP_MSG_MO_FSM_REQ) {
+        /* MO-FSM only comes from the MSC: learn the CS conn for MT/NI use. */
+        gsup_track_conn(req.imsi, conn_id, GSUP_CN_DOMAIN_CS);
         sms_iwf_on_gsup_mo_req(conn_id, &req);
         return;
     }
@@ -764,6 +766,7 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
     if (req.msg_type == GSUP_MSG_PROC_SS_REQ ||
         req.msg_type == GSUP_MSG_PROC_SS_RES ||
         req.msg_type == GSUP_MSG_PROC_SS_ERR) {
+        gsup_track_conn(req.imsi, conn_id, GSUP_CN_DOMAIN_CS);
         ussd_iwf_on_gsup_ss(rt, conn_id, &req);
         return;
     }
@@ -859,6 +862,7 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
     /* MT-SMS delivery outcome from the MSC (sms-over-gsup). */
     if (req.msg_type == GSUP_MSG_MT_FSM_RES ||
         req.msg_type == GSUP_MSG_MT_FSM_ERR) {
+        gsup_track_conn(req.imsi, conn_id, GSUP_CN_DOMAIN_CS);
         sms_iwf_on_gsup_mt_resp(&req);
         return;
     }
