@@ -173,6 +173,9 @@ typedef struct {
         uint8_t hlr_ssn;            /* default 6 (HLR) or 149 per partner */
         char    src_ip[64];         /* optional SCTP/source hint for this route */
         char    src_gt[24];         /* optional SCCP CallingParty GT override */
+        /* E.214 MGT routing: when set, first UL/SAI/UGL CdPA = this prefix +
+         * IMSI MSIN (NP=E.214) instead of hlr_gt (NP=E.164). E.g. 99001. */
+        char    e214_prefix[24];
         int     is_local;           /* 1 = home PLMN → local Diameter dest      */
         int     use_diameter;       /* 1 = S6d via DRA (not MAP) for this MNC   */
         char    dest_realm[128];    /* partner HSS realm (DRA routing)          */

@@ -22,3 +22,6 @@ iwf/FileContentIndex/
 /scripts/local/
 *.local.sh
 *.helper.sh
+/tools/_*.py
+/tools/*.patch
+/tools/pcap_*.py

@@ -49,7 +49,12 @@
 #define GSUP_RESYNC_RAND_LEN    16
 #define GSUP_RESYNC_AUTS_LEN    14
 
-#define GSUP_CAUSE_IMSI_UNKNOWN 0x02
+/* GSUP cause = GSM 04.08 GMM cause. IMSI-unknown is a *permanent* reject
+ * (UE marks the SIM invalid); use NET_FAIL for transient failures. */
+#define GSUP_CAUSE_IMSI_UNKNOWN    0x02
+#define GSUP_CAUSE_PLMN_NOTALLOWED 0x0b
+#define GSUP_CAUSE_ROAM_NOTALLOWED 0x0d
+#define GSUP_CAUSE_NET_FAIL        0x11
 
 #define GSUP_AUTH_UMTS          0x01
 #define GSUP_AUTH_GSM           0x02

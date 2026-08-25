@@ -79,6 +79,8 @@ static void fill_route_meta(gsup_route_t *out, const iwf_config_t *cfg, int idx)
         strncpy(out->src_gt, r->src_gt, sizeof(out->src_gt) - 1);
     else if (cfg->map_local_gt[0])
         strncpy(out->src_gt, cfg->map_local_gt, sizeof(out->src_gt) - 1);
+    if (r->e214_prefix[0])
+        strncpy(out->e214_prefix, r->e214_prefix, sizeof(out->e214_prefix) - 1);
     fill_diam_dest(out, cfg, idx);
 }
 
@@ -113,6 +115,7 @@ int gsup_router_lookup(const iwf_config_t *cfg,
 
     /* Check if the 2-digit key matches local or a roaming route.
      * If not, try the 3-digit interpretation. */
+    out->mnc_digits = 2;
     bool matched_2digit = (!strcmp(mnc_key, cfg->gsup_local_mnc) ||
                            find_roam_route(cfg, mnc_key) >= 0);
     if (!matched_2digit) {
@@ -123,6 +126,7 @@ int gsup_router_lookup(const iwf_config_t *cfg,
             if (!strcmp(mnc_key3, cfg->gsup_local_mnc) ||
                 find_roam_route(cfg, mnc_key3) >= 0) {
                 out->mnc = mnc3;
+                out->mnc_digits = 3;
                 mnc_to_key(mnc3, mnc_key);
             }
         }
@@ -143,7 +147,8 @@ int gsup_router_lookup(const iwf_config_t *cfg,
         out->kind = GSUP_ROUTE_LOCAL;
     } else if (roam_route_is_diameter(cfg, idx)) {
         out->kind = GSUP_ROUTE_DIAM_HSS;
-    } else if (cfg->gsup_roam_routes[idx].hlr_gt[0]) {
+    } else if (cfg->gsup_roam_routes[idx].hlr_gt[0] ||
+               cfg->gsup_roam_routes[idx].e214_prefix[0]) {
         out->kind = GSUP_ROUTE_MAP_HLR;
     } else {
         out->kind = GSUP_ROUTE_REJECT;

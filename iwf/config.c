@@ -356,6 +356,9 @@ static void gsup_roam_key(iwf_config_t *out, const char *key, const char *val)
     else if (!strcmp(p, "src_gt"))
         copy_str(out->gsup_roam_routes[idx].src_gt,
                  sizeof(out->gsup_roam_routes[idx].src_gt), val);
+    else if (!strcmp(p, "e214_prefix"))
+        copy_str(out->gsup_roam_routes[idx].e214_prefix,
+                 sizeof(out->gsup_roam_routes[idx].e214_prefix), val);
     else if (!strcmp(p, "dest_realm"))
         copy_str(out->gsup_roam_routes[idx].dest_realm,
                  sizeof(out->gsup_roam_routes[idx].dest_realm), val);

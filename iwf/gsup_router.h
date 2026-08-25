@@ -22,10 +22,12 @@ typedef struct {
     char              imsi[16];
     uint16_t          mcc;
     uint16_t          mnc;
+    int               mnc_digits;  /* IMSI MNC digit count (2 or 3) */
     char              hlr_gt[24];
     uint8_t           hlr_ssn;
     char              src_ip[64];
     char              src_gt[24];
+    char              e214_prefix[24]; /* E.214 MGT prefix (CdPA = prefix+MSIN) */
     char              dest_realm[128];  /* DRA Destination-Realm (roam S6d) */
     char              dest_host[128];   /* optional Destination-Host          */
     int               route_idx;   /* index into cfg->gsup_roam_routes, or -1 */

@@ -239,6 +239,15 @@ static void osmo_addr_to_ss7(const struct osmo_sccp_addr *in, ss7_sccp_addr_t *o
 static void ss7_put_gt_in_osmo_addr(const ss7_sccp_addr_t *in, struct osmo_sccp_addr *out)
 {
     out->presence |= OSMO_SCCP_ADDR_T_GT;
+    if (in->gt_np_e214) {
+        out->gt.gti = OSMO_SCCP_GTI_TT_NPL_ENC_NAI;
+        out->gt.tt  = 0;
+        out->gt.npi = 7; /* E.214 ISDN/mobile numbering plan */
+        out->gt.nai = OSMO_SCCP_NAI_INTL;
+        strncpy(out->gt.digits, in->gt_digits, sizeof(out->gt.digits) - 1);
+        out->gt.digits[sizeof(out->gt.digits) - 1] = '\0';
+        return;
+    }
     out->gt.gti = OSMO_SCCP_GTI_TT_NPL_ENC_NAI;
     out->gt.tt  = 0;
     out->gt.npi = OSMO_SCCP_NPI_E164_ISDN;

@@ -267,9 +267,10 @@ static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
          map_op_str(op));
         return -1;
     }
-    if (!route->hlr_gt[0]) {
+    if (!route->hlr_gt[0] && !route->e214_prefix[0]) {
         LOGW("gsup",
-         "[%s] MAP %s: no hlr_gt (set [roaming_hlr] mncNNN_hlr_gt)",
+         "[%s] MAP %s: no hlr_gt/e214_prefix (set [roaming_hlr] mncNNN_hlr_gt "
+         "or mncNNN_e214_prefix)",
          route->imsi,
          map_op_str(op));
         return -1;
@@ -305,7 +306,21 @@ static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
     if (n < 0) return -1;
 
     ss7_sccp_addr_t called, calling;
-    ss7_gt_from_digits(route->hlr_gt, route->hlr_ssn, &called);
+    if (route->e214_prefix[0]) {
+        /* E.214 MGT: CdPA = prefix + MSIN (IMSI without MCC+MNC), NP=E.214.
+         * Partner GTT routes on the mobile global title; the fixed E.164
+         * HLR GT is only learned from the UL response (TS 29.002 / Q.714). */
+        char mgt[40];
+        size_t skip = 3 + (route->mnc_digits == 3 ? 3u : 2u);
+        size_t il = strlen(route->imsi);
+        snprintf(mgt, sizeof(mgt), "%s%s",
+                 route->e214_prefix,
+                 il > skip ? route->imsi + skip : "");
+        ss7_gt_from_digits(mgt, route->hlr_ssn, &called);
+        called.gt_np_e214 = true;
+    } else {
+        ss7_gt_from_digits(route->hlr_gt, route->hlr_ssn, &called);
+    }
     memset(&calling, 0, sizeof(calling));
     /* MAP-C networkLocUp is VLR↔HLR; CS auth also from VLR. PS uses SGSN SSN. */
     uint8_t orig_ssn = (cn_domain == GSUP_CN_DOMAIN_CS)
@@ -328,12 +343,13 @@ static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
         return -1;
 
     LOGI("gsup",
-         "[%s] TX MAP %s cn=%s tid=0x%08x hlr_gt=%s src_gt=%s ssn=%u",
+         "[%s] TX MAP %s cn=%s tid=0x%08x cdpa=%s%s src_gt=%s ssn=%u",
          route->imsi,
          map_op_str(op),
          cn_domain == GSUP_CN_DOMAIN_CS ? "CS" : "PS",
          tid,
-         route->hlr_gt,
+         called.gt_digits,
+         called.gt_np_e214 ? " (E.214)" : "",
          route->src_gt[0] ? route->src_gt : g_rt->cfg.map_local_gt,
          (unsigned)orig_ssn);
     return 0;
@@ -619,9 +635,10 @@ static int handle_sai(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
         return 0;
     }
     uint8_t cn = (req && req->have_cn_domain) ? req->cn_domain : GSUP_CN_DOMAIN_PS;
-    int want_map = (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && route->hlr_gt[0]);
+    int have_map_dest = route->hlr_gt[0] || route->e214_prefix[0];
+    int want_map = (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && have_map_dest);
     if (!want_map) {
-        if (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && !route->hlr_gt[0])
+        if (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && !have_map_dest)
             LOGI("gsup",
          "[%s] SAI cn=%s: no hlr_gt, falling back to Diameter",
          route->imsi,
@@ -655,10 +672,11 @@ static int handle_ul(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
         return 0;
     }
     uint8_t cn = (req && req->have_cn_domain) ? req->cn_domain : GSUP_CN_DOMAIN_PS;
-    int want_map = (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && route->hlr_gt[0]);
+    int have_map_dest = route->hlr_gt[0] || route->e214_prefix[0];
+    int want_map = (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && have_map_dest);
 
     if (!want_map) {
-        if (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && !route->hlr_gt[0])
+        if (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && !have_map_dest)
             LOGI("gsup",
          "[%s] UL cn=%s: no hlr_gt, falling back to Diameter",
          route->imsi,
@@ -1146,10 +1164,25 @@ bool gsup_map_proxy_on_tcap(iwf_runtime_t *rt,
     for (size_t i = 0; i < tmsg->n_components; i++) {
         const tcap_component_t *c = &tmsg->components[i];
         if (c->kind == TCAP_CMP_KIND_ERR) {
+            /* Map TS 29.002 user errors to GMM causes. Only unknownSubscriber
+             * is a permanent reject; systemFailure(34) etc. must stay
+             * transient or UEs mark the SIM invalid. */
+            uint8_t cause;
+            switch (c->error_code) {
+            case 1:  cause = GSUP_CAUSE_IMSI_UNKNOWN;    break;
+            case 8:  cause = GSUP_CAUSE_ROAM_NOTALLOWED; break;
+            default: cause = GSUP_CAUSE_NET_FAIL;        break;
+            }
+            LOGI("gsup",
+         "[%s] RX MAP returnError err=%d tid=0x%08x -> gsup cause=0x%02x",
+         p->imsi,
+         c->error_code,
+         p->tcap_tid,
+         cause);
             reply_gsup_err(p->conn_id, p->imsi,
                            p->map_op == MAP_OP_SAI ? GSUP_MSG_SAI_REQ
                                                    : GSUP_MSG_UL_REQ,
-                           GSUP_CAUSE_IMSI_UNKNOWN);
+                           cause);
             pending_remove(p);
             return true;
         }
@@ -1209,10 +1242,12 @@ void gsup_map_proxy_sweep(iwf_runtime_t *rt, time_t now)
          "[%s] pending timeout tid=0x%08x",
          p->imsi,
          p->tcap_tid);
+            /* Timeout is transient (congested partner HLR): NET_FAIL, not
+             * IMSI-unknown, so the UE retries instead of invalidating SIM. */
             reply_gsup_err(p->conn_id, p->imsi,
                            p->map_op == MAP_OP_SAI ? GSUP_MSG_SAI_REQ
                                                    : GSUP_MSG_UL_REQ,
-                           GSUP_CAUSE_IMSI_UNKNOWN);
+                           GSUP_CAUSE_NET_FAIL);
             pending_remove(p);
         }
     }

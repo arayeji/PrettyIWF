@@ -52,6 +52,10 @@ typedef struct {
     /* Optional Global Title: ASCII E.164 digits for osmo_sccp_gt.digits[]. */
     char     gt_digits[32];
     bool     have_gt;
+    /* GT numbering plan: false = E.164/ISDN (default), true = E.214 mobile
+     * (MGT derived from IMSI; used to GTT-route first UL/SAI to a roaming
+     * partner HLR that has no fixed E.164 HLR GT translation for us). */
+    bool     gt_np_e214;
 } ss7_sccp_addr_t;
 
 /* Module bring-up. Reads [stp] config from rt->cfg, opens the SCTP
