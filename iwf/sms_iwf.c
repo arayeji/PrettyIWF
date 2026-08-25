@@ -28,11 +28,13 @@
 #define SMS_DIR_INBOUND         1
 #define SMS_DIR_OUTBOUND        2
 #define SMS_DIR_MT_IN           3   /* partner SMSC -> our roamer via MSC */
+#define SMS_DIR_MO_OUT          4   /* our subscriber -> home SMSC        */
 
 #define SMS_STATE_WAIT_GSUP     1
 #define SMS_STATE_WAIT_SRI_SM   2
 #define SMS_STATE_WAIT_FWDSM    3
 #define SMS_STATE_WAIT_GSUP_MT  4
+#define SMS_STATE_WAIT_MO_FSM   5
 
 #define SMS_OTID_OUTBOUND_BIT   0x80000000u
 
@@ -63,6 +65,8 @@ typedef struct sms_session {
     uint8_t             sm_rp_mr;       /* GSUP correlation                  */
     uint8_t             aare_oid[16];   /* AC OID from AARQ, echoed in AARE  */
     uint8_t             aare_oid_len;
+    /* MO-out (subscriber -> home SMSC) */
+    int                 gsup_conn;      /* MSC conn awaiting the MO result   */
 } sms_session_t;
 
 static struct iwf_runtime *g_rt;
@@ -441,16 +445,17 @@ static void handle_inbound_begin(const ss7_sccp_addr_t *calling,
 
 static int sms_send_map_begin(uint32_t otid, int opcode,
                               const uint8_t *params, size_t plen,
+                              const uint8_t *dlg, size_t dlen,
                               const ss7_sccp_addr_t *called,
                               const ss7_sccp_addr_t *calling)
 {
-    uint8_t cmp[256];
+    uint8_t cmp[512];
     size_t co = 0;
     if (tcap_enc_invoke(cmp, sizeof(cmp), &co, 1, opcode, params, plen) < 0)
         return -1;
-    uint8_t out[512];
+    uint8_t out[768];
     int n = tcap_encode_message(TCAP_MSG_BEGIN, otid, true,
-                                0, false, NULL, 0, cmp, co, out, sizeof(out));
+                                0, false, dlg, dlen, cmp, co, out, sizeof(out));
     if (n < 0) return -1;
     return ss7_link_send_tcap_ex(g_rt, called, calling, out, (size_t)n);
 }
@@ -469,7 +474,7 @@ static void start_outbound_sri_sm(sms_session_t *s)
     s->state = SMS_STATE_WAIT_SRI_SM;
     sms_arm_timer(s, g_rt->cfg.sms_sri_sm_timeout_ms);
     if (sms_send_map_begin(s->otid, MAP_OP_CODE_SEND_ROUTING_INFO_SM,
-                           arg, (size_t)alen, &called, &calling) < 0)
+                           arg, (size_t)alen, NULL, 0, &called, &calling) < 0)
         sms_fail_outbound(s);
 }
 
@@ -498,7 +503,7 @@ static void start_outbound_fwdsm(sms_session_t *s)
     s->state = SMS_STATE_WAIT_FWDSM;
     sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
     if (sms_send_map_begin(fwd_otid, MAP_OP_CODE_MT_FORWARD_SM,
-                           arg, (size_t)alen, &called, &calling) < 0) {
+                           arg, (size_t)alen, NULL, 0, &called, &calling) < 0) {
         sms_fail_outbound(s);
         return;
     }
@@ -593,6 +598,150 @@ static void handle_outbound_tcap(const tcap_msg_t *tmsg)
     }
 }
 
+/* ----- Outbound MO-SMS relay (our subscriber -> home SMSC) ------------- */
+
+/* GSUP SM-RP-DA/OA value: [id-type][address]. The address (GSM 04.11) may
+ * carry a leading length byte, then TON/NPI, then TBCD digits. */
+static int gsup_sm_addr_digits(const uint8_t *v, size_t l,
+                               uint8_t *type_out, char *digits, size_t cap)
+{
+    if (!v || l < 2 || !digits || !cap) return -1;
+    digits[0] = '\0';
+    if (type_out) *type_out = v[0];
+    size_t i = 1;
+    if (i + 1 < l && v[i] == l - i - 1)
+        i++;                            /* 04.11 length byte */
+    if (i < l && (v[i] & 0x80))
+        i++;                            /* TON/NPI octet */
+    if (i >= l) return -1;
+    map_bcd_to_str(v + i, l - i, digits, cap);
+    return digits[0] ? 0 : -1;
+}
+
+static void sms_mo_reply_err(int conn_id, const char *imsi, uint8_t mr,
+                             uint8_t rp_cause)
+{
+    uint8_t gsup[128];
+    int n = gsup_build_mo_fsm_err(imsi, mr, rp_cause, gsup, sizeof(gsup));
+    if (n > 0)
+        gsup_server_send(conn_id, gsup, (size_t)n);
+}
+
+void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
+{
+    if (!g_rt || !m) return;
+    uint8_t mr = m->have_sm_rp_mr ? m->sm_rp_mr : 0;
+
+    char smsc[20], oa[20];
+    uint8_t da_type = 0, oa_type = 0;
+    if (!m->sm_rp_da_len || !m->sm_rp_ui_len ||
+        gsup_sm_addr_digits(m->sm_rp_da, m->sm_rp_da_len,
+                            &da_type, smsc, sizeof(smsc)) < 0 ||
+        da_type != 0x03 /* SMSC address */) {
+        LOGW("sms", "[%s] MO-FSM: bad SM-RP-DA/UI (da_len=%u ui_len=%u)",
+             m->imsi, (unsigned)m->sm_rp_da_len, (unsigned)m->sm_rp_ui_len);
+        sms_mo_reply_err(conn_id, m->imsi, mr, 96 /* invalid mandatory info */);
+        return;
+    }
+    if (!m->sm_rp_oa_len ||
+        gsup_sm_addr_digits(m->sm_rp_oa, m->sm_rp_oa_len,
+                            &oa_type, oa, sizeof(oa)) < 0) {
+        LOGW("sms", "[%s] MO-FSM: missing SM-RP-OA MSISDN", m->imsi);
+        sms_mo_reply_err(conn_id, m->imsi, mr, 96);
+        return;
+    }
+
+    uint8_t arg[400];
+    int an = map_encode_mo_fwd_sm_arg(smsc, oa, m->sm_rp_ui, m->sm_rp_ui_len,
+                                      arg, sizeof(arg));
+    if (an < 0) {
+        sms_mo_reply_err(conn_id, m->imsi, mr, 41 /* temporary failure */);
+        return;
+    }
+    uint8_t dlg[128];
+    int dn = map_encode_aarq(MAP_AC_SHORT_MSG_MO_RELAY_V2, dlg, sizeof(dlg));
+    if (dn < 0) {
+        sms_mo_reply_err(conn_id, m->imsi, mr, 41);
+        return;
+    }
+
+    sms_session_t *s = calloc(1, sizeof(*s));
+    if (!s) {
+        sms_mo_reply_err(conn_id, m->imsi, mr, 41);
+        return;
+    }
+    s->otid = sms_new_out_otid();
+    s->direction = SMS_DIR_MO_OUT;
+    s->state = SMS_STATE_WAIT_MO_FSM;
+    s->timer_fd = -1;
+    s->gsup_conn = conn_id;
+    s->sm_rp_mr = mr;
+    strncpy(s->imsi, m->imsi, sizeof(s->imsi) - 1);
+
+    /* CdPA = SMSC GT from SM-RP-DA (route on GT); CgPA = our MSC GT. */
+    ss7_sccp_addr_t called, calling;
+    ss7_gt_from_digits(smsc, SS7_SSN_MSC, &called);
+    memset(&calling, 0, sizeof(calling));
+    if (g_rt->cfg.map_local_gt[0])
+        ss7_gt_from_digits(g_rt->cfg.map_local_gt, SS7_SSN_MSC, &calling);
+    calling.ssn = SS7_SSN_MSC;
+
+    if (sms_send_map_begin(s->otid, MAP_OP_CODE_MT_FORWARD_SM /* forwardSM */,
+                           arg, (size_t)an, dlg, (size_t)dn,
+                           &called, calling.have_gt ? &calling : NULL) < 0) {
+        free(s);
+        sms_mo_reply_err(conn_id, m->imsi, mr, 41);
+        return;
+    }
+    HASH_ADD(hh, g_sessions, otid, sizeof(s->otid), s);
+    sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
+    LOGI("sms",
+         "[%s] RX GSUP MO-FSM mr=%u smsc=%s oa=%s ui_len=%u -> MAP fwdSM otid=0x%08x",
+         m->imsi, (unsigned)mr, smsc, oa, (unsigned)m->sm_rp_ui_len, s->otid);
+}
+
+bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
+{
+    (void)rt;
+    if (!g_rt || !tmsg->have_dtid) return false;
+    sms_session_t *s = sms_sess_find(tmsg->dtid);
+    if (!s || s->direction != SMS_DIR_MO_OUT) return false;
+
+    uint8_t gsup[128];
+    int n = -1;
+    bool done = false;
+    for (size_t i = 0; i < tmsg->n_components && !done; i++) {
+        const tcap_component_t *c = &tmsg->components[i];
+        if (c->kind == TCAP_CMP_KIND_RES) {
+            LOGI("sms", "[%s] MO-FSM accepted by SMSC mr=%u",
+                 s->imsi, (unsigned)s->sm_rp_mr);
+            n = gsup_build_mo_fsm_res(s->imsi, s->sm_rp_mr,
+                                      gsup, sizeof(gsup));
+            done = true;
+        } else if (c->kind == TCAP_CMP_KIND_ERR) {
+            LOGI("sms", "[%s] MO-FSM rejected by SMSC map_err=%d mr=%u",
+                 s->imsi, c->error_code, (unsigned)s->sm_rp_mr);
+            n = gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr,
+                                      41 /* temporary failure */,
+                                      gsup, sizeof(gsup));
+            done = true;
+        }
+    }
+    /* END without any component: dialogue closed without result. */
+    if (!done && tmsg->type == TCAP_MSG_END) {
+        LOGW("sms", "[%s] MO-FSM: END without result", s->imsi);
+        n = gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr, 41,
+                                  gsup, sizeof(gsup));
+        done = true;
+    }
+    if (done) {
+        if (n > 0)
+            gsup_server_send(s->gsup_conn, gsup, (size_t)n);
+        sms_sess_remove(s);
+    }
+    return true;
+}
+
 static void on_hlr_sccp(struct iwf_runtime *rt,
                         const ss7_sccp_addr_t *calling,
                         const uint8_t *tcap, size_t len)
@@ -646,6 +795,11 @@ void sms_iwf_on_timer(void)
         } else if (s->direction == SMS_DIR_MT_IN) {
             /* MSC didn't answer (paging?): transient -> SMSC will retry. */
             sms_mt_send_end(s, 1, MAP_ERR_SYSTEM_FAILURE, NULL, 0);
+            sms_sess_remove(s);
+        } else if (s->direction == SMS_DIR_MO_OUT) {
+            /* Home SMSC didn't answer: UE gets RP-ERROR and retries. */
+            sms_mo_reply_err(s->gsup_conn, s->imsi, s->sm_rp_mr,
+                             41 /* temporary failure */);
             sms_sess_remove(s);
         } else {
             sms_fail_outbound(s);

@@ -738,6 +738,15 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
     }
     iwf_imsi_trace_packet(req.imsi, "gsup", "rx", gsup, len);
 
+#ifdef SMS_IWF_ENABLED
+    /* MO-SMS submission from the MSC (sms-over-gsup): relay to the SMSC
+     * addressed in SM-RP-DA; no IMSI route needed. */
+    if (req.msg_type == GSUP_MSG_MO_FSM_REQ) {
+        sms_iwf_on_gsup_mo_req(conn_id, &req);
+        return;
+    }
+#endif
+
     gsup_route_t route;
     if (gsup_router_lookup(&rt->cfg, req.imsi, &route) < 0) {
         reply_gsup_err(conn_id, req.imsi, req.msg_type, GSUP_CAUSE_IMSI_UNKNOWN);

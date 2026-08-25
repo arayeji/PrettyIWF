@@ -47,6 +47,7 @@
 #define MAP_OP_CODE_SEND_ROUTING_INFO_SM    45
 #define MAP_OP_CODE_MT_FORWARD_SM           46  /* forwardSM (v1/v2) / mo-forwardSM (v3) */
 #define MAP_OP_CODE_MT_FORWARD_SM_V3        44  /* mt-forwardSM (MAP v3) */
+#define MAP_OP_CODE_PROVIDE_SUBSCRIBER_INFO 70
 
 /* MAP error codes we may receive/send (TS 29.002 §17.6). */
 #define MAP_ERR_UNKNOWN_SUBSCRIBER          1
@@ -160,6 +161,17 @@ int map_decode_mt_fsm_arg(const uint8_t *p, size_t n,
                           uint8_t *sc_addr, size_t sc_cap, size_t *sc_len,
                           const uint8_t **ui, size_t *ui_len,
                           int *more);
+/* MO submission relay: [MO-]ForwardSM-Arg with sm-RP-DA =
+ * serviceCentreAddressDA, sm-RP-OA = msisdn, sm-RP-UI = SMS-SUBMIT TPDU. */
+int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
+                             const uint8_t *tpdu, size_t tpdu_len,
+                             uint8_t *out, size_t out_cap);
+
+/* provideSubscriberInfo (HLR/gsmSCF -> our VLR). */
+int map_decode_psi_arg(const uint8_t *p, size_t n,
+                       char *imsi_out, size_t imsi_cap);
+int map_encode_psi_res(int reachable, uint8_t not_reach_reason,
+                       uint8_t *out, size_t out_cap);
 
 /* ----- encoders (for the IWF -> SGSN direction) ------------------- */
 
@@ -258,6 +270,7 @@ typedef enum {
     MAP_AC_MS_PURGING_V3            = 5, /* purgeMS                        */
     MAP_AC_NETWORK_LOC_UP_V3        = 6, /* updateLocation (MAP-C)         */
     MAP_AC_ROAMING_NUMBER_ENQUIRY_V3 = 7, /* provideRoamingNumber           */
+    MAP_AC_SHORT_MSG_MO_RELAY_V2    = 8, /* forwardSM (MO submit, v2)      */
 } map_app_ctx_t;
 
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap);

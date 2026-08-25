@@ -1120,6 +1120,8 @@ static const uint8_t AC_GPRS_LOC_UPDATE_V3[]     = { 0x04,0x00,0x00,0x01,0x00,0x
 static const uint8_t AC_SUBSCRIBER_DATA_MGMT_V3[]= { 0x04,0x00,0x00,0x01,0x00,0x10,0x03 };
 static const uint8_t AC_GPRS_LOC_CANCEL_V3[]     = { 0x04,0x00,0x00,0x01,0x00,0x07,0x03 };
 static const uint8_t AC_MS_PURGING_V3[]          = { 0x04,0x00,0x00,0x01,0x00,0x1b,0x03 };
+/* shortMsgMO-RelayContext-v2: 0.4.0.0.1.0.21.2 */
+static const uint8_t AC_SHORT_MSG_MO_RELAY_V2[]  = { 0x04,0x00,0x00,0x01,0x00,0x15,0x02 };
 
 static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
 {
@@ -1138,6 +1140,8 @@ static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
         *out = AC_GPRS_LOC_CANCEL_V3;      *out_len = sizeof(AC_GPRS_LOC_CANCEL_V3);      break;
     case MAP_AC_MS_PURGING_V3:
         *out = AC_MS_PURGING_V3;           *out_len = sizeof(AC_MS_PURGING_V3);           break;
+    case MAP_AC_SHORT_MSG_MO_RELAY_V2:
+        *out = AC_SHORT_MSG_MO_RELAY_V2;   *out_len = sizeof(AC_SHORT_MSG_MO_RELAY_V2);   break;
     default: return -1;
     }
     return 0;
@@ -1405,6 +1409,96 @@ int map_encode_mt_fwd_sm_arg(const char *imsi_digits, const char *smsc_gt_digits
     if (ber_enc_tlv(out, out_cap, &off, 0x02, da_inner, dio) < 0) return -1;
     if (ber_enc_tlv(out, out_cap, &off, 0x04, oa_inner, oio) < 0) return -1;
     if (ber_enc_tlv(out, out_cap, &off, 0x03, tpdu, tpdu_len) < 0) return -1;
+    return (int)off;
+}
+
+/* AddressString: 0x91 (international, E.164) + TBCD digits. */
+static int enc_addr_string_91(const char *digits, uint8_t *out, size_t cap)
+{
+    if (!digits || !digits[0] || cap < 2) return -1;
+    out[0] = 0x91;
+    int bl = map_str_to_bcd(digits, out + 1, cap - 1);
+    if (bl < 0) return -1;
+    return 1 + bl;
+}
+
+int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
+                             const uint8_t *tpdu, size_t tpdu_len,
+                             uint8_t *out, size_t out_cap)
+{
+    /* ForwardSM-Arg ::= SEQUENCE {
+     *   sm-RP-DA serviceCentreAddressDA [4] IMPLICIT AddressString,
+     *   sm-RP-OA msisdn [2] IMPLICIT ISDN-AddressString,
+     *   sm-RP-UI OCTET STRING }                                          */
+    if (!tpdu || !tpdu_len) return -1;
+    uint8_t da[16], oa[16];
+    int dl = enc_addr_string_91(smsc_digits, da, sizeof(da));
+    int ol = enc_addr_string_91(oa_msisdn, oa, sizeof(oa));
+    if (dl < 0 || ol < 0) return -1;
+
+    uint8_t body[320];
+    size_t bo = 0;
+    if (ber_enc_tlv(body, sizeof(body), &bo, 0x84, da, (size_t)dl) < 0)
+        return -1;
+    if (ber_enc_tlv(body, sizeof(body), &bo, 0x82, oa, (size_t)ol) < 0)
+        return -1;
+    if (ber_enc_tlv(body, sizeof(body), &bo, 0x04, tpdu, tpdu_len) < 0)
+        return -1;
+
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x30, body, bo) < 0) return -1;
+    return (int)off;
+}
+
+int map_decode_psi_arg(const uint8_t *p, size_t n,
+                       char *imsi_out, size_t imsi_cap)
+{
+    /* ProvideSubscriberInfoArg ::= SEQUENCE { imsi [0], lmsi [1] OPT,
+     *   requestedInfo [2], ... }                                         */
+    if (!p || !imsi_out || !imsi_cap) return -1;
+    imsi_out[0] = '\0';
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && (p[0] == 0x30 || (p[0] & 0x20)))
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    const uint8_t *v;
+    size_t l;
+    if (find_tlv(body, blen, 0x80, &v, &l) < 0) return -1;
+    map_bcd_to_str(v, l, imsi_out, imsi_cap);
+    return imsi_out[0] ? 0 : -1;
+}
+
+int map_encode_psi_res(int reachable, uint8_t not_reach_reason,
+                       uint8_t *out, size_t out_cap)
+{
+    /* ProvideSubscriberInfoRes ::= SEQUENCE { subscriberInfo SubscriberInfo }
+     * SubscriberInfo ::= SEQUENCE { subscriberState [1] SubscriberState OPT }
+     * SubscriberState ::= CHOICE { assumedIdle [0] NULL,
+     *   netDetNotReachable NotReachableReason (untagged ENUMERATED), ... } */
+    uint8_t state[8];
+    size_t so = 0;
+    if (reachable) {
+        if (ber_enc_tlv(state, sizeof(state), &so, 0x80 /* assumedIdle */,
+                        NULL, 0) < 0)
+            return -1;
+    } else {
+        if (ber_enc_tlv(state, sizeof(state), &so, 0x0A /* ENUMERATED */,
+                        &not_reach_reason, 1) < 0)
+            return -1;
+    }
+    uint8_t sub[16];
+    size_t su = 0;
+    if (ber_enc_tlv(sub, sizeof(sub), &su, 0xA1 /* [1] subscriberState */,
+                    state, so) < 0)
+        return -1;
+    uint8_t info[24];
+    size_t io = 0;
+    if (ber_enc_tlv(info, sizeof(info), &io, 0x30 /* SubscriberInfo */,
+                    sub, su) < 0)
+        return -1;
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x30 /* PSI-Res */, info, io) < 0)
+        return -1;
     return (int)off;
 }
 

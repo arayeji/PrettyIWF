@@ -92,6 +92,13 @@ typedef struct {
     bool     have_sm_rp_mr;
     uint8_t  sm_rp_cause;
     bool     have_sm_rp_cause;
+    /* Raw SM-RP-DA/OA as carried in GSUP: [id-type][address bytes]. */
+    uint8_t  sm_rp_da[24];
+    uint8_t  sm_rp_da_len;
+    uint8_t  sm_rp_oa[24];
+    uint8_t  sm_rp_oa_len;
+    uint8_t  sm_rp_ui[256];
+    uint16_t sm_rp_ui_len;
 } gsup_parsed_t;
 
 #define gsup_parsed_have_resync(p) \
@@ -125,6 +132,11 @@ int  gsup_build_mt_fsm_req(const char *imsi, uint8_t sm_rp_mr,
                            const uint8_t *tpdu, size_t tpdu_len,
                            int more_to_send,
                            uint8_t *out, size_t cap);
+/* MO-ForwardSM outcome toward osmo-msc (relay result from home SMSC). */
+int  gsup_build_mo_fsm_res(const char *imsi, uint8_t sm_rp_mr,
+                           uint8_t *out, size_t cap);
+int  gsup_build_mo_fsm_err(const char *imsi, uint8_t sm_rp_mr,
+                           uint8_t rp_cause, uint8_t *out, size_t cap);
 
 int  gsup_ipa_wrap(const uint8_t *gsup, size_t gsup_len,
                    uint8_t *out, size_t cap);

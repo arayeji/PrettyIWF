@@ -532,6 +532,63 @@ static void handle_begin_prn(struct iwf_runtime *rt,
     iwf_imsi_trace_flush_rx(s->imsi_str);
 }
 
+/* ProvideSubscriberInfo (partner HLR/gsmSCF -> our VLR): answer with the
+ * subscriber state so their SMSC/CAMEL logic can proceed. Session-less:
+ * decode IMSI, reply TCAP END (AARE echoing their AC) immediately. */
+static void handle_begin_psi(struct iwf_runtime *rt,
+                             const ss7_sccp_addr_t *calling,
+                             const tcap_msg_t *tmsg,
+                             const tcap_component_t *c)
+{
+    char imsi[16] = "";
+    (void)map_decode_psi_arg(c->parameters, c->parameters_len,
+                             imsi, sizeof(imsi));
+    bool attached = false;
+#ifdef GSUP_PROXY_ENABLED
+    if (imsi[0])
+        attached = gsup_map_proxy_imsi_known(imsi, 0);
+#endif
+
+    uint8_t params[48];
+    int pn = map_encode_psi_res(attached ? 1 : 0,
+                                1 /* imsiDetached */, params, sizeof(params));
+    if (pn < 0) return;
+    uint8_t cmp[128];
+    size_t co = 0;
+    if (tcap_enc_return_result(cmp, sizeof(cmp), &co, c->invoke_id,
+                               MAP_OP_CODE_PROVIDE_SUBSCRIBER_INFO,
+                               params, (size_t)pn) < 0)
+        return;
+
+    uint8_t dlg[128];
+    int dn = 0;
+    uint8_t oid[16];
+    size_t ol = 0;
+    if (tmsg->dialogue && tmsg->dialogue_len &&
+        map_decode_aarq_ac_raw(tmsg->dialogue, tmsg->dialogue_len,
+                               oid, sizeof(oid), &ol) == 0)
+        dn = map_encode_aare_oid(oid, ol, dlg, sizeof(dlg));
+    if (dn < 0) dn = 0;
+
+    uint8_t out[512];
+    int n = tcap_encode_message(TCAP_MSG_END, 0, false,
+                                tmsg->otid, tmsg->have_otid,
+                                dn > 0 ? dlg : NULL, dn > 0 ? (size_t)dn : 0,
+                                cmp, co, out, sizeof(out));
+    if (n < 0) return;
+
+    ss7_sccp_addr_t src;
+    memset(&src, 0, sizeof(src));
+    if (rt->cfg.map_local_gt[0])
+        ss7_gt_from_digits(rt->cfg.map_local_gt, SS7_SSN_VLR, &src);
+    src.ssn = SS7_SSN_VLR;
+    ss7_link_send_tcap_ex(rt, calling, src.have_gt ? &src : NULL,
+                          out, (size_t)n);
+    LOGI("map", "[%s] PSI answered state=%s",
+         imsi[0] ? imsi : "?",
+         attached ? "assumedIdle" : "netDetNotReachable");
+}
+
 /* ----- Continue / End handlers (ISD ack from VLR/SGSN) ----------------- */
 
 static void finish_ul_with_result(struct iwf_runtime *rt, map_session_t *s)
@@ -670,6 +727,7 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
         case MAP_OP_CODE_PURGE_MS:              handle_begin_purge(rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_CANCEL_LOCATION:       handle_begin_cl   (rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_PROVIDE_ROAMING_NUMBER: handle_begin_prn (rt, calling, &tmsg, c); break;
+        case MAP_OP_CODE_PROVIDE_SUBSCRIBER_INFO: handle_begin_psi(rt, calling, &tmsg, c); break;
 #ifdef SMS_IWF_ENABLED
         case MAP_OP_CODE_MT_FORWARD_SM_V3:      /* mt-forwardSM (v3)      */
         case MAP_OP_CODE_MT_FORWARD_SM:         /* forwardSM (v1/v2)      */
@@ -689,6 +747,10 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
     }
 
     if (tmsg.type == TCAP_MSG_CONTINUE || tmsg.type == TCAP_MSG_END) {
+#ifdef SMS_IWF_ENABLED
+        if (sms_iwf_enabled(rt) && sms_iwf_on_mo_tcap(rt, &tmsg))
+            return;
+#endif
 #ifdef GSUP_PROXY_ENABLED
         if (gsup_map_proxy_on_tcap(rt, calling, &tmsg))
             return;
