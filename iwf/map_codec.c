@@ -616,14 +616,15 @@ int map_decode_ul_arg(const uint8_t *p, size_t n, map_ul_req_t *out)
 
 int map_decode_prn_arg(const uint8_t *p, size_t n, map_prn_req_t *out)
 {
-    /* ProvideRoamingNumberArg ::= SEQUENCE {
-     *   imsi                      [0] IMSI OPTIONAL,
-     *   msc-Number                    ISDN-AddressString,
-     *   msisdn                    [1] ISDN-AddressString OPTIONAL,
-     *   lmsi                      [2] LMSI OPTIONAL,
-     *   gsm-BearerCapability      [3] ExternalSignalInfo OPTIONAL,
-     *   networkSignalInfo         [4] ExternalSignalInfo OPTIONAL,
-     *   suppressionOfAnnouncement [5] NULL OPTIONAL,
+    /* ProvideRoamingNumberArg ::= SEQUENCE {          (TS 29.002)
+     *   imsi                      [0] IMSI,
+     *   msc-Number                [1] ISDN-AddressString,
+     *   msisdn                    [2] ISDN-AddressString OPTIONAL,
+     *   lmsi                      [4] LMSI OPTIONAL,
+     *   gsm-BearerCapability      [5] ExternalSignalInfo OPTIONAL,
+     *   networkSignalInfo         [6] ExternalSignalInfo OPTIONAL,
+     *   suppressionOfAnnouncement [7] NULL OPTIONAL,
+     *   gmsc-Address              [8] ISDN-AddressString OPTIONAL,
      *   ... } */
     if (!p || !out) return -1;
     memset(out, 0, sizeof(*out));
@@ -645,14 +646,14 @@ int map_decode_prn_arg(const uint8_t *p, size_t n, map_prn_req_t *out)
             memcpy(out->imsi_bcd, v, l);
             out->imsi_bcd_len = (uint8_t)l;
             map_bcd_to_str(v, l, out->imsi_str, sizeof(out->imsi_str));
-        } else if (tag == 0x04 && !out->msc_number[0]) {
-            /* Untagged msc-Number (ISDN-AddressString). */
+        } else if ((tag == 0x81 || tag == 0x04) && !out->msc_number[0]) {
+            /* [1] msc-Number (0x04 tolerated for non-standard encoders). */
             dec_isdn_addr_digits(v, l, out->msc_number, sizeof(out->msc_number));
-        } else if (tag == 0x81) {
+        } else if (tag == 0x82) {
             dec_isdn_addr_digits(v, l, out->msisdn, sizeof(out->msisdn));
-        } else if (tag == 0x85) {
+        } else if (tag == 0x87) {
             out->suppression_of_announcement = true;
-        } else if (tag == 0xA3 || tag == 0x83) {
+        } else if (tag == 0xA5 || tag == 0x85) {
             out->have_gsm_bearer_cap = true;
         }
         /* Ignore LMSI / networkSignalInfo / extensionContainer / etc. */

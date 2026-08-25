@@ -682,13 +682,19 @@ int ss7_link_init(struct iwf_runtime *rt)
 
 void ss7_link_on_readable(struct iwf_runtime *rt)
 {
-    /* libosmo-sigtran drives its own select loop; the main epoll-side
-     * trigger is the eventfd posted by the helper thread.  The real glue
-     * implementation lives in a deployment-specific patch (it has to fit
-     * the host's libosmocore version).  This entrypoint exists so main.c
-     * can wire it identically across builds. */
+    /* libosmo-sigtran drives its own select loop; we pump it from the main
+     * epoll loop.  A single osmo_select_main_ctx(1) pass services roughly
+     * one read per ready fd, i.e. ~one M3UA message per epoll wakeup.
+     * Under sustained inbound MAP load that starves the SCTP socket: the
+     * backlog delays BEAT-ACK processing until the ASP heartbeat expires
+     * and libosmo tears the link down, discarding the buffered messages.
+     * Drain until the osmo fd set reports idle (bounded for fairness to
+     * the GTP fast path). */
     (void)rt;
-    osmo_select_main_ctx(1);
+    for (int i = 0; i < 256; i++) {
+        if (osmo_select_main_ctx(1) <= 0)
+            break;
+    }
 }
 
 /* Encode a classic SCCP UDT (class 0) into msg.  Addresses must already have
