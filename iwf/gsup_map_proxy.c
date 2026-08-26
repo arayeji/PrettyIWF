@@ -1,6 +1,7 @@
 #include "gsup_map_proxy.h"
 #include "gsup_server.h"
 #include "gsup_router.h"
+#include "msisdn_db.h"
 #include "gsup_proto.h"
 #include "map_session.h"
 #include "map_codec.h"
@@ -189,9 +190,21 @@ int gsup_map_proxy_imsi_for_msisdn(const char *msisdn,
     if (!norm[0]) return -1;
     msisdn_imsi_t *m = NULL;
     HASH_FIND_STR(g_msisdn_map, norm, m);
-    if (!m) return -1;
-    snprintf(imsi_out, cap, "%s", m->imsi);
-    return 0;
+    if (m) {
+        snprintf(imsi_out, cap, "%s", m->imsi);
+        return 0;
+    }
+    /* Miss: read the HSS DB once for this MSISDN; a hit is cached in the
+     * map (and file) so the DB is never asked about it again. */
+    char imsi[16] = "";
+    if (msisdn_db_lookup(norm, imsi, sizeof(imsi)) == 0 && imsi[0]) {
+        LOGI("gsup", "[%s] msisdn_db: resolved msisdn=%s from HSS DB",
+             imsi, norm);
+        gsup_map_proxy_note_msisdn(imsi, norm);
+        snprintf(imsi_out, cap, "%s", imsi);
+        return 0;
+    }
+    return -1;
 }
 
 int gsup_map_proxy_cs_conn_for_imsi(const char *imsi)
@@ -1466,6 +1479,9 @@ void gsup_map_proxy_init(iwf_runtime_t *rt)
 {
     g_rt = rt;
     msisdn_map_load();
+    if (rt && rt->cfg.map_msisdn_db_uri[0])
+        (void)msisdn_db_init(rt->cfg.map_msisdn_db_uri,
+                             rt->cfg.map_msisdn_db_name);
     /* LOCAL auth/UL uses Diameter S6d unless cs_backend/ps_backend override. */
     if (rt && rt->cfg.gsup_cs_backend == GSUP_BACKEND_MAP) {
         /* HLR replies to VLR SSN on networkLocUp; bind so CONTINUE/END arrive. */
@@ -1496,5 +1512,6 @@ void gsup_map_proxy_shutdown(void)
         HASH_DEL(g_msisdn_map, m);
         free(m);
     }
+    msisdn_db_shutdown();
     g_rt = NULL;
 }

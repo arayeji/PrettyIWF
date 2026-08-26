@@ -478,6 +478,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
         } else if (!strcmp(section, "map_iwf")) {
             if      (!strcmp(key, "enabled"))        out->map_iwf_enabled  = (atoi(val) != 0);
             else if (!strcmp(key, "msisdn_map_file")) copy_str(out->map_msisdn_map_file, sizeof(out->map_msisdn_map_file), val);
+            else if (!strcmp(key, "msisdn_db_uri"))  copy_str(out->map_msisdn_db_uri, sizeof(out->map_msisdn_db_uri), val);
+            else if (!strcmp(key, "msisdn_db_name")) copy_str(out->map_msisdn_db_name, sizeof(out->map_msisdn_db_name), val);
             else if (!strcmp(key, "local_gt"))       copy_str(out->map_local_gt, sizeof(out->map_local_gt), val);
             else if (!strcmp(key, "local_pc"))       copy_str(out->map_local_pc, sizeof(out->map_local_pc), val);
             else if (!strcmp(key, "local_ssn"))      out->map_local_ssn    = (uint8_t)atoi(val);

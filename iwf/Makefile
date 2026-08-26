@@ -58,11 +58,23 @@ ifeq ($(MAP_IWF_ENABLED),1)
   PKG_OSMO_LIBS   := $(shell pkg-config --libs   libosmocore libosmo-sigtran libosmo-sccp 2>/dev/null)
   CFLAGS  += -DMAP_IWF_WITH_OSMO_SIGTRAN -DGSUP_PROXY_ENABLED $(PKG_OSMO_CFLAGS)
   LDLIBS  += $(PKG_OSMO_LIBS)
-  SRCS    += gsup_proto.c gsup_router.c gsup_server.c gsup_map_proxy.c ussd_iwf.c
-  HDRS    += gsup_proto.h gsup_router.h gsup_server.h gsup_map_proxy.h ussd_iwf.h
+  SRCS    += gsup_proto.c gsup_router.c gsup_server.c gsup_map_proxy.c ussd_iwf.c msisdn_db.c
+  HDRS    += gsup_proto.h gsup_router.h gsup_server.h gsup_map_proxy.h ussd_iwf.h msisdn_db.h
   ifeq ($(strip $(PKG_OSMO_LIBS)),)
     $(error MAP_IWF_ENABLED=1 but pkg-config cannot find libosmocore/libosmo-sigtran/libosmo-sccp. \
             Install: sudo apt install libosmocore-dev libosmo-sccp-dev libosmo-sigtran-dev)
+  endif
+endif
+
+# --- Optional MongoDB MSISDN->IMSI lookup (SRI fallback) --------------------
+# Auto-enabled when libmongoc-dev is installed; MONGO_ENABLED=0 to force off.
+MONGO_ENABLED ?= 1
+ifeq ($(MAP_IWF_ENABLED)$(MONGO_ENABLED),11)
+  PKG_MONGOC_CFLAGS := $(shell pkg-config --cflags libmongoc-1.0 2>/dev/null)
+  PKG_MONGOC_LIBS   := $(shell pkg-config --libs   libmongoc-1.0 2>/dev/null)
+  ifneq ($(strip $(PKG_MONGOC_LIBS)),)
+    CFLAGS += -DIWF_WITH_MONGOC $(PKG_MONGOC_CFLAGS)
+    LDLIBS += $(PKG_MONGOC_LIBS)
   endif
 endif
 
