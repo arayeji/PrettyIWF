@@ -362,17 +362,34 @@ void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
 void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *m)
 {
     if (!g_rt || !m) return;
-    sms_session_t *s, *tmp, *found = NULL;
+    sms_session_t *s, *tmp, *found = NULL, *by_imsi = NULL;
+
+    /* Prefer exact (IMSI, MR) match.  osmo-msc has been seen returning
+     * SM-RP-MR=0 on MT-FSM-RES/ERR even when we sent a non-zero MR, so fall
+     * back to a unique IMSI match when the echoed MR does not line up. */
     HASH_ITER(hh, g_sessions, s, tmp) {
         if (s->direction != SMS_DIR_MT_IN) continue;
-        if (m->have_sm_rp_mr && s->sm_rp_mr != m->sm_rp_mr) continue;
         if (m->have_imsi && s->imsi[0] && strcmp(s->imsi, m->imsi) != 0)
             continue;
-        found = s;
-        break;
+        if (!by_imsi)
+            by_imsi = s;
+        if (m->have_sm_rp_mr && s->sm_rp_mr == m->sm_rp_mr) {
+            found = s;
+            break;
+        }
+    }
+    if (!found && by_imsi &&
+        (!m->have_sm_rp_mr || m->sm_rp_mr == 0 ||
+         by_imsi->sm_rp_mr != m->sm_rp_mr)) {
+        if (m->have_sm_rp_mr && m->sm_rp_mr != by_imsi->sm_rp_mr)
+            LOGW("sms",
+                 "[%s] MT-FSM resp mr=%u != session mr=%u; matching by IMSI",
+                 by_imsi->imsi, (unsigned)m->sm_rp_mr,
+                 (unsigned)by_imsi->sm_rp_mr);
+        found = by_imsi;
     }
     if (!found) {
-        LOGD("sms", "MT-FSM resp without session (mr=%u imsi=%s)",
+        LOGW("sms", "MT-FSM resp without session (mr=%u imsi=%s)",
              (unsigned)m->sm_rp_mr, m->have_imsi ? m->imsi : "?");
         return;
     }
