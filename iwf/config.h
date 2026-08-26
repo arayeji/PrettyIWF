@@ -72,6 +72,9 @@ typedef struct {
 
     /* [map_iwf] */
     int         map_iwf_enabled;          /* 0 = module disabled (default) */
+    char        map_msisdn_map_file[256]; /* MSISDN->IMSI map for SRI;
+                                           * seeded once, ISD-maintained.
+                                           * Empty = in-memory only.       */
     char        map_local_gt[24];         /* Global Title (E.164 digits)   */
     char        map_local_pc[16];         /* dotted SS7 point code         */
     uint8_t     map_local_ssn;            /* default 149 (SGSN)            */

@@ -17,6 +17,8 @@
 #include "ussd_iwf.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -56,12 +58,23 @@ static gsup_pending_t *g_pending;
 /* Last GSUP TCP conn per IMSI, split by CN domain (SGSN=PS, MSC=CS). */
 typedef struct {
     char imsi[16];
-    char msisdn[24];    /* learned from ISD; empty until seen */
     int  ps_conn_id;
     int  cs_conn_id;
     UT_hash_handle hh;
 } gsup_imsi_conn_t;
 static gsup_imsi_conn_t *g_imsi_conn;
+
+/* MSISDN -> IMSI map for inbound SRI (MT call routing). Independent of the
+ * conn table so CancelLocation / conn purge never drop it. Seeded from
+ * [map_iwf].msisdn_map_file at startup (one-time HSS DB export), kept
+ * current by ISD passing through, and every new/changed mapping is appended
+ * to the same file so the map survives restarts without another DB read. */
+typedef struct {
+    char msisdn[24];
+    char imsi[16];
+    UT_hash_handle hh;
+} msisdn_imsi_t;
+static msisdn_imsi_t *g_msisdn_map;
 
 /* Most recent conn that spoke CS-domain GSUP: MT-SMS fallback when the
  * per-IMSI table is cold (e.g. right after an IWF restart).  The MSC
@@ -101,20 +114,70 @@ static int gsup_conn_for_imsi(const char *imsi, uint8_t cn_domain)
     return cid;
 }
 
+static void msisdn_map_persist(const msisdn_imsi_t *m)
+{
+    if (!g_rt || !g_rt->cfg.map_msisdn_map_file[0]) return;
+    FILE *fp = fopen(g_rt->cfg.map_msisdn_map_file, "a");
+    if (!fp) {
+        LOGW("gsup", "msisdn_map: cannot append %s: %s",
+             g_rt->cfg.map_msisdn_map_file, strerror(errno));
+        return;
+    }
+    fprintf(fp, "%s %s\n", m->msisdn, m->imsi);
+    fclose(fp);
+}
+
+static void msisdn_map_load(void)
+{
+    if (!g_rt || !g_rt->cfg.map_msisdn_map_file[0]) return;
+    FILE *fp = fopen(g_rt->cfg.map_msisdn_map_file, "r");
+    if (!fp) {
+        LOGI("gsup", "msisdn_map: %s not present (starting empty)",
+             g_rt->cfg.map_msisdn_map_file);
+        return;
+    }
+    char line[80];
+    size_t n = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char ms[24], im[16];
+        if (sscanf(line, "%23s %15s", ms, im) != 2) continue;
+        char norm[24];
+        map_normalize_msisdn_digits(ms, norm, sizeof(norm));
+        if (!norm[0] || !im[0]) continue;
+        msisdn_imsi_t *m = NULL;
+        HASH_FIND_STR(g_msisdn_map, norm, m);
+        if (!m) {
+            m = calloc(1, sizeof(*m));
+            if (!m) break;
+            snprintf(m->msisdn, sizeof(m->msisdn), "%s", norm);
+            HASH_ADD_STR(g_msisdn_map, msisdn, m);
+            n++;
+        }
+        snprintf(m->imsi, sizeof(m->imsi), "%s", im);  /* last line wins */
+    }
+    fclose(fp);
+    LOGI("gsup", "msisdn_map: loaded %zu entries from %s",
+         n, g_rt->cfg.map_msisdn_map_file);
+}
+
 void gsup_map_proxy_note_msisdn(const char *imsi, const char *msisdn)
 {
     if (!imsi || !imsi[0] || !msisdn || !msisdn[0]) return;
-    gsup_imsi_conn_t *e = NULL;
-    HASH_FIND_STR(g_imsi_conn, imsi, e);
-    if (!e) {
-        e = calloc(1, sizeof(*e));
-        if (!e) return;
-        strncpy(e->imsi, imsi, sizeof(e->imsi) - 1);
-        e->ps_conn_id = -1;
-        e->cs_conn_id = -1;
-        HASH_ADD_STR(g_imsi_conn, imsi, e);
+    char norm[24];
+    map_normalize_msisdn_digits(msisdn, norm, sizeof(norm));
+    if (!norm[0]) return;
+    msisdn_imsi_t *m = NULL;
+    HASH_FIND_STR(g_msisdn_map, norm, m);
+    if (m && !strcmp(m->imsi, imsi))
+        return;                          /* known and unchanged */
+    if (!m) {
+        m = calloc(1, sizeof(*m));
+        if (!m) return;
+        snprintf(m->msisdn, sizeof(m->msisdn), "%s", norm);
+        HASH_ADD_STR(g_msisdn_map, msisdn, m);
     }
-    map_normalize_msisdn_digits(msisdn, e->msisdn, sizeof(e->msisdn));
+    snprintf(m->imsi, sizeof(m->imsi), "%s", imsi);
+    msisdn_map_persist(m);
 }
 
 int gsup_map_proxy_imsi_for_msisdn(const char *msisdn,
@@ -124,14 +187,11 @@ int gsup_map_proxy_imsi_for_msisdn(const char *msisdn,
     char norm[24];
     map_normalize_msisdn_digits(msisdn, norm, sizeof(norm));
     if (!norm[0]) return -1;
-    gsup_imsi_conn_t *e, *tmp;
-    HASH_ITER(hh, g_imsi_conn, e, tmp) {
-        if (e->msisdn[0] && !strcmp(e->msisdn, norm)) {
-            snprintf(imsi_out, cap, "%s", e->imsi);
-            return 0;
-        }
-    }
-    return -1;
+    msisdn_imsi_t *m = NULL;
+    HASH_FIND_STR(g_msisdn_map, norm, m);
+    if (!m) return -1;
+    snprintf(imsi_out, cap, "%s", m->imsi);
+    return 0;
 }
 
 int gsup_map_proxy_cs_conn_for_imsi(const char *imsi)
@@ -1405,6 +1465,7 @@ void gsup_map_proxy_on_conn_closed(int conn_id)
 void gsup_map_proxy_init(iwf_runtime_t *rt)
 {
     g_rt = rt;
+    msisdn_map_load();
     /* LOCAL auth/UL uses Diameter S6d unless cs_backend/ps_backend override. */
     if (rt && rt->cfg.gsup_cs_backend == GSUP_BACKEND_MAP) {
         /* HLR replies to VLR SSN on networkLocUp; bind so CONTINUE/END arrive. */
@@ -1429,6 +1490,11 @@ void gsup_map_proxy_shutdown(void)
     HASH_ITER(hh, g_imsi_conn, c, ctmp) {
         HASH_DEL(g_imsi_conn, c);
         free(c);
+    }
+    msisdn_imsi_t *m, *mtmp;
+    HASH_ITER(hh, g_msisdn_map, m, mtmp) {
+        HASH_DEL(g_msisdn_map, m);
+        free(m);
     }
     g_rt = NULL;
 }
