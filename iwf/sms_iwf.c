@@ -410,14 +410,9 @@ void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *m)
     sms_sess_remove(found);
 }
 
-static void on_gsup_result(uint32_t corr_id, int error, const char *imsi)
+/* TCAP END with SRI-SM-Res (IMSI + our MSC GT) back to the SMSC. */
+static void sms_sri_sm_answer(sms_session_t *s, const char *imsi)
 {
-    sms_session_t *s = sms_sess_find(corr_id);
-    if (!s || s->direction != SMS_DIR_INBOUND) return;
-    if (error || !imsi || !imsi[0]) {
-        sms_fail_inbound(s);
-        return;
-    }
     strncpy(s->imsi, imsi, sizeof(s->imsi) - 1);
     uint8_t params[64];
     int plen = map_encode_sri_sm_res(imsi, g_rt->cfg.sms_local_msc_gt,
@@ -431,6 +426,17 @@ static void on_gsup_result(uint32_t corr_id, int error, const char *imsi)
         sms_fail_inbound(s);
     else
         sms_sess_remove(s);
+}
+
+static void on_gsup_result(uint32_t corr_id, int error, const char *imsi)
+{
+    sms_session_t *s = sms_sess_find(corr_id);
+    if (!s || s->direction != SMS_DIR_INBOUND) return;
+    if (error || !imsi || !imsi[0]) {
+        sms_fail_inbound(s);
+        return;
+    }
+    sms_sri_sm_answer(s, imsi);
 }
 
 static void handle_inbound_begin(const ss7_sccp_addr_t *calling,
@@ -455,11 +461,30 @@ static void handle_inbound_begin(const ss7_sccp_addr_t *calling,
     s->timer_fd = -1;
     snprintf(s->msisdn, sizeof(s->msisdn), "%s", msisdn);
     HASH_ADD(hh, g_sessions, otid, sizeof(s->otid), s);
-    sms_arm_timer(s, g_rt->cfg.sms_gsup_timeout_ms);
 
     LOGI("sms", "RX inbound SRI-SM msisdn=%s otid=0x%08x", msisdn, s->otid);
-    if (gsup_client_send_sri_sm_req(msisdn, s->otid) < 0)
-        sms_fail_inbound(s);
+
+    /* Resolve MSISDN -> IMSI locally: in-memory msisdn map (fed by ISD),
+     * then the HSS Mongo (pretty5gs "subscribers" collection).  Same data
+     * the voice SRI path uses; answered synchronously, no external HLR. */
+    char imsi[16];
+    if (gsup_map_proxy_imsi_for_msisdn(msisdn, imsi, sizeof(imsi)) == 0 &&
+        imsi[0]) {
+        LOGI("sms", "[%s] SRI-SM: resolved msisdn=%s locally (map/HSS DB)",
+             imsi, msisdn);
+        sms_sri_sm_answer(s, imsi);
+        return;
+    }
+
+    /* Legacy fallback: GSUP SRI-SM query toward an external backend
+     * ([gsup_client]).  Only useful when such a backend exists. */
+    sms_arm_timer(s, g_rt->cfg.sms_gsup_timeout_ms);
+    if (gsup_client_send_sri_sm_req(msisdn, s->otid) < 0) {
+        LOGW("sms", "SRI-SM: msisdn=%s unknown (map/HSS DB miss, no GSUP "
+             "backend) -> unknownSubscriber", msisdn);
+        sms_send_tcap_end_error(s, MAP_ERR_UNKNOWN_SUBSCRIBER);
+        sms_sess_remove(s);
+    }
 }
 
 static int sms_send_map_begin(uint32_t otid, int opcode,
