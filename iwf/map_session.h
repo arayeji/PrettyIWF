@@ -38,6 +38,7 @@ typedef enum {
     MAP_OP_PURGE_MS         = 5,   /* purgeMS                 - op 67                */
     MAP_OP_UL               = 6,   /* updateLocation (MAP-C)  - op 2                 */
     MAP_OP_PRN              = 7,   /* provideRoamingNumber    - op 4                 */
+    MAP_OP_SRI              = 8,   /* sendRoutingInformation  - op 22 (MT call)      */
 } map_op_t;
 
 typedef enum {
@@ -105,6 +106,10 @@ typedef struct map_session {
     char                imsi_str[MAP_IMSI_STR_MAX];
 
     char                msisdn_str[MAP_MSISDN_STR_MAX];
+
+    /* MAP-C UpdateLocationArg msc-Number / vlr-Number (E.164 digits). */
+    char                msc_number[24];
+    char                vlr_number[24];
 
     char                diameter_session_id[DIAMETER_SESSION_ID_MAX];
     uint32_t            diameter_hop_by_hop;

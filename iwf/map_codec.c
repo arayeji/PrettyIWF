@@ -663,6 +663,42 @@ int map_decode_prn_arg(const uint8_t *p, size_t n, map_prn_req_t *out)
     return out->msc_number[0] ? 0 : -1;
 }
 
+int map_encode_prn_arg(const char *imsi_str,
+                       const char *msc_gt_digits,
+                       const char *msisdn_digits,
+                       uint8_t *out, size_t out_cap)
+{
+    if (!imsi_str || !imsi_str[0] || !msc_gt_digits || !msc_gt_digits[0] ||
+        !out)
+        return -1;
+    uint8_t imsi_bcd[8];
+    int il = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
+    if (il < 0) return -1;
+    uint8_t msc_buf[16];
+    int ml = enc_isdn_addr(msc_gt_digits, msc_buf, sizeof(msc_buf));
+    if (ml < 0) return -1;
+
+    uint8_t inner[128];
+    size_t io = 0;
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x80,
+                    imsi_bcd, (size_t)il) < 0)
+        return -1;
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x81,
+                    msc_buf, (size_t)ml) < 0)
+        return -1;
+    if (msisdn_digits && msisdn_digits[0]) {
+        uint8_t ms_buf[16];
+        int msl = enc_isdn_addr(msisdn_digits, ms_buf, sizeof(ms_buf));
+        if (msl > 0 &&
+            ber_enc_tlv(inner, sizeof(inner), &io, 0x82,
+                        ms_buf, (size_t)msl) < 0)
+            return -1;
+    }
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0x30, inner, io) < 0) return -1;
+    return (int)off;
+}
+
 int map_encode_prn_res(const char *msrn_digits, uint8_t *out, size_t out_cap)
 {
     /* ProvideRoamingNumberRes ::= SEQUENCE {
@@ -680,6 +716,30 @@ int map_encode_prn_res(const char *msrn_digits, uint8_t *out, size_t out_cap)
     size_t off = 0;
     if (ber_enc_tlv(out, out_cap, &off, 0x30, inner, io) < 0) return -1;
     return (int)off;
+}
+
+int map_decode_prn_res(const uint8_t *p, size_t n,
+                       char *msrn_digits, size_t msrn_cap)
+{
+    if (!msrn_digits || !msrn_cap) return -1;
+    msrn_digits[0] = '\0';
+    if (!p || n == 0) return -1;
+
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && (p[0] == 0x30 || (p[0] & 0x20))) {
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    }
+    size_t off = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *v;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &v, &l) < 0) break;
+        if (tag == 0x04 && !msrn_digits[0])
+            dec_isdn_addr_digits(v, l, msrn_digits, msrn_cap);
+    }
+    return msrn_digits[0] ? 0 : -1;
 }
 
 int map_decode_sri_arg(const uint8_t *p, size_t n,

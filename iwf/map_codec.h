@@ -144,8 +144,16 @@ int map_decode_cl_arg      (const uint8_t *p, size_t n, map_cl_req_t  *out);
 int map_decode_purge_arg   (const uint8_t *p, size_t n, map_purge_req_t *out);
 int map_decode_prn_arg     (const uint8_t *p, size_t n, map_prn_req_t *out);
 
+/* ProvideRoamingNumber Invoke (HLR -> visited VLR). */
+int map_encode_prn_arg(const char *imsi_str,
+                       const char *msc_gt_digits,
+                       const char *msisdn_digits,
+                       uint8_t *out, size_t out_cap);
+
 /* ProvideRoamingNumberRes: roamingNumber ISDN-AddressString. */
 int map_encode_prn_res(const char *msrn_digits, uint8_t *out, size_t out_cap);
+int map_decode_prn_res(const uint8_t *p, size_t n,
+                       char *msrn_digits, size_t msrn_cap);
 
 /* sendRoutingInformation (opcode 22, MT voice call).
  * Arg decoder extracts only msisdn [0]; Res encoder emits the MAP v3

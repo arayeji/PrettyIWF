@@ -87,6 +87,59 @@ int msisdn_db_lookup(const char *msisdn, char *imsi_out, size_t cap)
     return imsi_out[0] ? 0 : -1;
 }
 
+int msisdn_db_lookup_cs(const char *msisdn, msisdn_db_cs_t *out)
+{
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    if (!g_coll || !msisdn || !msisdn[0]) return -1;
+
+    bson_t *filter = BCON_NEW("msisdn", BCON_UTF8(msisdn));
+    bson_t *opts = BCON_NEW("projection", "{",
+                            "imsi", BCON_INT32(1),
+                            "vlr_number", BCON_INT32(1),
+                            "cs_purge_flag", BCON_INT32(1),
+                            "}");
+    mongoc_cursor_t *cur =
+        mongoc_collection_find_with_opts(g_coll, filter, opts, NULL);
+
+    const bson_t *doc = NULL;
+    if (mongoc_cursor_next(cur, &doc)) {
+        bson_iter_t it;
+        if (bson_iter_init_find(&it, doc, "imsi") &&
+            BSON_ITER_HOLDS_UTF8(&it)) {
+            uint32_t l = 0;
+            const char *s = bson_iter_utf8(&it, &l);
+            if (s && l)
+                snprintf(out->imsi, sizeof(out->imsi), "%.*s", (int)l, s);
+        }
+        if (bson_iter_init_find(&it, doc, "vlr_number") &&
+            BSON_ITER_HOLDS_UTF8(&it)) {
+            uint32_t l = 0;
+            const char *s = bson_iter_utf8(&it, &l);
+            if (s && l && s[0]) {
+                snprintf(out->vlr_number, sizeof(out->vlr_number),
+                         "%.*s", (int)l, s);
+                out->have_vlr = true;
+            }
+        }
+        if (bson_iter_init_find(&it, doc, "cs_purge_flag") &&
+            BSON_ITER_HOLDS_BOOL(&it))
+            out->cs_purge_flag = bson_iter_bool(&it);
+    }
+    bson_error_t err;
+    if (mongoc_cursor_error(cur, &err))
+        LOGW("map", "msisdn_db: CS query msisdn=%s failed: %s", msisdn,
+             err.message);
+
+    mongoc_cursor_destroy(cur);
+    bson_destroy(opts);
+    bson_destroy(filter);
+
+    if (!out->imsi[0]) return -1;
+    out->cs_active = out->have_vlr && !out->cs_purge_flag;
+    return 0;
+}
+
 #else /* !IWF_WITH_MONGOC */
 
 int msisdn_db_init(const char *uri, const char *dbname)
@@ -103,6 +156,12 @@ void msisdn_db_shutdown(void) {}
 int msisdn_db_lookup(const char *msisdn, char *imsi_out, size_t cap)
 {
     (void)msisdn; (void)imsi_out; (void)cap;
+    return -1;
+}
+
+int msisdn_db_lookup_cs(const char *msisdn, msisdn_db_cs_t *out)
+{
+    (void)msisdn; (void)out;
     return -1;
 }
 

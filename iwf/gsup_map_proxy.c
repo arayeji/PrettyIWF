@@ -349,6 +349,13 @@ static const char *vlr_gt_digits(void)
     return NULL;
 }
 
+static const char *msc_gt_digits(void)
+{
+    if (g_rt && g_rt->cfg.sms_local_msc_gt[0])
+        return g_rt->cfg.sms_local_msc_gt;
+    return vlr_gt_digits();
+}
+
 static void reply_gsup_err(int conn_id, const char *imsi,
                            uint8_t req_type, uint8_t cause)
 {
@@ -830,13 +837,14 @@ static int handle_ul(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
 
     /* MAP backend (CS → MAP-C updateLocation; PS → Gr UGL) */
     if (cn == GSUP_CN_DOMAIN_CS) {
-        const char *gt = vlr_gt_digits();
-        if (!gt) {
+        const char *vlr = vlr_gt_digits();
+        const char *msc = msc_gt_digits();
+        if (!vlr || !msc) {
             LOGW("gsup", "[%s] CS MAP-C UL: set [map_iwf].local_gt", route->imsi);
             return -1;
         }
         uint8_t arg[256];
-        int an = map_encode_ul_arg(route->imsi, gt, gt, arg, sizeof(arg));
+        int an = map_encode_ul_arg(route->imsi, msc, vlr, arg, sizeof(arg));
         if (an < 0) return -1;
         return send_map_to_hlr(route, MAP_OP_UL, arg, (size_t)an, conn_id, cn);
     }
@@ -943,6 +951,7 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
                 return;
             }
             LOGI("gsup", "[%s] RX ISD_RES (MAP-C) conn=%d", req.imsi, conn_id);
+            gsup_track_conn(req.imsi, conn_id, GSUP_CN_DOMAIN_CS);
             if (map_pending_ack_isd(mp) < 0) {
                 reply_gsup_err(mp->conn_id, mp->imsi, GSUP_MSG_UL_REQ,
                                GSUP_CAUSE_IMSI_UNKNOWN);
@@ -951,6 +960,8 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
             return;
         }
         map_session_t *s = map_sess_find_gsup_pending(req.imsi, MAP_OP_UGL);
+        if (!s)
+            s = map_sess_find_gsup_pending(req.imsi, MAP_OP_UL);
         if (!s) {
             LOGD("gsup", "[%s] ISD response for unknown session", req.imsi);
             return;
@@ -976,6 +987,7 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
          req.imsi,
          conn_id,
          gsup_server_conn_peer(conn_id));
+        gsup_track_conn(req.imsi, conn_id, s->gsup_cn_domain);
         gsup_map_proxy_finish_ugl(rt, s);
         return;
     }

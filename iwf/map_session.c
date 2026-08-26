@@ -161,6 +161,7 @@ const char *map_op_str(map_op_t op)
     case MAP_OP_PURGE_MS: return "PurgeMS";
     case MAP_OP_UL:       return "UL";
     case MAP_OP_PRN:      return "PRN";
+    case MAP_OP_SRI:      return "SRI";
     }
     return "?";
 }

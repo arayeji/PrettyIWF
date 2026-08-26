@@ -814,13 +814,22 @@ int diameter_send_ulr(struct iwf_runtime *rt, map_session_t *s)
                 DIAM_AVP_FLAG_VENDOR | DIAM_AVP_FLAG_MANDATORY,
                 DIAMETER_VENDOR_3GPP, rat_type);
 
-    /* CS ULR: SGSN-Number = visited VLR GT when we are HLR (MAP inbound),
-     * else map_local_gt when we are VLR (GSUP/osmo-msc). */
+    /* CS ULR: SGSN-Number = visited VLR GT (Open5GS stores vlr_number).
+     * MAP inbound: prefer UpdateLocationArg vlr-Number, then msc-Number,
+     * then SCCP CgPA. GSUP/osmo-msc outbound: map_local_gt. */
     if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS) {
-        const char *vlr_gt = rt->cfg.map_local_gt;
-        if (!s->gsup_originated && s->have_peer_sccp &&
-            s->peer_sccp.have_gt && s->peer_sccp.gt_digits[0])
-            vlr_gt = s->peer_sccp.gt_digits;
+        const char *vlr_gt = NULL;
+        if (!s->gsup_originated) {
+            if (s->vlr_number[0])
+                vlr_gt = s->vlr_number;
+            else if (s->msc_number[0])
+                vlr_gt = s->msc_number;
+            else if (s->have_peer_sccp && s->peer_sccp.have_gt &&
+                     s->peer_sccp.gt_digits[0])
+                vlr_gt = s->peer_sccp.gt_digits;
+        } else if (rt->cfg.map_local_gt[0]) {
+            vlr_gt = rt->cfg.map_local_gt;
+        }
         uint8_t sn_bcd[8];
         int snl = -1;
 
@@ -840,16 +849,25 @@ int diameter_send_ulr(struct iwf_runtime *rt, map_session_t *s)
 
     finalize_length(pkt, off);
     if (s->gsup_cn_domain == GSUP_CN_DOMAIN_CS) {
-        const char *vlr_gt = rt->cfg.map_local_gt;
-        if (!s->gsup_originated && s->have_peer_sccp &&
-            s->peer_sccp.have_gt && s->peer_sccp.gt_digits[0])
-            vlr_gt = s->peer_sccp.gt_digits;
+        const char *vlr_gt = NULL;
+        if (!s->gsup_originated) {
+            if (s->vlr_number[0])
+                vlr_gt = s->vlr_number;
+            else if (s->msc_number[0])
+                vlr_gt = s->msc_number;
+            else if (s->have_peer_sccp && s->peer_sccp.have_gt &&
+                     s->peer_sccp.gt_digits[0])
+                vlr_gt = s->peer_sccp.gt_digits;
+        } else if (rt->cfg.map_local_gt[0]) {
+            vlr_gt = rt->cfg.map_local_gt;
+        }
         LOGI("diameter",
-         "[%s] TX ULR cn=CS/S6d flags=0x%x origin=%s vlr_gt=%s sid=%s len=%zu",
+         "[%s] TX ULR cn=CS/S6d flags=0x%x origin=%s msc=%s vlr=%s sid=%s len=%zu",
          s->imsi_str,
          (unsigned)ulr_flags,
          diam_origin_host_for_sess(rt, s),
-         (vlr_gt && vlr_gt[0]) ? vlr_gt : "(unset)",
+         s->msc_number[0] ? s->msc_number : "-",
+         (vlr_gt && vlr_gt[0]) ? vlr_gt : "-",
          s->diameter_session_id,
          off);
     } else {
