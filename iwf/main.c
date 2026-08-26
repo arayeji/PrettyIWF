@@ -53,8 +53,15 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_sigusr1_test_sai = 0;
+static volatile sig_atomic_t g_sighup_reload = 0;
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+static void on_sighup(int sig)
+{
+    (void)sig;
+    g_sighup_reload = 1;
+}
 
 static void on_sigusr1(int sig)
 {
@@ -412,6 +419,7 @@ int main(int argc, char **argv)
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGHUP,  on_sighup);
     signal(SIGUSR1, on_sigusr1);
     signal(SIGPIPE, SIG_IGN);
 
@@ -428,7 +436,7 @@ int main(int argc, char **argv)
         const char *sms_s = "";
 #endif
         LOGI("iwf", "ready: UDP %s:%u (listen_ip=%s) -> S4 SGW-C=%s:%u "
-                    "(F-TEID/GSN %s)%s%s%s",
+                    "(F-TEID/GSN %s)%s%s%s; SIGHUP reloads config",
              bind_ip, rt.cfg.listen_port,
              rt.cfg.listen_ip,
              rt.cfg.sgwc_ip, rt.cfg.sgwc_port,
@@ -437,6 +445,10 @@ int main(int argc, char **argv)
     }
 
     while (!g_stop) {
+        if (g_sighup_reload) {
+            g_sighup_reload = 0;
+            iwf_config_reload(&rt);
+        }
         struct epoll_event events[IWF_MAX_EVENTS];
         int n = epoll_wait(epfd, events, IWF_MAX_EVENTS, 1000);
         if (n < 0) {

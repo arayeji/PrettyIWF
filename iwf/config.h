@@ -225,8 +225,12 @@ typedef struct {
 
 } iwf_config_t;
 
+struct iwf_runtime;
+
 int  iwf_config_load(const char *path, iwf_config_t *out);
 void iwf_config_dump(const iwf_config_t *c);
+/* Re-read cfg_path and apply runtime-tunable options (SIGHUP). */
+int  iwf_config_reload(struct iwf_runtime *rt);
 
 /* Look up the preconfigured per-roaming-partner PGW for an IMSI (matches the
  * IMSI PLMN against [roaming_hlr] mncNNN_pgw_ip / mncNNN_pgw_fqdn). Returns 1

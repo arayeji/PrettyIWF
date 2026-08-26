@@ -39,7 +39,7 @@ LDLIBS  ?=
 
 # Source set: GTP IWF (always built) + MAP IWF translation units (always
 # compiled; SS7 backend is conditional via -DMAP_IWF_WITH_OSMO_SIGTRAN).
-SRCS    := main.c gtpv1.c gtpv2.c session.c translate.c config.c logging.c \
+SRCS    := main.c gtpv1.c gtpv2.c session.c translate.c config.c config_reload.c logging.c \
            subscr_cache.c imsi_trace.c gtp_trace.c metrics_http.c \
            map_iwf.c map_session.c tcap.c map_codec.c diameter.c ss7_link.c \
            test_cmd.c msrn_pool.c

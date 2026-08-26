@@ -179,6 +179,12 @@ void msrn_pool_shutdown(void)
     memset(g_msc_map, 0, sizeof(g_msc_map));
 }
 
+void msrn_pool_set_ttl(int ttl_sec)
+{
+    if (ttl_sec > 0)
+        g_ttl_sec = ttl_sec;
+}
+
 bool msrn_pool_configured(void)
 {
     return g_inited && g_n_pools > 0;

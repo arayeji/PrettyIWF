@@ -79,7 +79,7 @@ static void defaults(iwf_config_t *c)
     strncpy(c->sms_local_smsc_gt, "1234567890006", sizeof(c->sms_local_smsc_gt) - 1);
     c->sms_gsup_timeout_ms   = 3000;
     c->sms_sri_sm_timeout_ms = 5000;
-    c->sms_fwdsm_timeout_ms  = 10000;
+    c->sms_fwdsm_timeout_ms  = 30000;
     strncpy(c->gsup_remote_ip, "127.0.0.1", sizeof(c->gsup_remote_ip) - 1);
     c->gsup_remote_port      = 4222;
     strncpy(c->gsup_client_name, "IWF-SMS", sizeof(c->gsup_client_name) - 1);

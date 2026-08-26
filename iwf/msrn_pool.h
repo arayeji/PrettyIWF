@@ -53,6 +53,7 @@ int  msrn_pool_alloc(const char *imsi,
 int  msrn_pool_lookup(const char *msrn_digits, bool consume, msrn_binding_t *out);
 
 void msrn_pool_release(const char *msrn_digits);
+void msrn_pool_set_ttl(int ttl_sec);
 void msrn_pool_sweep(time_t now);
 
 /* Append human-readable dump into buf; returns bytes written (excl NUL). */
