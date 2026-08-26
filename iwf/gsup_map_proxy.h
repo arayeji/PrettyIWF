@@ -55,6 +55,15 @@ bool gsup_map_proxy_imsi_known(const char *imsi, uint8_t cn_domain);
 /* Tracked CS-domain GSUP conn for IMSI (MT-SMS delivery), or -1. */
 int gsup_map_proxy_cs_conn_for_imsi(const char *imsi);
 
+/* Remember the MSISDN learned for an attached IMSI (from ISD) so inbound
+ * sendRoutingInformation can resolve called-MSISDN -> IMSI. */
+void gsup_map_proxy_note_msisdn(const char *imsi, const char *msisdn);
+
+/* Reverse lookup: MSISDN digits (any common normalization) -> IMSI.
+ * Returns 0 and fills imsi_out on hit, -1 when unknown. */
+int gsup_map_proxy_imsi_for_msisdn(const char *msisdn,
+                                   char *imsi_out, size_t cap);
+
 /* HSS IDR(URRP-MME): report UE reachability via S6a NOR. */
 void gsup_map_proxy_on_urrp(struct iwf_runtime *rt, const char *imsi,
                             const char *diam_origin_host);

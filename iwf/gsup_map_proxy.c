@@ -56,6 +56,7 @@ static gsup_pending_t *g_pending;
 /* Last GSUP TCP conn per IMSI, split by CN domain (SGSN=PS, MSC=CS). */
 typedef struct {
     char imsi[16];
+    char msisdn[24];    /* learned from ISD; empty until seen */
     int  ps_conn_id;
     int  cs_conn_id;
     UT_hash_handle hh;
@@ -98,6 +99,39 @@ static int gsup_conn_for_imsi(const char *imsi, uint8_t cn_domain)
     if (cid < 0 || !gsup_server_conn_valid(cid))
         return -1;
     return cid;
+}
+
+void gsup_map_proxy_note_msisdn(const char *imsi, const char *msisdn)
+{
+    if (!imsi || !imsi[0] || !msisdn || !msisdn[0]) return;
+    gsup_imsi_conn_t *e = NULL;
+    HASH_FIND_STR(g_imsi_conn, imsi, e);
+    if (!e) {
+        e = calloc(1, sizeof(*e));
+        if (!e) return;
+        strncpy(e->imsi, imsi, sizeof(e->imsi) - 1);
+        e->ps_conn_id = -1;
+        e->cs_conn_id = -1;
+        HASH_ADD_STR(g_imsi_conn, imsi, e);
+    }
+    map_normalize_msisdn_digits(msisdn, e->msisdn, sizeof(e->msisdn));
+}
+
+int gsup_map_proxy_imsi_for_msisdn(const char *msisdn,
+                                   char *imsi_out, size_t cap)
+{
+    if (!msisdn || !msisdn[0] || !imsi_out || !cap) return -1;
+    char norm[24];
+    map_normalize_msisdn_digits(msisdn, norm, sizeof(norm));
+    if (!norm[0]) return -1;
+    gsup_imsi_conn_t *e, *tmp;
+    HASH_ITER(hh, g_imsi_conn, e, tmp) {
+        if (e->msisdn[0] && !strcmp(e->msisdn, norm)) {
+            snprintf(imsi_out, cap, "%s", e->imsi);
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int gsup_map_proxy_cs_conn_for_imsi(const char *imsi)
@@ -629,6 +663,8 @@ int gsup_map_proxy_send_isd(iwf_runtime_t *rt, map_session_t *s)
 
     s->state = MAP_SESS_WAIT_MAP_ACK;
     s->gsup_isd_sent = true;
+    if (s->msisdn_str[0])
+        gsup_map_proxy_note_msisdn(s->imsi_str, s->msisdn_str);
     map_sess_touch(s);
     {
         char hexbuf[512] = {0};
@@ -1183,6 +1219,9 @@ static int map_pending_on_isd_invoke(gsup_pending_t *p,
     char msisdn[24] = {0};
     (void)map_decode_isd_arg(c->parameters, c->parameters_len,
                              NULL, 0, msisdn, sizeof(msisdn));
+
+    if (msisdn[0])
+        gsup_map_proxy_note_msisdn(p->imsi, msisdn);
 
     /* Primary ISD (carries the MSISDN): forward to the MSC over GSUP and
      * ack toward the HLR only after the MSC's ISD_RES. */

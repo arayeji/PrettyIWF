@@ -590,6 +590,127 @@ static void handle_begin_psi(struct iwf_runtime *rt,
          attached ? "assumedIdle" : "netDetNotReachable");
 }
 
+/* sendRoutingInformation (GMSC -> HLR, MT voice call): act as the HLR for
+ * subscribers currently attached to our MSC. Resolve the called MSISDN to
+ * an IMSI (learned from ISD), allocate an MSRN from the PRN pool and return
+ * it as roamingNumber so the call is routed to our MSC. Session-less:
+ * reply with a TCAP END immediately, AARE echoing the caller's AC. */
+static void sri_send_end(struct iwf_runtime *rt,
+                         const ss7_sccp_addr_t *calling,
+                         const tcap_msg_t *tmsg,
+                         const uint8_t *cmp, size_t co)
+{
+    uint8_t dlg[128];
+    int dn = 0;
+    uint8_t oid[16];
+    size_t ol = 0;
+    if (tmsg->dialogue && tmsg->dialogue_len &&
+        map_decode_aarq_ac_raw(tmsg->dialogue, tmsg->dialogue_len,
+                               oid, sizeof(oid), &ol) == 0)
+        dn = map_encode_aare_oid(oid, ol, dlg, sizeof(dlg));
+    if (dn < 0) dn = 0;
+
+    uint8_t out[512];
+    int n = tcap_encode_message(TCAP_MSG_END, 0, false,
+                                tmsg->otid, tmsg->have_otid,
+                                dn > 0 ? dlg : NULL, dn > 0 ? (size_t)dn : 0,
+                                cmp, co, out, sizeof(out));
+    if (n < 0) return;
+
+    ss7_sccp_addr_t src;
+    memset(&src, 0, sizeof(src));
+    if (rt->cfg.map_local_gt[0])
+        ss7_gt_from_digits(rt->cfg.map_local_gt, SS7_SSN_HLR, &src);
+    src.ssn = SS7_SSN_HLR;
+    ss7_link_send_tcap_ex(rt, calling, src.have_gt ? &src : NULL,
+                          out, (size_t)n);
+}
+
+static void sri_send_error(struct iwf_runtime *rt,
+                           const ss7_sccp_addr_t *calling,
+                           const tcap_msg_t *tmsg,
+                           uint8_t invoke_id, int err)
+{
+    uint8_t cmp[64];
+    size_t co = 0;
+    if (tcap_enc_return_error(cmp, sizeof(cmp), &co, invoke_id,
+                              err, NULL, 0) < 0)
+        return;
+    sri_send_end(rt, calling, tmsg, cmp, co);
+}
+
+static void handle_begin_sri(struct iwf_runtime *rt,
+                             const ss7_sccp_addr_t *calling,
+                             const tcap_msg_t *tmsg,
+                             const tcap_component_t *c)
+{
+    char msisdn[24] = "";
+    if (map_decode_sri_arg(c->parameters, c->parameters_len,
+                           msisdn, sizeof(msisdn)) < 0) {
+        LOGW("map", "[?] RX BEGIN SRI otid=0x%08x: no MSISDN -> "
+             "unexpectedDataValue", tmsg->otid);
+        sri_send_error(rt, calling, tmsg, c->invoke_id,
+                       MAP_ERR_UNEXPECTED_DATA_VALUE);
+        return;
+    }
+
+    char imsi[16] = "";
+    int err = 0;
+#ifdef GSUP_PROXY_ENABLED
+    if (gsup_map_proxy_imsi_for_msisdn(msisdn, imsi, sizeof(imsi)) < 0)
+        err = MAP_ERR_UNKNOWN_SUBSCRIBER;
+    else if (!gsup_map_proxy_imsi_known(imsi, GSUP_CN_DOMAIN_CS))
+        err = MAP_ERR_ABSENT_SUBSCRIBER;
+#else
+    err = MAP_ERR_FACILITY_NOT_SUPPORTED;
+#endif
+
+    LOGI("map", "[%s] RX BEGIN SRI otid=0x%08x invoke=%u msisdn=%s",
+         imsi[0] ? imsi : "?", tmsg->otid, (unsigned)c->invoke_id, msisdn);
+
+    msrn_binding_t bind;
+    if (!err) {
+        if (!msrn_pool_configured()) {
+            LOGW("map", "[%s] SRI msisdn=%s: no msrn_pool configured -> "
+                 "facilityNotSupported", imsi, msisdn);
+            err = MAP_ERR_FACILITY_NOT_SUPPORTED;
+        } else if (msrn_pool_alloc(imsi, msisdn, NULL,
+                                   tmsg->otid, &bind) < 0) {
+            LOGW("map", "[%s] SRI msisdn=%s: MSRN alloc failed -> "
+                 "systemFailure", imsi, msisdn);
+            err = MAP_ERR_SYSTEM_FAILURE;
+        }
+    }
+
+    if (err) {
+        LOGI("map", "[%s] SRI msisdn=%s rejected err=%d",
+             imsi[0] ? imsi : "?", msisdn, err);
+        sri_send_error(rt, calling, tmsg, c->invoke_id, err);
+        return;
+    }
+
+    uint8_t params[80];
+    int pn = map_encode_sri_res(imsi, bind.msrn, params, sizeof(params));
+    if (pn < 0) {
+        msrn_pool_release(bind.msrn);
+        sri_send_error(rt, calling, tmsg, c->invoke_id,
+                       MAP_ERR_SYSTEM_FAILURE);
+        return;
+    }
+    uint8_t cmp[192];
+    size_t co = 0;
+    if (tcap_enc_return_result(cmp, sizeof(cmp), &co, c->invoke_id,
+                               MAP_OP_CODE_SEND_ROUTING_INFO,
+                               params, (size_t)pn) < 0) {
+        msrn_pool_release(bind.msrn);
+        return;
+    }
+    sri_send_end(rt, calling, tmsg, cmp, co);
+    LOGI("map", "[%s] SRI answered msisdn=%s msrn=%s pool=%s",
+         imsi, msisdn, bind.msrn, bind.pool_name);
+    iwf_imsi_trace_flush_rx(imsi);
+}
+
 /* ----- Continue / End handlers (ISD ack from VLR/SGSN) ----------------- */
 
 static void finish_ul_with_result(struct iwf_runtime *rt, map_session_t *s)
@@ -892,6 +1013,7 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
         case MAP_OP_CODE_CANCEL_LOCATION:       handle_begin_cl   (rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_PROVIDE_ROAMING_NUMBER: handle_begin_prn (rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_PROVIDE_SUBSCRIBER_INFO: handle_begin_psi(rt, calling, &tmsg, c); break;
+        case MAP_OP_CODE_SEND_ROUTING_INFO:      handle_begin_sri (rt, calling, &tmsg, c); break;
 #ifdef SMS_IWF_ENABLED
         case MAP_OP_CODE_MT_FORWARD_SM_V3:      /* mt-forwardSM (v3)      */
         case MAP_OP_CODE_MT_FORWARD_SM:         /* forwardSM (v1/v2)      */

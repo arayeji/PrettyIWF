@@ -682,6 +682,63 @@ int map_encode_prn_res(const char *msrn_digits, uint8_t *out, size_t out_cap)
     return (int)off;
 }
 
+int map_decode_sri_arg(const uint8_t *p, size_t n,
+                       char *msisdn_out, size_t cap)
+{
+    /* SendRoutingInfoArg ::= SEQUENCE {
+     *   msisdn             [0] ISDN-AddressString,
+     *   cug-CheckInfo      [1] OPTIONAL,
+     *   numberOfForwarding [2] OPTIONAL,
+     *   interrogationType  [3] (v3), gmsc-Address [6] (v3), ... }
+     * Only msisdn matters for routing here. */
+    if (!p || !msisdn_out || !cap) return -1;
+    msisdn_out[0] = '\0';
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && (p[0] == 0x30 || (p[0] & 0x20))) {
+        if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
+    }
+    size_t off = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *v;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &v, &l) < 0) break;
+        if (tag == 0x80 && !msisdn_out[0])
+            dec_isdn_addr_digits(v, l, msisdn_out, cap);
+    }
+    return msisdn_out[0] ? 0 : -1;
+}
+
+int map_encode_sri_res(const char *imsi_str, const char *msrn_digits,
+                       uint8_t *out, size_t out_cap)
+{
+    /* SendRoutingInfoRes (v3) ::= [3] IMPLICIT SEQUENCE {
+     *   imsi                [9] IMSI OPTIONAL,
+     *   extendedRoutingInfo ExtendedRoutingInfo OPTIONAL, ... }
+     * ExtendedRoutingInfo -> RoutingInfo -> roamingNumber is an untagged
+     * CHOICE, so the MSRN appears as a universal OCTET STRING (0x04). */
+    if (!msrn_digits || !msrn_digits[0] || !out) return -1;
+    uint8_t body[48];
+    size_t bo = 0;
+    if (imsi_str && imsi_str[0]) {
+        uint8_t imsi_bcd[8];
+        int il = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
+        if (il < 0) return -1;
+        if (ber_enc_tlv(body, sizeof(body), &bo, 0x89,
+                        imsi_bcd, (size_t)il) < 0)
+            return -1;
+    }
+    uint8_t addr[16];
+    int al = enc_isdn_addr(msrn_digits, addr, sizeof(addr));
+    if (al < 0) return -1;
+    if (ber_enc_tlv(body, sizeof(body), &bo, 0x04, addr, (size_t)al) < 0)
+        return -1;
+    size_t off = 0;
+    if (ber_enc_tlv(out, out_cap, &off, 0xA3, body, bo) < 0) return -1;
+    return (int)off;
+}
+
 int map_encode_ul_arg(const char *imsi_str,
                       const char *msc_gt_digits,
                       const char *vlr_gt_digits,

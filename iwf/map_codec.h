@@ -41,6 +41,7 @@
 #define MAP_OP_CODE_CANCEL_LOCATION         3
 #define MAP_OP_CODE_PROVIDE_ROAMING_NUMBER  4
 #define MAP_OP_CODE_INSERT_SUBSCRIBER_DATA  7
+#define MAP_OP_CODE_SEND_ROUTING_INFO       22  /* sendRoutingInformation (MT call) */
 #define MAP_OP_CODE_UPDATE_GPRS_LOCATION    23
 #define MAP_OP_CODE_SEND_AUTH_INFO          56
 #define MAP_OP_CODE_PURGE_MS                67
@@ -145,6 +146,14 @@ int map_decode_prn_arg     (const uint8_t *p, size_t n, map_prn_req_t *out);
 
 /* ProvideRoamingNumberRes: roamingNumber ISDN-AddressString. */
 int map_encode_prn_res(const char *msrn_digits, uint8_t *out, size_t out_cap);
+
+/* sendRoutingInformation (opcode 22, MT voice call).
+ * Arg decoder extracts only msisdn [0]; Res encoder emits the MAP v3
+ * [3] SEQUENCE { imsi [9], roamingNumber } form. */
+int map_decode_sri_arg(const uint8_t *p, size_t n,
+                       char *msisdn_out, size_t cap);
+int map_encode_sri_res(const char *imsi_str, const char *msrn_digits,
+                       uint8_t *out, size_t out_cap);
 
 /* MAP SMS (TS 29.002) — used by sms_iwf when SMS_IWF_ENABLED. */
 int map_decode_sri_sm_arg(const uint8_t *p, size_t n, char *msisdn_out, size_t cap);
