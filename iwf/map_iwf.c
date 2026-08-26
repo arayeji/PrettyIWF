@@ -657,9 +657,12 @@ static void handle_begin_sri(struct iwf_runtime *rt,
     char imsi[16] = "";
     int err = 0;
 #ifdef GSUP_PROXY_ENABLED
+    /* Attach state: like MT-SMS, accept when any MSC GSUP conn exists
+     * (per-IMSI table is cold right after a restart); the MSC pages and
+     * rejects properly if the UE is really gone. */
     if (gsup_map_proxy_imsi_for_msisdn(msisdn, imsi, sizeof(imsi)) < 0)
         err = MAP_ERR_UNKNOWN_SUBSCRIBER;
-    else if (!gsup_map_proxy_imsi_known(imsi, GSUP_CN_DOMAIN_CS))
+    else if (gsup_map_proxy_cs_conn_for_imsi(imsi) < 0)
         err = MAP_ERR_ABSENT_SUBSCRIBER;
 #else
     err = MAP_ERR_FACILITY_NOT_SUPPORTED;
