@@ -36,6 +36,22 @@ static const char *v1_msg_str(uint8_t t)
  * for the Update-PDP-Context-triggered MBReq path. */
 static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi);
 
+static int send_create_pdp_reject(iwf_runtime_t *rt, const iwf_endpoint_t *to,
+                                  uint32_t sgsn_ctrl_teid, uint16_t seq,
+                                  uint8_t cause)
+{
+    uint8_t outbuf[IWF_MAX_PKT];
+    gtpv1_enc_t e;
+    gtpv1_enc_init(&e, outbuf, sizeof(outbuf));
+    gtpv1_enc_begin(&e, GTPV1_CREATE_PDP_CONTEXT_RESPONSE,
+                    sgsn_ctrl_teid, seq);
+    gtpv1_enc_cause(&e, cause);
+    int total = gtpv1_enc_finish(&e);
+    if (total > 0)
+        return iwf_send_v1(rt, to, outbuf, (size_t)total);
+    return -1;
+}
+
 static int iwf_send_v2_sess(iwf_runtime_t *rt, const sess_t *s,
                             const uint8_t *buf, size_t len)
 {
@@ -1531,15 +1547,19 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         LOGW("translate",
              "[%s] Create-PDP has no APN — rejecting (Missing or unknown APN)",
              imsi);
-        uint8_t outbuf[IWF_MAX_PKT];
-        gtpv1_enc_t er;
-        gtpv1_enc_init(&er, outbuf, sizeof(outbuf));
-        gtpv1_enc_begin(&er, GTPV1_CREATE_PDP_CONTEXT_RESPONSE,
-                        s->sgsn_ctrl_teid, (uint16_t)v1->seq);
-        gtpv1_enc_cause(&er, GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN);
-        int total = gtpv1_enc_finish(&er);
-        if (total > 0)
-            (void)iwf_send_v1(rt, from, outbuf, (size_t)total);
+        (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
+                                     (uint16_t)v1->seq,
+                                     GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN);
+        sess_remove(s);
+        return 0;
+    }
+    if (!iwf_config_apn_allowed(&rt->cfg, imsi, s->apn)) {
+        LOGW("translate",
+             "[%s] Create-PDP APN '%s' denied by [roaming_hlr] mnc*_apn ACL",
+             imsi, s->apn);
+        (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
+                                     (uint16_t)v1->seq,
+                                     GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN);
         sess_remove(s);
         return 0;
     }
@@ -1683,74 +1703,106 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     /* PGW/SMF S5/S8-C F-TEID (instance 1) — Open5GS SGWC requires this IE or
      * rejects with cause 103 ("No PGW IP" in sgwc logs).
      *
-     * PGW selection order:
-     *   1. The PGW the home HSS advertised for this (IMSI, APN) in ULA
-     *      Subscription-Data (MIP6-Agent-Info), cached at Update Location.
-     *      This anchors home-routed roamers at their home PGW and lets local
-     *      subscribers work with no static [smf] address at all.
-     *   2. A preconfigured per-roaming-partner PGW ([roaming_hlr] mncNNN_pgw_*)
-     *      when the HSS sent no PGW (IP and/or DNS-resolved FQDN).
-     *   3. The static [smf] address from config (global last resort).
-     *
-     * For 1 and 2, the F-TEID TEID is 0 on an initial Create Session: the PGW
-     * allocates and returns its own S5/S8-C TEID. We keep cfg.smf_teid for the
-     * [smf] path to preserve any explicitly configured peer TEID. */
+     * Order comes from [iwf] pgw_select / [roaming_hlr] mncNNN_pgw_select
+     * (mip, dns, static, smf). If the dns step runs and yields no A record,
+     * Create-PDP is rejected immediately (no fall-through). */
     uint32_t    pgw_ipv4 = 0;          /* host order */
     uint32_t    pgw_teid = 0;
     const char *pgw_src  = NULL;
     char        pgw_fqdn[256] = { 0 };
+    int         dns_no_records = 0;
 
-    if (rt->cfg.pgw_from_subscription &&
-        subscr_cache_get_pgw(imsi, s->apn, &pgw_ipv4,
-                             pgw_fqdn, sizeof(pgw_fqdn), NULL)) {
-        pgw_teid = 0;
-        pgw_src  = "subscription";
-    }
+    uint8_t pgw_order[IWF_PGW_SELECT_MAX];
+    int nsel = iwf_config_pgw_select(&rt->cfg, imsi, pgw_order);
 
-    /* No PGW in subscription data — fall back to a preconfigured PGW for the
-     * subscriber's roaming partner (IP first, else DNS-resolve the FQDN). */
-    if (!pgw_ipv4) {
-        const char *cip = NULL, *cfqdn = NULL;
-        if (iwf_config_roam_pgw(&rt->cfg, imsi, &cip, &cfqdn)) {
-            if (cip && cip[0]) {
-                struct in_addr a;
-                if (inet_pton(AF_INET, cip, &a) == 1)
-                    pgw_ipv4 = ntohl(a.s_addr);
-                else
-                    LOGW("translate",
-         "[%s] invalid [roaming_hlr] pgw_ip=%s",
-         imsi,
-         cip);
+    for (int si = 0; si < nsel && !pgw_ipv4 && !dns_no_records; si++) {
+        switch (pgw_order[si]) {
+        case IWF_PGW_SRC_MIP:
+            if (subscr_cache_get_pgw_mip(imsi, s->apn, &pgw_ipv4)) {
+                pgw_teid = 0;
+                pgw_src  = "mip";
             }
-            if (!pgw_ipv4 && cfqdn && cfqdn[0]) {
-                pgw_ipv4 = subscr_resolve_fqdn_ipv4(cfqdn);
-                if (pgw_ipv4) {
-                    strncpy(pgw_fqdn, cfqdn, sizeof(pgw_fqdn) - 1);
-                    pgw_fqdn[sizeof(pgw_fqdn) - 1] = '\0';
-                } else {
-                    LOGW("translate",
-         "[%s] could not resolve [roaming_hlr] pgw_fqdn=%s",
-         imsi,
-         cfqdn);
+            break;
+
+        case IWF_PGW_SRC_DNS: {
+            char name[256] = { 0 };
+            if (subscr_cache_get_pgw_fqdn(imsi, s->apn, name, sizeof(name)) &&
+                name[0]) {
+                /* ULA MIP-Home-Agent-Host */
+            } else {
+                const char *cip = NULL, *cfqdn = NULL;
+                if (iwf_config_roam_pgw(&rt->cfg, imsi, &cip, &cfqdn) &&
+                    cfqdn && cfqdn[0]) {
+                    strncpy(name, cfqdn, sizeof(name) - 1);
+                } else if (iwf_config_apn_epc_fqdn(&rt->cfg, imsi, s->apn,
+                                                   name, sizeof(name)) != 0) {
+                    name[0] = '\0';
                 }
             }
+            if (!name[0]) {
+                LOGW("translate",
+                     "[%s] pgw_select=dns: no FQDN for apn=%s — rejecting",
+                     imsi, s->apn[0] ? s->apn : "(none)");
+                dns_no_records = 1;
+                break;
+            }
+            pgw_ipv4 = subscr_resolve_fqdn_ipv4(name);
             if (pgw_ipv4) {
                 pgw_teid = 0;
-                pgw_src  = "roaming_hlr";
+                pgw_src  = "dns";
+                strncpy(pgw_fqdn, name, sizeof(pgw_fqdn) - 1);
+                pgw_fqdn[sizeof(pgw_fqdn) - 1] = '\0';
+            } else {
+                LOGW("translate",
+                     "[%s] pgw_select=dns: no A record for %s — rejecting",
+                     imsi, name);
+                dns_no_records = 1;
             }
+            break;
+        }
+
+        case IWF_PGW_SRC_STATIC: {
+            const char *cip = NULL, *cfqdn = NULL;
+            if (iwf_config_roam_pgw(&rt->cfg, imsi, &cip, &cfqdn) &&
+                cip && cip[0]) {
+                struct in_addr a;
+                if (inet_pton(AF_INET, cip, &a) == 1) {
+                    pgw_ipv4 = ntohl(a.s_addr);
+                    pgw_teid = 0;
+                    pgw_src  = "static";
+                } else {
+                    LOGW("translate",
+                         "[%s] invalid [roaming_hlr] pgw_ip=%s", imsi, cip);
+                }
+            }
+            break;
+        }
+
+        case IWF_PGW_SRC_SMF:
+            if (rt->cfg.smf_ip[0]) {
+                struct in_addr smf;
+                if (inet_pton(AF_INET, rt->cfg.smf_ip, &smf) != 1) {
+                    LOGE("translate", "invalid [smf] ip=%s", rt->cfg.smf_ip);
+                    sess_remove(s);
+                    return -1;
+                }
+                pgw_ipv4 = ntohl(smf.s_addr);
+                pgw_teid = rt->cfg.smf_teid;
+                pgw_src  = "smf";
+            }
+            break;
+
+        default:
+            break;
         }
     }
 
-    if (!pgw_ipv4 && rt->cfg.smf_ip[0]) {
-        struct in_addr smf;
-        if (inet_pton(AF_INET, rt->cfg.smf_ip, &smf) != 1) {
-            LOGE("translate", "invalid [smf] ip=%s", rt->cfg.smf_ip);
-            sess_remove(s);
-            return -1;
-        }
-        pgw_ipv4 = ntohl(smf.s_addr);
-        pgw_teid = rt->cfg.smf_teid;
-        pgw_src  = "config";
+    if (dns_no_records) {
+        (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
+                                     (uint16_t)v1->seq,
+                                     GTPV1_CAUSE_NO_RESOURCES);
+        sess_remove(s);
+        return 0;
     }
 
     if (pgw_ipv4) {
@@ -1765,7 +1817,7 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
          (pgw_ipv4 >> 8) & 0xff,
          pgw_ipv4 & 0xff,
          pgw_teid,
-         pgw_src,
+         pgw_src ? pgw_src : "?",
          pgw_fqdn[0] ? " fqdn=" : "",
          pgw_fqdn[0] ? pgw_fqdn : "");
     } else {
@@ -1773,7 +1825,8 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         if (!warned_no_pgw) {
             warned_no_pgw = 1;
             LOGW("translate",
-         "[%s] Create Session: no PGW for apn=%s — none of HSS subscription (ULA MIP6-Agent-Info), [roaming_hlr] mncNNN_pgw_ip/pgw_fqdn, or [smf] ip is set (config file: %s). Open5GS SGWC rejects CSReq (cause 103). Provide PGW in HSS APN-Configuration, a per-partner pgw_ip/pgw_fqdn, or [smf] ip=<PGW/SMF GTP-C IPv4>.",
+         "[%s] Create Session: no PGW for apn=%s — pgw_select exhausted "
+         "(config file: %s). Open5GS SGWC rejects CSReq (cause 103).",
          imsi,
          s->apn[0] ? s->apn : "(none)",
          rt->cfg.cfg_path[0] ? rt->cfg.cfg_path : "iwf.conf");

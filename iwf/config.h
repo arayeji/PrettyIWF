@@ -46,7 +46,9 @@ typedef struct {
      *   mip    — ULA MIP6-Agent-Info IPv4 (MIP-Home-Agent-Address)
      *   dns    — DNS-resolve FQDN from ULA MIP-Home-Agent-Host, else
      *            [roaming_hlr] mncNNN_pgw_fqdn, else 3GPP APN FQDN
-     *            <apn>.apn.epc.mncXXX.mccYYY.3gppnetwork.org
+     *            <apn>.apn.epc.mncXXX.mccYYY.3gppnetwork.org.
+     *            If this step runs and DNS yields no A record, Create-PDP
+     *            is rejected (no fall-through to static/smf).
      *   static — [roaming_hlr] mncNNN_pgw_ip (literal, no DNS)
      *   smf    — [smf] ip
      * Default: mip,dns,static,smf. Override globally via [iwf] pgw_select
@@ -204,6 +206,12 @@ typedef struct {
         /* Optional per-partner override of [iwf] pgw_select (same tokens). */
         uint8_t pgw_select[IWF_PGW_SELECT_MAX];
         int     pgw_n_select;           /* 0 = inherit global */
+        /* Optional APN ACL for this PLMN (mncNNN_apn). n_apn_acl==0 → allow
+         * all; otherwise only listed APN-NIs (comma-separated). */
+#define IWF_APN_ACL_MAX      32
+#define IWF_APN_ACL_NAME_MAX 64
+        char    apn_acl[IWF_APN_ACL_MAX][IWF_APN_ACL_NAME_MAX];
+        int     n_apn_acl;
     } gsup_roam_routes[GSUP_MAX_ROAM_ROUTES];
     int         gsup_n_roam_routes;
 
@@ -279,5 +287,15 @@ int  iwf_config_imsi_is_roamer(const iwf_config_t *cfg, const char *imsi);
  * Copies src_apn as-is when already FQDN / home subscriber / empty. */
 void iwf_apn_for_s4(const iwf_config_t *cfg, const char *imsi,
                     const char *src_apn, char *out, size_t out_cap);
+
+/* Per-PLMN APN ACL ([roaming_hlr] mncNNN_apn). Returns 1 if allowed:
+ * no matching route or empty ACL → allow all; else APN-NI must be listed. */
+int  iwf_config_apn_allowed(const iwf_config_t *cfg, const char *imsi,
+                            const char *apn);
+
+/* Build 3GPP PGW APN FQDN: <ni>.apn.epc.mncXXX.mccYYY.3gppnetwork.org
+ * using the IMSI home PLMN. Returns 0 on success, -1 on bad input. */
+int  iwf_config_apn_epc_fqdn(const iwf_config_t *cfg, const char *imsi,
+                             const char *apn, char *out, size_t out_cap);
 
 #endif /* IWF_CONFIG_H */

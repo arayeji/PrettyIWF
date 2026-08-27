@@ -378,6 +378,36 @@ static void gsup_roam_key(iwf_config_t *out, const char *key, const char *val)
         int n = parse_pgw_select(val, out->gsup_roam_routes[idx].pgw_select);
         if (n > 0)
             out->gsup_roam_routes[idx].pgw_n_select = n;
+    } else if (!strcmp(p, "apn") || !strcmp(p, "apn_acl")) {
+        /* Comma-separated APN-NI allow-list for this PLMN. */
+        char buf[512];
+        copy_str(buf, sizeof(buf), val);
+        char *save = NULL;
+        for (char *tok = strtok_r(buf, ", \t", &save); tok;
+             tok = strtok_r(NULL, ", \t", &save)) {
+            iwf_apn_normalize(tok);
+            if (!tok[0])
+                continue;
+            typeof(out->gsup_roam_routes[0]) *r = &out->gsup_roam_routes[idx];
+            int dup = 0;
+            for (int i = 0; i < r->n_apn_acl; i++) {
+                if (!strcasecmp(r->apn_acl[i], tok)) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup)
+                continue;
+            if (r->n_apn_acl >= IWF_APN_ACL_MAX) {
+                LOGW("config",
+                     "mnc%s_apn: ACL full (max %d), ignoring '%s'",
+                     mnc, IWF_APN_ACL_MAX, tok);
+                break;
+            }
+            copy_str(r->apn_acl[r->n_apn_acl],
+                     sizeof(r->apn_acl[0]), tok);
+            r->n_apn_acl++;
+        }
     } else
         LOGW("config", "unknown key [roaming_hlr].%s", key);
 }
@@ -802,6 +832,22 @@ void iwf_config_dump(const iwf_config_t *c)
              c->gsup_cs_backend == GSUP_BACKEND_MAP ? "map" : "diameter",
              c->gsup_ps_backend == GSUP_BACKEND_MAP ? "map" : "diameter");
     }
+    for (int i = 0; i < c->gsup_n_roam_routes; i++) {
+        const typeof(c->gsup_roam_routes[0]) *r = &c->gsup_roam_routes[i];
+        if (r->n_apn_acl <= 0)
+            continue;
+        char list[256];
+        size_t off = 0;
+        list[0] = '\0';
+        for (int a = 0; a < r->n_apn_acl; a++) {
+            int n = snprintf(list + off, sizeof(list) - off, "%s%s",
+                             a ? "," : "", r->apn_acl[a]);
+            if (n < 0 || (size_t)n >= sizeof(list) - off)
+                break;
+            off += (size_t)n;
+        }
+        LOGI("config", "roaming_hlr mnc%s apn_acl=%s", r->mnc, list);
+    }
 #ifdef SMS_IWF_ENABLED
     if (c->sms_iwf_enabled) {
         LOGI("config", "sms_iwf: msc_gt=%s smsc_gt=%s hlr_ssn=%u gsup_timeout=%dms",
@@ -1035,4 +1081,78 @@ void iwf_apn_for_s4(const iwf_config_t *cfg, const char *imsi,
     if (al + ol + 1 > out_cap)
         return;
     memcpy(out + al, oi, ol + 1);
+}
+
+/* Match request APN against an ACL entry (exact or NI prefix before '.'). */
+static int apn_matches_acl_entry(const char *apn, const char *entry)
+{
+    if (!apn || !entry || !entry[0])
+        return 0;
+    if (!strcasecmp(apn, entry))
+        return 1;
+    size_t el = strlen(entry);
+    if (strncasecmp(apn, entry, el) == 0 &&
+        (apn[el] == '\0' || apn[el] == '.'))
+        return 1;
+    return 0;
+}
+
+int iwf_config_apn_allowed(const iwf_config_t *cfg, const char *imsi,
+                           const char *apn)
+{
+    if (!cfg || !apn || !apn[0])
+        return 1; /* empty handled elsewhere */
+    int idx = roam_route_idx_for_imsi(cfg, imsi);
+    if (idx < 0)
+        return 1; /* no PLMN route → no ACL → allow all */
+    const typeof(cfg->gsup_roam_routes[0]) *r = &cfg->gsup_roam_routes[idx];
+    if (r->n_apn_acl <= 0)
+        return 1;
+    for (int i = 0; i < r->n_apn_acl; i++) {
+        if (apn_matches_acl_entry(apn, r->apn_acl[i]))
+            return 1;
+    }
+    return 0;
+}
+
+int iwf_config_apn_epc_fqdn(const iwf_config_t *cfg, const char *imsi,
+                            const char *apn, char *out, size_t out_cap)
+{
+    if (!out || !out_cap || !imsi || strlen(imsi) < 5 || !apn || !apn[0])
+        return -1;
+    out[0] = '\0';
+
+    /* APN-NI only (strip OI / epc suffix if present). */
+    char ni[IWF_APN_ACL_NAME_MAX];
+    copy_str(ni, sizeof(ni), apn);
+    iwf_apn_normalize(ni);
+    char *cut = strstr(ni, ".mnc");
+    if (!cut)
+        cut = strstr(ni, ".apn.epc.");
+    if (!cut)
+        cut = strstr(ni, ".gprs");
+    if (cut)
+        *cut = '\0';
+    if (!ni[0])
+        return -1;
+
+    unsigned a = 0, b = 0, c = 0, d = 0, e = 0;
+    if (sscanf(imsi, "%1u%1u%1u%1u%1u", &a, &b, &c, &d, &e) != 5)
+        return -1;
+    uint16_t mcc = (uint16_t)(a * 100u + b * 10u + c);
+    uint16_t mnc = (uint16_t)(d * 10u + e);
+    int ridx = roam_route_idx_for_imsi(cfg, imsi);
+    if (ridx >= 0)
+        mnc = (uint16_t)atoi(cfg->gsup_roam_routes[ridx].mnc);
+    else if (strlen(imsi) >= 6 && imsi[5] >= '0' && imsi[5] <= '9')
+        mnc = (uint16_t)(d * 100u + e * 10u + (unsigned)(imsi[5] - '0'));
+
+    int n = snprintf(out, out_cap,
+                     "%s.apn.epc.mnc%03u.mcc%03u.3gppnetwork.org",
+                     ni, (unsigned)mnc, (unsigned)mcc);
+    if (n < 0 || (size_t)n >= out_cap) {
+        out[0] = '\0';
+        return -1;
+    }
+    return 0;
 }
