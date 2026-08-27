@@ -562,7 +562,8 @@ static int start_diameter(gsup_route_t *route, gsup_parsed_t *req,
     strncpy(s->imsi_str, route->imsi, sizeof(s->imsi_str) - 1);
     s->imsi_str[sizeof(s->imsi_str) - 1] = '\0';
 
-    if (map_plmn_pack_home(g_rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
+    if (map_plmn_pack_home(g_rt->cfg.gsup_local_mcc, g_rt->cfg.gsup_local_mnc,
+                           s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
 
     if (g_rt->cfg.gsup_timeout_ms > 0)

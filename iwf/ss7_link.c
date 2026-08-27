@@ -136,7 +136,7 @@ void ss7_gt_from_digits(const char *digits, uint8_t ssn, ss7_sccp_addr_t *out)
     out->ssn = ssn;
     /* libosmo osmo_sccp_gt.digits[] is a NUL-terminated ASCII digit string
      * (not packed TBCD). Copying TBCD here truncated GTs at embedded 0x00
-     * (e.g. ...00... in 1234567890123) → wire digits like "0900"/"00". */
+     * (a GT with embedded zero digits) → wire digits like "0900"/"00". */
     size_t di = 0;
     for (size_t i = 0; digits[i] && di + 1 < sizeof(out->gt_digits); i++) {
         if (digits[i] < '0' || digits[i] > '9') continue;

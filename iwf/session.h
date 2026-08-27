@@ -154,8 +154,27 @@ uint32_t sess_new_teid(void);
 void sess_touch(sess_t *s);
 const char *sess_state_str(sess_state_t st);
 
-/* Periodic sweep: remove sessions older than timeout_s without activity. */
-void sess_sweep(time_t now, int timeout_s);
+/* Hook invoked just before the sweep removes a timed-out session, so the
+ * caller can answer whatever Gn transaction was still outstanding. */
+typedef void (*sess_timeout_hook_t)(sess_t *s, void *ctx);
+
+/* Periodic sweep.
+ *   idle_timeout_s    - settled sessions (ACTIVE/IDLE) with no activity.
+ *   pending_timeout_s - sessions still waiting on an S4 response; <= 0 makes
+ *                       them follow idle_timeout_s as before. A pending
+ *                       Create-PDP that never gets a Create-Session-Resp
+ *                       otherwise swallows every SGSN retransmission until
+ *                       N3 expires, leaving the subscriber with no answer.
+ *   hook/ctx          - optional, may be NULL.
+ */
+void sess_sweep(time_t now, int idle_timeout_s, int pending_timeout_s,
+                sess_timeout_hook_t hook, void *ctx);
+
+/* True while an unanswered Gn request is outstanding. SESS_WAIT_MB_RESP_INIT
+ * is deliberately excluded: that Modify Bearer follows a Create PDP Response
+ * we already sent, so the SGSN is not waiting and the session must not be
+ * torn down on the short timer. */
+int sess_state_is_pending(sess_state_t st);
 
 /* Iterate over all sessions (for stats / shutdown). */
 typedef void (*sess_iter_fn)(sess_t *s, void *ctx);

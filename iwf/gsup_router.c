@@ -17,7 +17,7 @@ static int parse_plmn_from_imsi(const char *imsi, uint16_t *mcc, uint16_t *mnc)
     *mcc = (uint16_t)(a * 100u + b * 10u + c);
     /* Always return 2-digit MNC here. Callers that need to try 3-digit must
      * call parse_plmn_from_imsi_3digit() separately. This avoids misrouting
-     * 2-digit MNC subscribers (e.g. the home PLMN MNC=12) as 3-digit MNC=12x. */
+     * a 2-digit MNC subscriber as 3-digit. */
     *mnc = (uint16_t)(d * 10u + e);
     return 0;
 }
@@ -103,13 +103,18 @@ int gsup_router_lookup(const iwf_config_t *cfg,
     if (parse_plmn_from_imsi(imsi_digits, &out->mcc, &out->mnc) < 0)
         return -1;
 
-    if (out->mcc != 432) {
+    /* Only IMSIs from our own country are routable here; everything else is
+     * rejected outright. The MCC comes from [gsup_server] local_mcc - never
+     * compile a PLMN into the binary. */
+    uint16_t home_mcc = (uint16_t)atoi(cfg->gsup_local_mcc);
+    if (!home_mcc || out->mcc != home_mcc) {
         out->kind = GSUP_ROUTE_REJECT;
         return 0;
     }
 
-    /* Try 2-digit MNC first, then 3-digit, to correctly handle operators like
-     * the home PLMN (MNC=012, 2-digit) whose IMSI digit[5] is the first MSIN digit. */
+    /* Try 2-digit MNC first, then 3-digit, so a home PLMN with a 2-digit MNC
+     * (whose IMSI digit[5] is already the first MSIN digit) is not misread as
+     * a 3-digit MNC. */
     char mnc_key[4];
     mnc_to_key(out->mnc, mnc_key);
 

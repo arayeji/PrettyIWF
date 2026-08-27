@@ -8,7 +8,7 @@
  * Outbound MAP SCCP addressing includes GT digits (when configured) plus
  * SSN.  Routing indicator is configurable via [map_iwf].sccp_ri:
  *   gt  (default) — RI=GT when a GT is present (osmo-stp GTT).
- *   ssn           — RI=SSN, SSN+GT digits (a roaming partner-style).
+ *   ssn           — RI=SSN, SSN+GT digits (some partners require this).
  * For both modes: never put Point Code in CdPA/CgPA (PCI=0).  The STP
  * receives the message and forwards with its own PC.  M3UA DPC is always
  * set to [stp] remote_pc via MTP-TRANSFER.req (libosmo would otherwise

@@ -18,6 +18,7 @@ typedef struct {
     uint32_t pgw_ipv4;                  /* host order; 0 = FQDN-only/unresolved */
     char     pgw_fqdn[SUBSCR_FQDN_MAX];
     int      alloc_dynamic;
+    int      is_default;                /* ULA default Context-Identifier */
 } subscr_apn_t;
 
 typedef struct subscr_entry {
@@ -80,19 +81,35 @@ static subscr_apn_t *find_apn(subscr_entry_t *e, const char *apn)
             }
         }
     }
-    if (!a && e->n_apns == 1)
-        a = &e->apns[0];
+    /* Single-PGW fallback: when the subscription names exactly one APN that
+     * actually carries PGW information, use it for any requested APN (common
+     * in single-APN labs). Entries without PGW info are cached too - they
+     * record the subscription for the default-APN path - so count only the
+     * useful ones or this would stop firing. */
+    if (!a) {
+        subscr_apn_t *only = NULL;
+        int n_useful = 0;
+        for (uint8_t i = 0; i < e->n_apns; i++) {
+            if (e->apns[i].pgw_ipv4 || e->apns[i].pgw_fqdn[0]) {
+                only = &e->apns[i];
+                n_useful++;
+            }
+        }
+        if (n_useful == 1)
+            a = only;
+    }
     return a;
 }
 
 void subscr_cache_put_pgw(const char *imsi, const char *apn,
                           uint32_t pgw_ipv4, const char *pgw_fqdn,
-                          int alloc_dynamic)
+                          int alloc_dynamic, int is_default)
 {
     if (!imsi || !*imsi || !apn || !*apn)
         return;
-    if (!pgw_ipv4 && (!pgw_fqdn || !*pgw_fqdn))
-        return;     /* nothing useful to remember */
+    /* An entry with neither PGW address nor FQDN is still worth keeping: it
+     * records that the HSS subscribed this IMSI to this APN, which is what
+     * fills in a Create-PDP whose APN IE arrived empty. */
 
     subscr_entry_t *e = find_imsi(imsi);
     if (!e) {
@@ -121,6 +138,7 @@ void subscr_cache_put_pgw(const char *imsi, const char *apn,
 
     a->pgw_ipv4      = pgw_ipv4;
     a->alloc_dynamic = alloc_dynamic;
+    a->is_default    = is_default;
     if (pgw_fqdn) {
         strncpy(a->pgw_fqdn, pgw_fqdn, sizeof(a->pgw_fqdn) - 1);
         a->pgw_fqdn[sizeof(a->pgw_fqdn) - 1] = '\0';
@@ -183,6 +201,9 @@ int subscr_cache_get_pgw(const char *imsi, const char *apn,
     if (!a)
         return 0;
 
+    if (a->alloc_dynamic)
+        return 0;                       /* see subscr_cache.h */
+
     uint32_t ip = a->pgw_ipv4;
     if (!ip && a->pgw_fqdn[0]) {
         ip = subscr_resolve_fqdn_ipv4(a->pgw_fqdn);
@@ -215,6 +236,13 @@ int subscr_cache_get_pgw_mip(const char *imsi, const char *apn,
     subscr_apn_t *a = find_apn(e, apn);
     if (!a || !a->pgw_ipv4)
         return 0;
+    /* PDN-GW-Allocation-Type = DYNAMIC: the HSS is only echoing the PGW that
+     * a previous PDN connection happened to land on, and it is valid solely
+     * for that connection's lifetime (TS 29.272 7.3.44, TS 23.401 5.3.2.1).
+     * A new activation must re-select, so hide it and let pgw_select move on
+     * to DNS. Only a STATIC (subscribed) PGW may be used as-is. */
+    if (a->alloc_dynamic)
+        return 0;
     if (out_pgw_ipv4)
         *out_pgw_ipv4 = a->pgw_ipv4;
     return 1;
@@ -232,9 +260,30 @@ int subscr_cache_get_pgw_fqdn(const char *imsi, const char *apn,
     subscr_apn_t *a = find_apn(e, apn);
     if (!a || !a->pgw_fqdn[0])
         return 0;
+    if (a->alloc_dynamic)
+        return 0;                       /* dynamic: re-select, see above */
     strncpy(out_fqdn, a->pgw_fqdn, fqdn_cap - 1);
     out_fqdn[fqdn_cap - 1] = '\0';
     return 1;
+}
+
+int subscr_cache_get_default_apn(const char *imsi, char *out_apn,
+                                 size_t apn_cap)
+{
+    if (!imsi || !*imsi || !out_apn || apn_cap == 0)
+        return 0;
+    out_apn[0] = 0;
+    subscr_entry_t *e = find_imsi(imsi);
+    if (!e || e->n_apns == 0)
+        return 0;
+    for (uint8_t i = 0; i < e->n_apns; i++) {
+        if (e->apns[i].is_default && e->apns[i].apn[0]) {
+            strncpy(out_apn, e->apns[i].apn, apn_cap - 1);
+            out_apn[apn_cap - 1] = 0;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void subscr_cache_sweep(time_t now, int ttl_s)

@@ -287,7 +287,8 @@ static void handle_begin_sai(struct iwf_runtime *rt,
     /* Visited PLMN: derive from the IMSI MCC+MNC (TS 24.008).  This is a
      * fallback - a future patch can prefer the SCCP CallingParty GT's
      * country code if it differs (roaming-from-home detection). */
-    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mcc, rt->cfg.gsup_local_mnc,
+                           s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
 
     LOGI("map",
@@ -330,7 +331,8 @@ static void handle_begin_ugl(struct iwf_runtime *rt,
     memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
     s->imsi_bcd_len = req.imsi_bcd_len;
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
-    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mcc, rt->cfg.gsup_local_mnc,
+                           s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
 
     LOGI("map",
@@ -368,7 +370,8 @@ static void handle_begin_ul(struct iwf_runtime *rt,
     memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
     s->imsi_bcd_len = req.imsi_bcd_len;
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
-    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mcc, rt->cfg.gsup_local_mnc,
+                           s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
     if (req.msc_number[0])
         snprintf(s->msc_number, sizeof(s->msc_number), "%s", req.msc_number);
@@ -413,7 +416,8 @@ static void handle_begin_purge(struct iwf_runtime *rt,
     memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
     s->imsi_bcd_len = req.imsi_bcd_len;
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
-    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mcc, rt->cfg.gsup_local_mnc,
+                           s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
     LOGI("map",
          "[%s] RX BEGIN PurgeMS tid=0x%08x invoke=%u",
@@ -1052,7 +1056,7 @@ static void handle_abort(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
 }
 
 /* ----- TC dialogue establishment (empty BEGIN) ---------------------- */
-/* Some peers (a roaming partner SMSC/USSD-GW) open the dialogue with an empty
+/* Some peers (some partner SMSC/USSD-GW) open the dialogue with an empty
  * BEGIN (AARQ only) and send the actual invoke in a CONTINUE once we
  * confirm with AARE - used when BEGIN + invoke would not fit one UDT.
  * We accept, remember the peer, and route the deferred invoke to the
@@ -1237,7 +1241,7 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
         if (tmsg.n_components == 0 ||
             tmsg.components[0].kind != TCAP_CMP_KIND_INVOKE) {
             /* Dialogue establishment: AARQ only, invoke follows in a
-             * CONTINUE after we confirm (a roaming partner SMSC/USSD pattern). */
+             * CONTINUE after we confirm (partner SMSC/USSD pattern). */
             handle_empty_begin(rt, calling, &tmsg);
             return;
         }
@@ -1910,9 +1914,15 @@ static void extract_ula_subdata(map_session_t *s,
             ? ((uint32_t)a->pgw_ipv4[0] << 24 | (uint32_t)a->pgw_ipv4[1] << 16 |
                (uint32_t)a->pgw_ipv4[2] << 8  | (uint32_t)a->pgw_ipv4[3])
             : 0;
-        if (pgw || a->pgw_fqdn[0])
-            subscr_cache_put_pgw(s->imsi_str, a->apn, pgw,
-                                 a->pgw_fqdn, a->pgw_alloc_dynamic);
+        /* Cache every subscribed APN, not only the ones carrying PGW info:
+         * the entry doubles as the subscription record that supplies the APN
+         * for a Create-PDP whose APN IE arrived empty. s->ula_apn already
+         * holds the profile default (or ula_apns[0] when the HSS sent no
+         * profile-level Context-Identifier), so reuse that decision here. */
+        int is_default = (s->ula_apn[0] &&
+                          strcasecmp(a->apn, s->ula_apn) == 0);
+        subscr_cache_put_pgw(s->imsi_str, a->apn, pgw,
+                             a->pgw_fqdn, a->pgw_alloc_dynamic, is_default);
     }
 
     if (s->n_ula_apns <= 1) {
@@ -2038,7 +2048,7 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
                     (s->map_op == MAP_OP_UGL && s->n_ula_apns > 0);
     if (s->have_ula_subdata && need_isd) {
 #ifdef GSUP_PROXY_ENABLED
-        /* Outbound roam: a roaming partner MAP UL updates HSS. Do not push GSUP ISD to
+        /* Outbound roam: the partner's MAP UL updates its HSS. Do not push GSUP ISD to
          * home MSC here — OsmoMSC VLR only accepts ISD after its own GSUP
          * UL_REQ (SGs/Iu attach). ISD follows MSC UL in gsup_map_proxy_send_isd. */
         if (s->map_op == MAP_OP_UL && s->msisdn_str[0]) {
@@ -2780,7 +2790,8 @@ int map_iwf_cmd_test_sai(struct iwf_runtime *rt,
     strncpy(s->imsi_str, imsi_digits, sizeof(s->imsi_str) - 1);
     s->imsi_str[sizeof(s->imsi_str) - 1] = '\0';
 
-    if (map_plmn_pack_home(rt->cfg.gsup_local_mnc, s->visited_plmn_bcd) == 0)
+    if (map_plmn_pack_home(rt->cfg.gsup_local_mcc, rt->cfg.gsup_local_mnc,
+                           s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
 
     s->cmd_test = true;

@@ -5,6 +5,7 @@
 #include "logging.h"
 #include "session.h"
 #include "subscr_cache.h"
+#include "pgw_dns.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -50,6 +51,39 @@ static int send_create_pdp_reject(iwf_runtime_t *rt, const iwf_endpoint_t *to,
     if (total > 0)
         return iwf_send_v1(rt, to, outbuf, (size_t)total);
     return -1;
+}
+
+/* Encode and send a bare GTPv1-C response carrying only a Cause IE. */
+static int send_v1_cause(iwf_runtime_t *rt, const iwf_endpoint_t *to,
+                         uint8_t resp_msg_type,
+                         uint32_t sgsn_ctrl_teid, uint16_t seq, uint8_t cause)
+{
+    uint8_t outbuf[IWF_MAX_PKT];
+    gtpv1_enc_t e;
+    gtpv1_enc_init(&e, outbuf, sizeof(outbuf));
+    gtpv1_enc_begin(&e, resp_msg_type, sgsn_ctrl_teid, seq);
+    gtpv1_enc_cause(&e, cause);
+    int total = gtpv1_enc_finish(&e);
+    if (total > 0)
+        return iwf_send_v1(rt, to, outbuf, (size_t)total);
+    return -1;
+}
+
+/* Answer a Gn request that names a PDP context we do not have.
+ *
+ * TS 29.060 requires a response for every request; libgtp's own GGSN path
+ * (gtp_update_pdp_ind / gtp_delete_pdp_ind) answers GTPCAUSE_NON_EXIST when
+ * neither the TEID nor (IMSI, NSAPI) matches. Staying silent instead makes
+ * osmo-sgsn retransmit N3 times at T3 (5 x 5 s of dead air for the UE) and
+ * only then give up, so the subscriber sits with a context that can never
+ * carry traffic. Cause 192 makes the SGSN drop it at once and the UE
+ * reactivate. */
+static int send_v1_non_existent(iwf_runtime_t *rt, const iwf_endpoint_t *to,
+                                uint8_t resp_msg_type,
+                                uint32_t sgsn_ctrl_teid, uint16_t seq)
+{
+    return send_v1_cause(rt, to, resp_msg_type, sgsn_ctrl_teid, seq,
+                         GTPV1_CAUSE_NON_EXISTENT);
 }
 
 static int iwf_send_v2_sess(iwf_runtime_t *rt, const sess_t *s,
@@ -1422,7 +1456,7 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
      *   GTPv1 199 (No Resources)        -> SM 26 (Insufficient resources):
      *       Most modern UEs (Android/iOS) treat this as "network overload"
      *       and tear down the entire PDN — including the working primary —
-     *       then re-attach. Empirically observed on Iranian MCI 432-12 UEs.
+     *       then re-attach. Empirically observed on UEs in the field.
      *
      *   GTPv1 220 (Unknown PDP addr/type) -> SM 28 (Unknown PDP address or
      *       PDP type): Per TS 24.008 §6.1.3.1.5, when received in response
@@ -1542,16 +1576,59 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         gtpv1_decode_teid(ie, &s->sgsn_data_teid);
 
     if (!s->apn[0]) {
-        /* Open5GS SGW-C rejects CSReq without APN (cause 70); answer Gn
-         * immediately instead of burning an S11 transaction. */
-        LOGW("translate",
-             "[%s] Create-PDP has no APN — rejecting (Missing or unknown APN)",
-             imsi);
-        (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
-                                     (uint16_t)v1->seq,
-                                     GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN);
-        sess_remove(s);
-        return 0;
+        /* The MS may omit the APN and leave the choice to the network
+         * (TS 23.060 §9.2.1: the SGSN then supplies the subscribed APN).
+         * OsmoSGSN forwards the empty APN IE verbatim, so fill it in from the
+         * subscription: the APN whose Context-Identifier matched the
+         * APN-Configuration-Profile default in the S6a/S6d Update-Location-
+         * Answer, cached when the ULA was processed.
+         *
+         * The APN is deliberately never taken from local configuration — it
+         * is subscription data and only the HSS is authoritative for it.
+         * Without a ULA for this IMSI we reject, exactly as before: Open5GS
+         * SGW-C answers a CSReq without APN with cause 70 anyway, so there is
+         * nothing to gain from burning an S11 transaction on a guess. */
+        char sub_apn[IWF_APN_MAX] = {0};
+
+        if (subscr_cache_get_default_apn(imsi, sub_apn, sizeof(sub_apn)) &&
+            sub_apn[0]) {
+            iwf_apn_normalize(sub_apn);
+            strncpy(s->apn, sub_apn, sizeof(s->apn) - 1);
+            s->apn[sizeof(s->apn) - 1] = '\0';
+            LOGI("translate",
+                 "[%s] Create-PDP has no APN — using ULA default APN '%s'",
+                 imsi, s->apn);
+
+            /* The duplicate-(IMSI, APN) guard above ran on the empty APN IE
+             * and could not match. Re-check now that we know the APN, or a
+             * no-APN activation would slip past it and make the SMF release
+             * the subscriber's working PDN. 220 is the cause that makes the
+             * MS stop this activation and keep the first PDP (see the guard's
+             * comment for why not 199). */
+            sess_t *dup = sess_find_active_by_imsi_apn_other_nsapi(
+                imsi, s->apn, nsapi);
+            if (dup) {
+                LOGW("translate",
+                     "[%s] substituted APN '%s' duplicates NSAPI %u (%s) — rejecting cause %u",
+                     imsi, s->apn, (unsigned)dup->key.nsapi,
+                     sess_state_str(dup->state),
+                     (unsigned)GTPV1_CAUSE_UNKNOWN_PDP_ADDR_TYPE);
+                (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
+                                             (uint16_t)v1->seq,
+                                             GTPV1_CAUSE_UNKNOWN_PDP_ADDR_TYPE);
+                sess_remove(s);
+                return 0;
+            }
+        } else {
+            LOGW("translate",
+                 "[%s] Create-PDP has no APN and no ULA default APN cached — rejecting (Missing or unknown APN)",
+                 imsi);
+            (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
+                                         (uint16_t)v1->seq,
+                                         GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN);
+            sess_remove(s);
+            return 0;
+        }
     }
     if (!iwf_config_apn_allowed(&rt->cfg, imsi, s->apn)) {
         LOGW("translate",
@@ -1745,7 +1822,12 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     uint8_t pgw_order[IWF_PGW_SELECT_MAX];
     int nsel = iwf_config_pgw_select(&rt->cfg, imsi, pgw_order);
 
-    for (int si = 0; si < nsel && !pgw_ipv4 && !dns_no_records; si++) {
+    /* dns_no_records records that the DNS source was tried and produced
+     * nothing. It no longer stops the loop: a later configured source
+     * (static, smf) is still allowed to supply the PGW. It only decides the
+     * reject cause once the whole chain is exhausted, so a partner whose
+     * pgw_select is dns-only still gets a clean local reject. */
+    for (int si = 0; si < nsel && !pgw_ipv4; si++) {
         switch (pgw_order[si]) {
         case IWF_PGW_SRC_MIP:
             if (subscr_cache_get_pgw_mip(imsi, s->apn, &pgw_ipv4)) {
@@ -1771,20 +1853,43 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             }
             if (!name[0]) {
                 LOGW("translate",
-                     "[%s] pgw_select=dns: no FQDN for apn=%s — rejecting",
+                     "[%s] pgw_select=dns: no FQDN for apn=%s — next source",
                      imsi, s->apn[0] ? s->apn : "(none)");
                 dns_no_records = 1;
                 break;
             }
-            pgw_ipv4 = subscr_resolve_fqdn_ipv4(name);
+            /* TS 23.003 §19.4.2.2 / TS 29.303 §4.3.2: an APN-FQDN is a NAPTR
+             * owner, not an A owner. A partner GpDNS publishes only
+             *   <apn>.apn.epc.mncNNN.mccMMM..  NAPTR "a" "x-3gpp-pgw:x-s8-gtp"
+             *      -> topon.s8.<pgw>.epc.mncNNN.mccMMM..  A  <addr>
+             * so a bare getaddrinfo() on the APN-FQDN gets NXDOMAIN and PGW
+             * selection fails for every spec-compliant partner. Query NAPTR
+             * first, then fall back to a plain A lookup for names that really
+             * are host names (ULA MIP-Home-Agent-Host, mncNNN_pgw_fqdn) and
+             * for locally flattened zones. */
+            {
+                char pgw_host[256] = { 0 };
+                if (pgw_dns_resolve_apn_fqdn(name,
+                                             PGW_DNS_IF_S8 | PGW_DNS_IF_S5,
+                                             &pgw_ipv4, pgw_host,
+                                             sizeof(pgw_host)) && pgw_ipv4) {
+                    pgw_src = "naptr";
+                    snprintf(pgw_fqdn, sizeof(pgw_fqdn), "%s->%s",
+                             name, pgw_host);
+                } else {
+                    pgw_ipv4 = subscr_resolve_fqdn_ipv4(name);
+                    if (pgw_ipv4) {
+                        pgw_src = "dns";
+                        strncpy(pgw_fqdn, name, sizeof(pgw_fqdn) - 1);
+                        pgw_fqdn[sizeof(pgw_fqdn) - 1] = '\0';
+                    }
+                }
+            }
             if (pgw_ipv4) {
                 pgw_teid = 0;
-                pgw_src  = "dns";
-                strncpy(pgw_fqdn, name, sizeof(pgw_fqdn) - 1);
-                pgw_fqdn[sizeof(pgw_fqdn) - 1] = '\0';
             } else {
                 LOGW("translate",
-                     "[%s] pgw_select=dns: no A record for %s — rejecting",
+                     "[%s] pgw_select=dns: no PGW NAPTR and no A record for %s — next source",
                      imsi, name);
                 dns_no_records = 1;
             }
@@ -1827,7 +1932,13 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         }
     }
 
-    if (dns_no_records) {
+    if (!pgw_ipv4 && dns_no_records) {
+        /* Every configured source is exhausted and DNS was one of them, so
+         * there is no PGW to anchor this PDN on. Reject here rather than
+         * sending a Create Session the SGW-C can only fail. */
+        LOGW("translate",
+             "[%s] pgw_select exhausted after DNS miss for apn=%s — rejecting",
+             imsi, s->apn[0] ? s->apn : "(none)");
         (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
                                      (uint16_t)v1->seq,
                                      GTPV1_CAUSE_NO_RESOURCES);
@@ -1964,12 +2075,26 @@ static int translate_update_pdp_context(iwf_runtime_t *rt,
     if (!s && v1->teid) s = sess_find_by_iwf_ctrl_teid(v1->teid);
 
     if (!s) {
+        /* teid==0 together with an IMSI IE is not a fault: libgtp emits the
+         * Update that way whenever the SGSN has no stored GGSN TEID-C for the
+         * context ("Include IMSI if updating with unknown teic_gn", gtp.c;
+         * TS 29.060 7.3.3), and the peer is then expected to key on
+         * (IMSI, NSAPI) - which we tried above. Not finding it means our
+         * session is gone while the SGSN still holds the PDP context, so tell
+         * it instead of dropping the message. */
         LOGW("translate",
-         "[%s] Update PDP Context for unknown session nsapi=%u teid=0x%08x",
+         "[%s] Update PDP Context for unknown session nsapi=%u teid=0x%08x - answering Non-existent",
          imsi,
          nsapi,
          v1->teid);
-        return -1;
+        uint32_t peer_ctrl_teid = 0;
+        const iwf_ie_t *t_ie = gtpv1_find_ie(v1, GTPV1_IE_TEID_CTRL_PLANE);
+        if (t_ie)
+            gtpv1_decode_teid(t_ie, &peer_ctrl_teid);
+        (void)send_v1_non_existent(rt, from,
+                                   GTPV1_UPDATE_PDP_CONTEXT_RESPONSE,
+                                   peer_ctrl_teid, (uint16_t)v1->seq);
+        return 0;
     }
 
     s->sgsn_ep  = *from;
@@ -2030,9 +2155,20 @@ static int translate_delete_pdp_context(iwf_runtime_t *rt,
     if (!s && v1->teid) s = sess_find_by_iwf_ctrl_teid(v1->teid);
 
     if (!s) {
-        LOGW("translate", "Delete PDP Context for unknown session teid=0x%08x",
+        /* Same contract as Update: always answer. A silent drop makes the
+         * SGSN retransmit the Delete N3 times and keep a context we have
+         * already forgotten. */
+        LOGW("translate",
+             "Delete PDP Context for unknown session teid=0x%08x - answering Non-existent",
              v1->teid);
-        return -1;
+        uint32_t peer_ctrl_teid = 0;
+        const iwf_ie_t *t_ie = gtpv1_find_ie(v1, GTPV1_IE_TEID_CTRL_PLANE);
+        if (t_ie)
+            gtpv1_decode_teid(t_ie, &peer_ctrl_teid);
+        (void)send_v1_non_existent(rt, from,
+                                   GTPV1_DELETE_PDP_CONTEXT_RESPONSE,
+                                   peer_ctrl_teid, (uint16_t)v1->seq);
+        return 0;
     }
 
     if (s->state == SESS_WAIT_DS_RESP &&
@@ -2075,6 +2211,63 @@ static int translate_delete_pdp_context(iwf_runtime_t *rt,
     iwf_log_hex("translate", "DSReq", outbuf, (size_t)total);
 
     return iwf_send_v2_sess(rt, s, outbuf, (size_t)total);
+}
+
+void translate_sess_timeout(sess_t *s, void *vrt)
+{
+    iwf_runtime_t *rt = (iwf_runtime_t *)vrt;
+    if (!rt || !s)
+        return;
+
+    /* osmo-sgsn runs T3-RESPONSE with N3-REQUESTS retries on every Gn request
+     * (5 x 5 s by default). While we sit in a *_WAIT_* state with no answer
+     * from SGW-C, translate_create_pdp_context() classifies each retransmit as
+     * a duplicate and drops it, so the subscriber gets nothing at all until
+     * N3 expires. Answer the outstanding transaction instead: cause 204
+     * (System failure) tells the SGSN the activation failed now, and the UE
+     * retries a clean one. */
+    switch (s->state) {
+    case SESS_CREATING:
+    case SESS_WAIT_CS_RESP:
+        LOGW("translate",
+     "[%s] no Create-Session-Resp from SGW-C — answering Gn Create-PDP cause %u",
+     s->key.imsi, (unsigned)GTPV1_CAUSE_SYSTEM_FAILURE);
+        (void)send_v1_cause(rt, &s->sgsn_ep,
+                            GTPV1_CREATE_PDP_CONTEXT_RESPONSE,
+                            s->sgsn_ctrl_teid, s->sgsn_seq,
+                            GTPV1_CAUSE_SYSTEM_FAILURE);
+        break;
+
+    case SESS_MODIFYING:
+    case SESS_WAIT_MB_RESP:
+        LOGW("translate",
+     "[%s] no Modify-Bearer-Resp from SGW-C — answering Gn Update-PDP cause %u",
+     s->key.imsi, (unsigned)GTPV1_CAUSE_SYSTEM_FAILURE);
+        (void)send_v1_cause(rt, &s->sgsn_ep,
+                            GTPV1_UPDATE_PDP_CONTEXT_RESPONSE,
+                            s->sgsn_ctrl_teid, s->sgsn_seq,
+                            GTPV1_CAUSE_SYSTEM_FAILURE);
+        break;
+
+    case SESS_DELETING:
+    case SESS_WAIT_DS_RESP:
+        /* The SGSN asked us to tear the context down and we are dropping it
+         * either way — confirm so it stops retransmitting. */
+        LOGW("translate",
+     "[%s] no Delete-Session-Resp from SGW-C — confirming Gn Delete-PDP",
+     s->key.imsi);
+        (void)send_v1_cause(rt, &s->sgsn_ep,
+                            GTPV1_DELETE_PDP_CONTEXT_RESPONSE,
+                            s->sgsn_ctrl_teid, s->sgsn_seq,
+                            GTPV1_CAUSE_REQUEST_ACCEPTED);
+        break;
+
+    /* SESS_WAIT_MB_RESP_INIT is the activation Modify Bearer we send after
+     * the Create PDP Response has already gone out: nothing is outstanding on
+     * Gn, so stay quiet. Same for settled sessions swept on idle. */
+    default:
+        break;
+    }
 }
 
 int translate_v1_request(iwf_runtime_t *rt,

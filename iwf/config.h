@@ -66,6 +66,18 @@ typedef struct {
     int         pgw_n_select;           /* 1..4 */
     int         pgw_select_explicit;    /* 1 if [iwf] pgw_select was set */
 
+    /* [iwf] pending_timeout_s - answer a Gn transaction stuck waiting on
+     * SGW-C after this many seconds (default 15; the sweep runs every 5 s
+     * so it fires by 20 s, inside osmo-sgsn's N3 x T3 = 25 s budget).
+     * 0 disables. */
+    int         pending_timeout_s;
+
+    /* [iwf] pgw_dns_neg_ttl_s / pgw_dns_timeout_ms - PGW NAPTR discovery
+     * negative-cache TTL and per-query resolver budget (defaults 30 s /
+     * 2000 ms). The positive TTL follows pgw_cache_ttl_s. */
+    int         pgw_dns_neg_ttl_s;
+    int         pgw_dns_timeout_ms;
+
     /* [iwf] pgw_cache_ttl_s — subscription PGW cache invalidation (default 300). */
     int         pgw_cache_ttl_s;
 
@@ -114,7 +126,7 @@ typedef struct {
 #define IWF_MSRN_MAX_POOLS    4
 #define IWF_MSRN_MAX_MSC_MAPS 8
     struct {
-        char     name[16];              /* thr1 / thr2 */
+        char     name[16];              /* msc1 / msc2 */
         char     start[20];             /* inclusive E.164 digits */
         char     end[20];
     } map_msrn_pools[IWF_MSRN_MAX_POOLS];
@@ -175,8 +187,13 @@ typedef struct {
 #define GSUP_MAX_LISTEN_IPS 8
     char        gsup_listen_ips[GSUP_MAX_LISTEN_IPS][64];
     int         gsup_n_listen_ips;
-    char        gsup_local_mcc[4];        /* visited/home MCC digits, default 432 */
-    char        gsup_local_mnc[4];        /* visited PLMN MNC digits, default 012 */
+    /* [gsup_server] local_mcc - home MCC digits. There is no real default:
+     * the placeholder is the ITU-T test MCC, and GSUP routing rejects every
+     * IMSI until this is set to the operator's own MCC. */
+    char        gsup_local_mcc[4];
+    int         gsup_local_mcc_set;       /* 1 when local_mcc was configured */
+    /* [gsup_server] local_mnc - home MNC digits; placeholder like local_mcc. */
+    char        gsup_local_mnc[4];
     /* Local (home) subscriber IMSI prefixes — MCC+MNC etc. Used for APN
      * form: home → bare NI; everyone else → NI.mncXXX.mccYYY.gprs.
      * Empty list → fall back to matching [gsup_server] local_mcc/local_mnc. */

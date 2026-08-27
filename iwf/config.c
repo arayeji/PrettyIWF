@@ -46,6 +46,9 @@ static void defaults(iwf_config_t *c)
     c->pgw_n_select = 4;
     c->pgw_select_explicit = 0;
     c->pgw_cache_ttl_s = 300;
+    c->pending_timeout_s = 15;
+    c->pgw_dns_neg_ttl_s = 30;
+    c->pgw_dns_timeout_ms = 2000;
 
     strncpy(c->map_cmd_sock_path, "/tmp/iwf_cmd.sock", sizeof(c->map_cmd_sock_path) - 1);
     c->map_cmd_sock_path[sizeof(c->map_cmd_sock_path) - 1] = '\0';
@@ -72,8 +75,11 @@ static void defaults(iwf_config_t *c)
 
     c->gsup_server_enabled = 0;
     c->gsup_listen_port      = 4222;
-    snprintf(c->gsup_local_mcc, sizeof(c->gsup_local_mcc), "432");
-    snprintf(c->gsup_local_mnc, sizeof(c->gsup_local_mnc), "012");
+    /* ITU-T E.212 test PLMN placeholders - a deployment must set
+     * [gsup_server] local_mcc / local_mnc to its own values. */
+    snprintf(c->gsup_local_mcc, sizeof(c->gsup_local_mcc), "001");
+    snprintf(c->gsup_local_mnc, sizeof(c->gsup_local_mnc), "01");
+    c->gsup_local_mcc_set = 0;
     c->gsup_timeout_ms       = 10000;
     c->gsup_cs_backend       = GSUP_BACKEND_DIAMETER;
     c->gsup_ps_backend       = GSUP_BACKEND_DIAMETER;
@@ -530,6 +536,19 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             } else if (!strcmp(key, "pgw_cache_ttl_s")) {
                 int ttl = atoi(val);
                 out->pgw_cache_ttl_s = (ttl > 0) ? ttl : 300;
+            } else if (!strcmp(key, "default_apn")) {
+                LOGW("config",
+                     "[iwf].default_apn ignored: the default APN is "
+                     "subscription data and is taken from the S6a/S6d ULA");
+            } else if (!strcmp(key, "pending_timeout_s")) {
+                int t = atoi(val);
+                out->pending_timeout_s = (t >= 0) ? t : 15;
+            } else if (!strcmp(key, "pgw_dns_neg_ttl_s")) {
+                int t = atoi(val);
+                out->pgw_dns_neg_ttl_s = (t > 0) ? t : 30;
+            } else if (!strcmp(key, "pgw_dns_timeout_ms")) {
+                int t = atoi(val);
+                out->pgw_dns_timeout_ms = (t > 0) ? t : 2000;
             } else LOGW("config", "unknown key [iwf].%s", key);
         } else if (!strcmp(section, "sgsn")) {
             if      (!strcmp(key, "ip"))   copy_str(out->sgsn_ip, sizeof(out->sgsn_ip), val);
@@ -697,7 +716,10 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "listen_port"))    out->gsup_listen_port = (uint16_t)atoi(val);
             else if (!strcmp(key, "listen_ip"))      gsup_listen_ip_add(out, val);
             else if (!strcmp(key, "listen_ips"))     gsup_listen_ips_split(out, val);
-            else if (!strcmp(key, "local_mcc"))      copy_str(out->gsup_local_mcc, sizeof(out->gsup_local_mcc), val);
+            else if (!strcmp(key, "local_mcc")) {
+                copy_str(out->gsup_local_mcc, sizeof(out->gsup_local_mcc), val);
+                out->gsup_local_mcc_set = 1;
+            }
             else if (!strcmp(key, "local_mnc"))      copy_str(out->gsup_local_mnc, sizeof(out->gsup_local_mnc), val);
             else if (!strcmp(key, "home_imsi_prefix") ||
                      !strcmp(key, "local_imsi_prefix"))
@@ -760,6 +782,15 @@ int iwf_config_load(const char *path, iwf_config_t *out)
 
     if (out->local_ip[0] == '\0' && strcmp(out->listen_ip, "0.0.0.0") != 0) {
         copy_str(out->local_ip, sizeof(out->local_ip), out->listen_ip);
+    }
+
+    /* The home PLMN is never compiled in. Without [gsup_server] local_mcc
+     * the placeholder test MCC stays in force and gsup_router_lookup()
+     * rejects every IMSI, so say so loudly rather than failing silently. */
+    if (out->gsup_server_enabled && !out->gsup_local_mcc_set) {
+        LOGE("config",
+             "[gsup_server] local_mcc is not set - using placeholder %s; GSUP routing will reject every IMSI until you set your home MCC",
+             out->gsup_local_mcc);
     }
 
     /* Legacy pgw_from_subscription=0 without explicit pgw_select: skip ULA MIP. */
@@ -1078,9 +1109,9 @@ int iwf_config_visited_plmn(const iwf_config_t *cfg,
         return -1;
     if (!cfg->gsup_local_mnc[0])
         return -1;
-    *mcc = cfg->gsup_local_mcc[0]
-               ? (uint16_t)atoi(cfg->gsup_local_mcc)
-               : (uint16_t)432;
+    if (!cfg->gsup_local_mcc[0])
+        return -1;
+    *mcc = (uint16_t)atoi(cfg->gsup_local_mcc);
     *mnc = (uint16_t)atoi(cfg->gsup_local_mnc);
     return 0;
 }

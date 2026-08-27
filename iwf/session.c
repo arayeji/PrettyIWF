@@ -251,19 +251,42 @@ const char *sess_state_str(sess_state_t st)
     return "?";
 }
 
-void sess_sweep(time_t now, int timeout_s)
+int sess_state_is_pending(sess_state_t st)
+{
+    switch (st) {
+    case SESS_CREATING:
+    case SESS_WAIT_CS_RESP:
+    case SESS_MODIFYING:
+    case SESS_WAIT_MB_RESP:
+    case SESS_DELETING:
+    case SESS_WAIT_DS_RESP:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+void sess_sweep(time_t now, int idle_timeout_s, int pending_timeout_s,
+                sess_timeout_hook_t hook, void *ctx)
 {
     sess_t *s, *tmp;
     HASH_ITER(hh, g_by_key, s, tmp) {
-        if ((now - s->last_activity) > timeout_s) {
-            LOGW("session",
-         "[%s] timeout nsapi=%u state=%s idle=%lds",
-         s->key.imsi,
-         s->key.nsapi,
-         sess_state_str(s->state),
-         (long)(now - s->last_activity));
-            sess_remove(s);
-        }
+        int pending = sess_state_is_pending(s->state);
+        int limit = (pending && pending_timeout_s > 0) ? pending_timeout_s
+                                                       : idle_timeout_s;
+        if ((now - s->last_activity) <= limit)
+            continue;
+        LOGW("session",
+     "[%s] timeout nsapi=%u state=%s idle=%lds (%s limit %ds)",
+     s->key.imsi,
+     s->key.nsapi,
+     sess_state_str(s->state),
+     (long)(now - s->last_activity),
+     pending ? "pending" : "idle",
+     limit);
+        if (hook)
+            hook(s, ctx);
+        sess_remove(s);
     }
 }
 

@@ -99,10 +99,13 @@ int map_plmn_pack(uint16_t mcc, uint16_t mnc, uint8_t out[3])
     return 0;
 }
 
-int map_plmn_pack_home(const char *mnc_digits, uint8_t out[3])
+int map_plmn_pack_home(const char *mcc_digits, const char *mnc_digits,
+                       uint8_t out[3])
 {
-    if (!mnc_digits || !out) return -1;
-    return map_plmn_pack(432, (uint16_t)atoi(mnc_digits), out);
+    if (!mcc_digits || !*mcc_digits || !mnc_digits || !*mnc_digits || !out)
+        return -1;
+    return map_plmn_pack((uint16_t)atoi(mcc_digits),
+                         (uint16_t)atoi(mnc_digits), out);
 }
 
 int map_plmn_to_diam_realm(uint16_t mcc, uint16_t mnc, char *out, size_t cap)

@@ -33,12 +33,14 @@ void subscr_cache_shutdown(void);
 void subscr_cache_set_ttl(int ttl_s);
 int  subscr_cache_get_ttl(void);
 
-/* Upsert the PGW selection for (imsi, apn) learned from HSS subscription
- * data. pgw_ipv4 is host byte order (0 when the HSS sent only an FQDN).
- * pgw_fqdn may be NULL/empty. alloc_dynamic: 1 = dynamic (DNS), 0 = static. */
+/* Upsert one subscribed APN for an IMSI, as learned from HSS subscription
+ * data. pgw_ipv4 is host byte order (0 when the HSS sent only an FQDN, or
+ * none at all). pgw_fqdn may be NULL/empty. alloc_dynamic: 1 = dynamic (DNS),
+ * 0 = static. is_default marks the APN-Configuration whose Context-Identifier
+ * equals the APN-Configuration-Profile default (TS 29.272 7.3.61). */
 void subscr_cache_put_pgw(const char *imsi, const char *apn,
                           uint32_t pgw_ipv4, const char *pgw_fqdn,
-                          int alloc_dynamic);
+                          int alloc_dynamic, int is_default);
 
 /* Look up the PGW for (imsi, apn). On success returns 1 and sets
  * *out_pgw_ipv4 (host order, non-zero). When the stored entry holds only an
@@ -51,7 +53,14 @@ int  subscr_cache_get_pgw(const char *imsi, const char *apn,
                           char *out_fqdn, size_t fqdn_cap,
                           int *out_alloc_dynamic);
 
-/* MIP path: return stored MIP-Home-Agent-Address IPv4 only (no DNS). */
+/* MIP path: return the stored MIP-Home-Agent-Address IPv4 only (no DNS).
+ *
+ * Returns 0 when the HSS marked the APN's PDN-GW-Allocation-Type as DYNAMIC:
+ * such an address is the PGW a previous PDN connection was allocated and is
+ * only valid while that connection lives (TS 29.272 7.3.44, TS 23.401
+ * 5.3.2.1), so a new activation must re-select via DNS. Only a STATIC
+ * (subscribed) PGW may be taken from subscription data. The same rule applies
+ * to subscr_cache_get_pgw_fqdn() and subscr_cache_get_pgw(). */
 int  subscr_cache_get_pgw_mip(const char *imsi, const char *apn,
                               uint32_t *out_pgw_ipv4);
 
@@ -59,6 +68,14 @@ int  subscr_cache_get_pgw_mip(const char *imsi, const char *apn,
  * a non-empty FQDN is present. */
 int  subscr_cache_get_pgw_fqdn(const char *imsi, const char *apn,
                                char *out_fqdn, size_t fqdn_cap);
+
+/* Default-APN path: copy the subscriber's default APN, i.e. the APN whose
+ * Context-Identifier matched the APN-Configuration-Profile default in the
+ * S6a/S6d Update-Location-Answer. Used to fill in a Create-PDP whose APN IE
+ * the SGSN sent empty. Returns 0 when this IMSI has no ULA-derived default,
+ * so the caller rejects rather than guessing. Returns 1 on hit. */
+int  subscr_cache_get_default_apn(const char *imsi, char *out_apn,
+                                  size_t apn_cap);
 
 /* Evict entries not refreshed within ttl_s seconds. If ttl_s <= 0, uses the
  * TTL from subscr_cache_set_ttl(). */

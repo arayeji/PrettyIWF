@@ -30,6 +30,11 @@ int translate_v2_response(struct iwf_runtime *rt,
                           const iwf_endpoint_t *from,
                           const iwf_msg_t *v2);
 
+/* sess_sweep hook: answer the Gn transaction a timed-out session still owes
+ * osmo-sgsn, so a silent SGW-C never leaves the SGSN retransmitting. ctx is
+ * the iwf_runtime_t*. */
+void translate_sess_timeout(sess_t *s, void *ctx);
+
 /* Context-transfer pending lookup for IMSI trace (SGSN Context / Context Req). */
 int translate_ctx_trace_imsi_by_gn_seq(uint16_t gn_seq, char *imsi, size_t cap);
 int translate_ctx_trace_imsi_by_v2_seq(uint32_t v2_seq24, char *imsi, size_t cap);

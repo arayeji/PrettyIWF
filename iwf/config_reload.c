@@ -8,6 +8,7 @@
 #include "imsi_trace.h"
 #include "msrn_pool.h"
 #include "subscr_cache.h"
+#include "pgw_dns.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -144,6 +145,8 @@ int iwf_config_reload(iwf_runtime_t *rt)
 
     iwf_log_set_level(iwf_log_level_from_str(nc.log_level));
     subscr_cache_set_ttl(nc.pgw_cache_ttl_s);
+    pgw_dns_set_ttl(nc.pgw_cache_ttl_s, nc.pgw_dns_neg_ttl_s);
+    pgw_dns_set_timeout_ms(nc.pgw_dns_timeout_ms);
     iwf_imsi_trace_load_config(nc.trace_imsi);
 
     if (!msrn_cfg_equal(old, &nc)) {

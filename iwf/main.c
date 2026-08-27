@@ -19,6 +19,7 @@
 #include "gtpv2.h"
 #include "session.h"
 #include "subscr_cache.h"
+#include "pgw_dns.h"
 #include "translate.h"
 #include "map_iwf.h"
 #include "test_cmd.h"
@@ -278,6 +279,8 @@ int main(int argc, char **argv)
     sess_init();
     subscr_cache_init();
     subscr_cache_set_ttl(rt.cfg.pgw_cache_ttl_s);
+    pgw_dns_set_ttl(rt.cfg.pgw_cache_ttl_s, rt.cfg.pgw_dns_neg_ttl_s);
+    pgw_dns_set_timeout_ms(rt.cfg.pgw_dns_timeout_ms);
 
     /* Resolve local IPv4 (network order) for GTP F-TEID / GSN Address IEs. */
     if (rt.cfg.local_ip[0]) {
@@ -491,8 +494,11 @@ int main(int argc, char **argv)
                 uint64_t exp;
                 ssize_t r = read(tfd, &exp, sizeof(exp));
                 (void)r;
-                sess_sweep(time(NULL), IWF_SESSION_TIMEOUT_S);
+                sess_sweep(time(NULL), IWF_SESSION_TIMEOUT_S,
+                           rt.cfg.pending_timeout_s,
+                           translate_sess_timeout, &rt);
                 subscr_cache_sweep(time(NULL), rt.cfg.pgw_cache_ttl_s);
+                pgw_dns_cache_sweep(time(NULL));
                 break;
             }
             case MAP_EPOLL_ROLE_SS7:
@@ -575,6 +581,7 @@ int main(int argc, char **argv)
     close(rt.v1_sock);
     sess_shutdown();
     subscr_cache_shutdown();
+    pgw_dns_shutdown();
     iwf_log_close();
     return 0;
 }

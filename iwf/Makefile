@@ -36,15 +36,17 @@ CFLAGS  += -fno-builtin-atoi -fno-builtin-strtol -fno-builtin-strtoul \
            -fno-builtin-sscanf
 LDFLAGS ?=
 LDLIBS  ?=
+# res_ninit/res_nquery/ns_parserr for PGW NAPTR discovery (pgw_dns.c).
+LDLIBS  += -lresolv
 
 # Source set: GTP IWF (always built) + MAP IWF translation units (always
 # compiled; SS7 backend is conditional via -DMAP_IWF_WITH_OSMO_SIGTRAN).
 SRCS    := main.c gtpv1.c gtpv2.c session.c translate.c config.c config_reload.c logging.c \
-           subscr_cache.c imsi_trace.c gtp_trace.c metrics_http.c \
+           subscr_cache.c pgw_dns.c imsi_trace.c gtp_trace.c metrics_http.c \
            map_iwf.c map_session.c tcap.c map_codec.c diameter.c ss7_link.c \
            test_cmd.c msrn_pool.c
 HDRS    := iwf.h gtpv1.h gtpv2.h session.h translate.h config.h logging.h \
-           runtime.h uthash.h subscr_cache.h imsi_trace.h gtp_trace.h metrics_http.h \
+           runtime.h uthash.h subscr_cache.h pgw_dns.h imsi_trace.h gtp_trace.h metrics_http.h \
            map_iwf.h map_iwf_priv.h map_session.h tcap.h map_codec.h \
            diameter.h ss7_link.h test_cmd.h msrn_pool.h
 
