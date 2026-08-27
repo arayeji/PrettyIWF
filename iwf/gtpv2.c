@@ -435,11 +435,11 @@ static int gtpv2_enc_uli_tai_ecgi(gtpv2_enc_t *e, const uint8_t plmn[3],
     v[5] = (uint8_t)(tac & 0xff);
     memcpy(v + 6, plmn, 3);
     /* ECI: 28-bit in 4 octets, high nibble of first octet spare=0 */
-    uint32_t e = eci & 0x0fffffff;
-    v[9]  = (uint8_t)((e >> 24) & 0x0f);
-    v[10] = (uint8_t)((e >> 16) & 0xff);
-    v[11] = (uint8_t)((e >> 8) & 0xff);
-    v[12] = (uint8_t)(e & 0xff);
+    uint32_t eci28 = eci & 0x0fffffff;
+    v[9]  = (uint8_t)((eci28 >> 24) & 0x0f);
+    v[10] = (uint8_t)((eci28 >> 16) & 0xff);
+    v[11] = (uint8_t)((eci28 >> 8) & 0xff);
+    v[12] = (uint8_t)(eci28 & 0xff);
     return gtpv2_enc_tlv(e, GTPV2_IE_ULI, 0, v, sizeof(v));
 }
 
