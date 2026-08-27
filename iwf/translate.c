@@ -1650,29 +1650,59 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         have_imsi_plmn = 1;
     }
 
-    /* ULI — when rat_type is EUTRAN (Open5GS default), encode TAI+ECGI.
+    /* ULI — when rat_type is EUTRAN, encode TAI+ECGI with configured gateway
+     * TAC/ECI (Gn RAI LAC/RAC is always dummy from OsmoSGSN).
      * Home PGWs reject RAI-only ULI with cause 69 (offending IE=ULI).
-     * Cache RAI/PLMN so Modify Bearer can replay the same form. */
-    if ((ie = gtpv1_find_ie(v1, GTPV1_IE_RAI)) && ie->length >= 6) {
-        memcpy(s->uli_rai6, ie->value, 6);
-        s->uli_kind = 1;
-        if (gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, ie->value, 0, 0) != 0)
-            LOGW("translate", "encoding ULI from RAI failed");
-    } else if (rt->cfg.synthetic_uli_no_rai && have_imsi_plmn) {
-        s->uli_kind = 2;
-        s->uli_mcc  = mcc_imsi;
-        s->uli_mnc  = mnc_imsi;
-        if (gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, NULL,
-                                  mcc_imsi, mnc_imsi) != 0)
-            LOGW("translate", "encoding synthetic ULI failed");
-        else
-            LOGI("translate",
-                 "encoded synthetic ULI (Gn had no RAI; synthetic_uli_no_rai=1) mcc=%u mnc=%u",
-                 (unsigned)mcc_imsi, (unsigned)mnc_imsi);
-    } else {
-        LOGW("translate",
-             "Create PDP has no RAI IE — Create Session may be rejected (e.g. gtpv2 cause 103); "
-             "enable [iwf] synthetic_uli_no_rai=1 for lab emulators that omit RAI");
+     * PLMN in TAI matches visited Serving Network when configured. */
+    {
+        uint16_t uli_mcc = 0, uli_mnc = 0;
+        if (iwf_config_visited_plmn(&rt->cfg, &uli_mcc, &uli_mnc) != 0 &&
+            have_imsi_plmn) {
+            uli_mcc = mcc_imsi;
+            uli_mnc = mnc_imsi;
+        }
+
+        if ((ie = gtpv1_find_ie(v1, GTPV1_IE_RAI)) && ie->length >= 6) {
+            memcpy(s->uli_rai6, ie->value, 6);
+            s->uli_kind = 1;
+            if (uli_mcc == 0) {
+                /* Fall back to RAI PLMN if visited PLMN unset. */
+                s->uli_mcc = 0;
+                s->uli_mnc = 0;
+            } else {
+                s->uli_mcc = uli_mcc;
+                s->uli_mnc = uli_mnc;
+            }
+            if (gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, ie->value,
+                                      uli_mcc, uli_mnc,
+                                      rt->cfg.uli_tac, rt->cfg.uli_eci) != 0)
+                LOGW("translate", "encoding ULI from RAI failed");
+            else if (rt->cfg.rat_type == GTPV2_RAT_EUTRAN ||
+                     rt->cfg.rat_type == GTPV2_RAT_WLAN)
+                LOGI("translate",
+                     "ULI EUTRAN TAI+ECGI flags=0x18 tac=0x%04x eci=0x%x "
+                     "mcc=%u mnc=%u (gateway; Gn RAI not mapped)",
+                     (unsigned)rt->cfg.uli_tac, (unsigned)rt->cfg.uli_eci,
+                     (unsigned)uli_mcc, (unsigned)uli_mnc);
+        } else if (rt->cfg.synthetic_uli_no_rai && have_imsi_plmn) {
+            s->uli_kind = 2;
+            s->uli_mcc  = uli_mcc ? uli_mcc : mcc_imsi;
+            s->uli_mnc  = uli_mcc ? uli_mnc : mnc_imsi;
+            if (gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, NULL,
+                                      s->uli_mcc, s->uli_mnc,
+                                      rt->cfg.uli_tac, rt->cfg.uli_eci) != 0)
+                LOGW("translate", "encoding synthetic ULI failed");
+            else
+                LOGI("translate",
+                     "encoded synthetic ULI (Gn had no RAI; synthetic_uli_no_rai=1) "
+                     "mcc=%u mnc=%u tac=0x%04x eci=0x%x",
+                     (unsigned)s->uli_mcc, (unsigned)s->uli_mnc,
+                     (unsigned)rt->cfg.uli_tac, (unsigned)rt->cfg.uli_eci);
+        } else {
+            LOGW("translate",
+                 "Create PDP has no RAI IE — Create Session may be rejected (e.g. gtpv2 cause 103); "
+                 "enable [iwf] synthetic_uli_no_rai=1 for lab emulators that omit RAI");
+        }
     }
 
     /* Serving Network = visited PLMN (the home PLMN), not the IMSI home PLMN.
@@ -2095,9 +2125,13 @@ static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
 
     /* User Location Information — same RAT-aware form as Create Session. */
     if (s->uli_kind == 1) {
-        gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, s->uli_rai6, 0, 0);
+        gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, s->uli_rai6,
+                              s->uli_mcc, s->uli_mnc,
+                              rt->cfg.uli_tac, rt->cfg.uli_eci);
     } else if (s->uli_kind == 2) {
-        gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, NULL, s->uli_mcc, s->uli_mnc);
+        gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, NULL,
+                              s->uli_mcc, s->uli_mnc,
+                              rt->cfg.uli_tac, rt->cfg.uli_eci);
     }
 
     /* Sender F-TEID = S11 MME GTP-C (same peer identity as Create Session). */

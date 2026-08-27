@@ -457,25 +457,24 @@ int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc)
 
 int gtpv2_enc_uli_for_rat(gtpv2_enc_t *e, uint8_t rat_type,
                           const uint8_t *rai6_or_null,
-                          uint16_t mcc, uint16_t mnc)
+                          uint16_t mcc, uint16_t mnc,
+                          uint16_t tac, uint32_t eci)
 {
-    /* EUTRAN (6) / WLAN (3): home PGWs require TAI (often + ECGI), not RAI. */
+    /* EUTRAN (6) / WLAN (3): home PGWs require TAI+ECGI, not RAI.
+     * Do not map TAC/ECI from Gn RAI — OsmoSGSN always sends LAC=0xfffe/RAC=0xff. */
     if (rat_type == GTPV2_RAT_EUTRAN || rat_type == GTPV2_RAT_WLAN) {
         uint8_t plmn[3];
-        uint16_t tac = 1;
-        uint32_t eci = 1;
-        if (rai6_or_null) {
+        if (mcc != 0) {
+            mccmnc_encode(mcc, mnc, plmn);
+        } else if (rai6_or_null) {
             memcpy(plmn, rai6_or_null, 3);
-            tac = (uint16_t)((rai6_or_null[3] << 8) | rai6_or_null[4]);
-            /* Avoid reserved/broadcast LAC 0xfffe as TAC. */
-            if (tac == 0 || tac == 0xffff || tac == 0xfffe)
-                tac = 1;
-            eci = (uint32_t)rai6_or_null[5];
-            if (eci == 0 || eci == 0xff)
-                eci = 1;
         } else {
             mccmnc_encode(mcc, mnc, plmn);
         }
+        if (tac == 0)
+            tac = 0xc350;
+        if (eci == 0)
+            eci = 1;
         return gtpv2_enc_uli_tai_ecgi(e, plmn, tac, eci);
     }
 

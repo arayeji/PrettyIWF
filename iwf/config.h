@@ -11,6 +11,10 @@ typedef struct {
     char        local_ip[64];     /* IWF source IP for S4 (defaults to listen_ip) */
     int         synthetic_uli_no_rai; /* lab: build ULI from IMSI PLMN if Gn omits RAI */
     uint8_t     rat_type;         /* GTPv2 RAT Type sent in Create Session Request */
+    /* Gateway TAI/ECGI for EUTRAN ULI when Gn RAI is dummy (0xfffe/0xff).
+     * Defaults: tac=0xc350 (MME-accepted roaming TAC), eci=1. */
+    uint16_t    uli_tac;
+    uint32_t    uli_eci;
 
     /* [sgsn] - osmo-sgsn Gn GTP-C (Context Request / inter-SGSN transfer) */
     char        sgsn_ip[64];

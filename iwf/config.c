@@ -2,6 +2,7 @@
 #include "logging.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -28,6 +29,14 @@ static void defaults(iwf_config_t *c)
     strncpy(c->metrics_listen_ip, "127.0.0.1", sizeof(c->metrics_listen_ip) - 1);
     c->metrics_listen_port = 9090;
     c->synthetic_uli_no_rai = 0;
+    /* Open5GS SMF only accepts EUTRAN (6) and WLAN (3); UTRAN (1) is rejected
+     * with "Unknown RAT Type" -> SGW-C surfaces it as GTP cause 70.
+     * Default to EUTRAN so the IWF works against vanilla Open5GS out of the box. */
+    c->rat_type = 6;
+    /* Gn RAI is always LAC=0xfffe/RAC=0xff from OsmoSGSN — not a real cell.
+     * Emit a fixed gateway TAI/ECGI for EUTRAN (MME-accepted roaming TAC). */
+    c->uli_tac = 0xc350;
+    c->uli_eci = 1;
     /* Prefer the HSS-advertised PGW (ULA MIP6-Agent-Info) over static [smf]. */
     c->pgw_from_subscription = 1;
     c->pgw_select[0] = IWF_PGW_SRC_MIP;
@@ -37,10 +46,6 @@ static void defaults(iwf_config_t *c)
     c->pgw_n_select = 4;
     c->pgw_select_explicit = 0;
     c->pgw_cache_ttl_s = 300;
-    /* Open5GS SMF only accepts EUTRAN (6) and WLAN (3); UTRAN (1) is rejected
-     * with "Unknown RAT Type" -> SGW-C surfaces it as GTP cause 70.
-     * Default to EUTRAN so the IWF works against vanilla Open5GS out of the box. */
-    c->rat_type = 6;
 
     strncpy(c->map_cmd_sock_path, "/tmp/iwf_cmd.sock", sizeof(c->map_cmd_sock_path) - 1);
     c->map_cmd_sock_path[sizeof(c->map_cmd_sock_path) - 1] = '\0';
@@ -507,7 +512,14 @@ int iwf_config_load(const char *path, iwf_config_t *out)
                 out->synthetic_uli_no_rai = (atoi(val) != 0);
             else if (!strcmp(key, "rat_type"))
                 out->rat_type = parse_rat_type(val);
-            else if (!strcmp(key, "pgw_from_subscription"))
+            else if (!strcmp(key, "uli_tac"))
+                out->uli_tac = (uint16_t)strtoul(val, NULL, 0);
+            else if (!strcmp(key, "uli_eci"))
+                out->uli_eci = (uint32_t)strtoul(val, NULL, 0);
+            else if (!strcmp(key, "home_imsi_prefix") ||
+                       !strcmp(key, "local_imsi_prefix")) {
+                home_imsi_prefix_add(out, val);
+            } else if (!strcmp(key, "pgw_from_subscription"))
                 out->pgw_from_subscription = (atoi(val) != 0);
             else if (!strcmp(key, "pgw_select")) {
                 int n = parse_pgw_select(val, out->pgw_select);
@@ -518,9 +530,6 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             } else if (!strcmp(key, "pgw_cache_ttl_s")) {
                 int ttl = atoi(val);
                 out->pgw_cache_ttl_s = (ttl > 0) ? ttl : 300;
-            } else if (!strcmp(key, "home_imsi_prefix") ||
-                       !strcmp(key, "local_imsi_prefix")) {
-                home_imsi_prefix_add(out, val);
             } else LOGW("config", "unknown key [iwf].%s", key);
         } else if (!strcmp(section, "sgsn")) {
             if      (!strcmp(key, "ip"))   copy_str(out->sgsn_ip, sizeof(out->sgsn_ip), val);
@@ -798,13 +807,15 @@ void iwf_config_dump(const iwf_config_t *c)
     }
 
     LOGI("config",
-         "file=%s listen=%s:%u local_ip=%s rat_type=%u synthetic_uli_no_rai=%d "
+         "file=%s listen=%s:%u local_ip=%s rat_type=%u uli_tac=0x%04x uli_eci=0x%x "
+         "synthetic_uli_no_rai=%d "
          "sgsn=%s:%u mme=%s:%u sgwc=%s:%u smf=%s teid=%u "
          "pgw_select=%s pgw_cache_ttl_s=%d log=%s/%s",
          c->cfg_path[0] ? c->cfg_path : "-",
          c->listen_ip, c->listen_port,
          c->local_ip[0] ? c->local_ip : "(unset)",
-         (unsigned)c->rat_type, c->synthetic_uli_no_rai,
+         (unsigned)c->rat_type, (unsigned)c->uli_tac, (unsigned)c->uli_eci,
+         c->synthetic_uli_no_rai,
          c->sgsn_ip, (unsigned)c->sgsn_port,
          c->mme_ip, (unsigned)c->mme_port,
          c->sgwc_ip, c->sgwc_port,
