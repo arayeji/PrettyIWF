@@ -1337,7 +1337,7 @@ static int send_orphan_delete_session_req(iwf_runtime_t *rt,
     gtpv2_enc_begin(&e, GTPV2_DELETE_SESSION_REQUEST,
                     sgwc_ctrl_teid, ++rt->v2_seq);
     gtpv2_enc_ebi(&e, 0, nsapi);
-    gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00);
+    gtpv2_enc_indication(&e, 0x40, 0x00, 0x00, 0x00);
 
     int total = gtpv2_enc_finish(&e);
     if (total <= 0) return -1;
@@ -1650,20 +1650,20 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         have_imsi_plmn = 1;
     }
 
-    /* ULI (RAI) — Open5GS SGW-C often requires this for UTRAN (GTPv2 cause 103
-     * "Conditional IE missing" if absent). Map from GTPv1 RAI TV IE. Cache the
-     * 6-octet RAI on the session so the activation Modify Bearer Req can
-     * replay the same ULI (Open5GS rejects MBReq without ULI as cause 70). */
+    /* ULI — when rat_type is EUTRAN (Open5GS default), encode TAI+ECGI.
+     * Home PGWs reject RAI-only ULI with cause 69 (offending IE=ULI).
+     * Cache RAI/PLMN so Modify Bearer can replay the same form. */
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_RAI)) && ie->length >= 6) {
         memcpy(s->uli_rai6, ie->value, 6);
         s->uli_kind = 1;
-        if (gtpv2_enc_uli_from_v1_rai(&e, ie->value) != 0)
+        if (gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, ie->value, 0, 0) != 0)
             LOGW("translate", "encoding ULI from RAI failed");
     } else if (rt->cfg.synthetic_uli_no_rai && have_imsi_plmn) {
         s->uli_kind = 2;
         s->uli_mcc  = mcc_imsi;
         s->uli_mnc  = mnc_imsi;
-        if (gtpv2_enc_uli_synthetic_plmn(&e, mcc_imsi, mnc_imsi) != 0)
+        if (gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, NULL,
+                                  mcc_imsi, mnc_imsi) != 0)
             LOGW("translate", "encoding synthetic ULI failed");
         else
             LOGI("translate",
@@ -1690,9 +1690,9 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
      * EUTRAN (6) / WLAN (3). Default of 6 is set in config defaults. */
     gtpv2_enc_rat_type(&e, rt->cfg.rat_type);
 
-    /* Indication flags: hi=DAF | DTF | HI | ... (TS 29.274 §8.12). Set DTF
-     * (bit 5 of octet 2) to advertise Direct Tunnel support. */
-    gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00);
+    /* Indication flags (TS 29.274 §8.12): octet1 bit7=DTF (Direct Tunnel).
+     * Was wrongly placed on octet2 (UIMSI) which home PGWs dislike. */
+    gtpv2_enc_indication(&e, 0x40, 0x00, 0x00, 0x00);
 
     /* Sender F-TEID = S11 MME GTP-C. This Open5GS SGW-C only speaks S11
      * (logs peer as MME[IWF]); iface 17 (S4-SGSN) is accepted for TEID
@@ -2029,7 +2029,7 @@ static int translate_delete_pdp_context(iwf_runtime_t *rt,
                     s->sgwc_ctrl_teid, s->gtpv2_seq);
 
     gtpv2_enc_ebi(&e, 0, nsapi);                  /* Linked EPS Bearer ID */
-    gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00); /* DTF */
+    gtpv2_enc_indication(&e, 0x40, 0x00, 0x00, 0x00); /* DTF */
 
     int total = gtpv2_enc_finish(&e);
     if (total <= 0) return -1;
@@ -2093,13 +2093,11 @@ static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
     gtpv2_enc_begin(&e, GTPV2_MODIFY_BEARER_REQUEST,
                     s->sgwc_ctrl_teid, s->gtpv2_seq);
 
-    /* User Location Information — Open5GS sgwcd validates ULI on Modify Bearer
-     * for S4 and answers cause 70 (Mandatory IE missing) if absent. Replay
-     * whatever we cached during Create PDP. */
+    /* User Location Information — same RAT-aware form as Create Session. */
     if (s->uli_kind == 1) {
-        gtpv2_enc_uli_from_v1_rai(&e, s->uli_rai6);
+        gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, s->uli_rai6, 0, 0);
     } else if (s->uli_kind == 2) {
-        gtpv2_enc_uli_synthetic_plmn(&e, s->uli_mcc, s->uli_mnc);
+        gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, NULL, s->uli_mcc, s->uli_mnc);
     }
 
     /* Sender F-TEID = S11 MME GTP-C (same peer identity as Create Session). */
@@ -2107,7 +2105,7 @@ static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
                          s->iwf_s4_c_teid, ntohl(rt->local_ipv4_be));
 
     gtpv2_enc_rat_type(&e, rt->cfg.rat_type);
-    gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00); /* DTF */
+    gtpv2_enc_indication(&e, 0x40, 0x00, 0x00, 0x00); /* DTF */
 
     /* Bearer Context (modified). Open5GS sgwc reads access F-TEID from
      * bearer instance 0 (field named s1_u_enodeb_f_teid). Use S1-U eNB

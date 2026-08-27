@@ -80,6 +80,11 @@ int gtpv2_enc_ipv4_ip_address(gtpv2_enc_t *e, uint8_t instance, uint32_t ipv4_be
 int gtpv2_enc_uli_from_v1_rai(gtpv2_enc_t *e, const uint8_t rai6[6]);
 /* Same wire shape, PLMN from MCC/MNC and LAC=RAC=0 (lab fallback when Gn has no RAI). */
 int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc);
+/* ULI for configured RAT: EUTRAN/WLAN → TAI+ECGI; UTRAN/GERAN → RAI.
+ * Home PGWs reject RAI-only ULI when RAT=EUTRAN (cause 69, offending IE=ULI). */
+int gtpv2_enc_uli_for_rat(gtpv2_enc_t *e, uint8_t rat_type,
+                          const uint8_t *rai6_or_null,
+                          uint16_t mcc, uint16_t mnc);
 int gtpv2_enc_fteid_ipv4(gtpv2_enc_t *e, uint8_t instance,
                          uint8_t iface, uint32_t teid, uint32_t ipv4);
 

@@ -424,6 +424,25 @@ int gtpv2_enc_uli_from_v1_rai(gtpv2_enc_t *e, const uint8_t rai6[6])
     return gtpv2_enc_tlv(e, GTPV2_IE_ULI, 0, v, sizeof(v));
 }
 
+/* TAI (5) + ECGI (7) from PLMN + TAC + ECI. Flags: TAI=0x08, ECGI=0x10. */
+static int gtpv2_enc_uli_tai_ecgi(gtpv2_enc_t *e, const uint8_t plmn[3],
+                                  uint16_t tac, uint32_t eci)
+{
+    uint8_t v[1 + 5 + 7];
+    v[0] = 0x18; /* TAI | ECGI */
+    memcpy(v + 1, plmn, 3);
+    v[4] = (uint8_t)((tac >> 8) & 0xff);
+    v[5] = (uint8_t)(tac & 0xff);
+    memcpy(v + 6, plmn, 3);
+    /* ECI: 28-bit in 4 octets, high nibble of first octet spare=0 */
+    uint32_t e = eci & 0x0fffffff;
+    v[9]  = (uint8_t)((e >> 24) & 0x0f);
+    v[10] = (uint8_t)((e >> 16) & 0xff);
+    v[11] = (uint8_t)((e >> 8) & 0xff);
+    v[12] = (uint8_t)(e & 0xff);
+    return gtpv2_enc_tlv(e, GTPV2_IE_ULI, 0, v, sizeof(v));
+}
+
 int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc)
 {
     uint8_t plmn[3];
@@ -434,6 +453,35 @@ int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc)
     rai6[4] = 0;
     rai6[5] = 0;
     return gtpv2_enc_uli_from_v1_rai(e, rai6);
+}
+
+int gtpv2_enc_uli_for_rat(gtpv2_enc_t *e, uint8_t rat_type,
+                          const uint8_t *rai6_or_null,
+                          uint16_t mcc, uint16_t mnc)
+{
+    /* EUTRAN (6) / WLAN (3): home PGWs require TAI (often + ECGI), not RAI. */
+    if (rat_type == GTPV2_RAT_EUTRAN || rat_type == GTPV2_RAT_WLAN) {
+        uint8_t plmn[3];
+        uint16_t tac = 1;
+        uint32_t eci = 1;
+        if (rai6_or_null) {
+            memcpy(plmn, rai6_or_null, 3);
+            tac = (uint16_t)((rai6_or_null[3] << 8) | rai6_or_null[4]);
+            /* Avoid reserved/broadcast LAC 0xfffe as TAC. */
+            if (tac == 0 || tac == 0xffff || tac == 0xfffe)
+                tac = 1;
+            eci = (uint32_t)rai6_or_null[5];
+            if (eci == 0 || eci == 0xff)
+                eci = 1;
+        } else {
+            mccmnc_encode(mcc, mnc, plmn);
+        }
+        return gtpv2_enc_uli_tai_ecgi(e, plmn, tac, eci);
+    }
+
+    if (rai6_or_null)
+        return gtpv2_enc_uli_from_v1_rai(e, rai6_or_null);
+    return gtpv2_enc_uli_synthetic_plmn(e, mcc, mnc);
 }
 
 int gtpv2_enc_cause(gtpv2_enc_t *e, uint8_t cause)
