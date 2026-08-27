@@ -999,11 +999,22 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
         if (!s)
             s = map_sess_find_gsup_pending(req.imsi, MAP_OP_UL);
         if (!s) {
-            LOGI("gsup",
-                 "[%s] RX ISD_RES (inbound MAP UL push) conn=%d peer=%s",
-                 req.imsi,
-                 conn_id,
-                 gsup_server_conn_peer(conn_id));
+            /* push_cs_isd() from inbound MAP-C UL: no gsup_originated session. */
+            if (req.msg_type == GSUP_MSG_ISD_ERR) {
+                LOGW("gsup",
+                     "[%s] RX ISD_ERR (inbound MAP UL push) cause=0x%02x conn=%d peer=%s "
+                     "— home MSC rejected ISD (check MSC/HSS subscriber)",
+                     req.imsi,
+                     req.have_cause ? req.cause : 0,
+                     conn_id,
+                     gsup_server_conn_peer(conn_id));
+            } else {
+                LOGI("gsup",
+                     "[%s] RX ISD_RES (inbound MAP UL push) conn=%d peer=%s",
+                     req.imsi,
+                     conn_id,
+                     gsup_server_conn_peer(conn_id));
+            }
             gsup_track_conn(req.imsi, conn_id, GSUP_CN_DOMAIN_CS);
             return;
         }
