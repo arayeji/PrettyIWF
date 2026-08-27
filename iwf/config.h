@@ -173,6 +173,13 @@ typedef struct {
     int         gsup_n_listen_ips;
     char        gsup_local_mcc[4];        /* visited/home MCC digits, default 432 */
     char        gsup_local_mnc[4];        /* visited PLMN MNC digits, default 012 */
+    /* Local (home) subscriber IMSI prefixes — MCC+MNC etc. Used for APN
+     * form: home → bare NI; everyone else → NI.mncXXX.mccYYY.gprs.
+     * Empty list → fall back to matching [gsup_server] local_mcc/local_mnc. */
+#define IWF_HOME_IMSI_PREFIX_MAX 16
+#define IWF_HOME_IMSI_PREFIX_LEN 16
+    char        home_imsi_prefix[IWF_HOME_IMSI_PREFIX_MAX][IWF_HOME_IMSI_PREFIX_LEN];
+    int         n_home_imsi_prefix;
     int         gsup_timeout_ms;
     /* CN-domain eastbound backends for GSUP combine mode (CSFB vs PS):
      *   cs_backend = map|diameter   (default diameter)
@@ -280,11 +287,14 @@ int  iwf_config_sgwc_for_imsi(const iwf_config_t *cfg, const char *imsi,
 int  iwf_config_visited_plmn(const iwf_config_t *cfg,
                              uint16_t *mcc, uint16_t *mnc);
 
-/* 1 if IMSI home PLMN differs from visited PLMN (inbound roamer on this IWF). */
+/* 1 if IMSI matches home_imsi_prefix (or local_mcc/mnc when list empty). */
+int  iwf_config_imsi_is_home(const iwf_config_t *cfg, const char *imsi);
+
+/* 1 if IMSI is not a home/local subscriber (inbound roamer on this IWF). */
 int  iwf_config_imsi_is_roamer(const iwf_config_t *cfg, const char *imsi);
 
-/* Build S4 APN: bare NI from Gn, or NI.mncXXX.mccYYY.gprs for roamers.
- * Copies src_apn as-is when already FQDN / home subscriber / empty. */
+/* Build S4/S11 APN: bare NI for home IMSIs; NI.mncXXX.mccYYY.gprs for roamers.
+ * Home set = [iwf]/[gsup_server] home_imsi_prefix (else local_mcc/mnc). */
 void iwf_apn_for_s4(const iwf_config_t *cfg, const char *imsi,
                     const char *src_apn, char *out, size_t out_cap);
 

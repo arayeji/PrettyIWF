@@ -326,7 +326,49 @@ static int parse_pgw_select(const char *val, uint8_t out[IWF_PGW_SELECT_MAX])
     return n;
 }
 
-/* Parse [roaming_hlr] keys: mnc003_hlr_gt, mnc003_ssn, mnc003_src_ip, ... */
+/* Parse comma-separated IMSI prefixes (digits only) into home_imsi_prefix[]. */
+static void home_imsi_prefix_add(iwf_config_t *out, const char *val)
+{
+    if (!out || !val)
+        return;
+    char buf[256];
+    copy_str(buf, sizeof(buf), val);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ", \t", &save); tok;
+         tok = strtok_r(NULL, ", \t", &save)) {
+        /* Keep digits only. */
+        char pfx[IWF_HOME_IMSI_PREFIX_LEN];
+        size_t n = 0;
+        for (const char *p = tok; *p && n + 1 < sizeof(pfx); p++) {
+            if (*p >= '0' && *p <= '9')
+                pfx[n++] = *p;
+        }
+        pfx[n] = '\0';
+        if (n < 5) {
+            if (tok[0])
+                LOGW("config", "home_imsi_prefix '%s' too short (need >=5 digits)",
+                     tok);
+            continue;
+        }
+        int dup = 0;
+        for (int i = 0; i < out->n_home_imsi_prefix; i++) {
+            if (!strcmp(out->home_imsi_prefix[i], pfx)) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        if (out->n_home_imsi_prefix >= IWF_HOME_IMSI_PREFIX_MAX) {
+            LOGW("config", "home_imsi_prefix full (max %d), ignoring %s",
+                 IWF_HOME_IMSI_PREFIX_MAX, pfx);
+            break;
+        }
+        copy_str(out->home_imsi_prefix[out->n_home_imsi_prefix],
+                 sizeof(out->home_imsi_prefix[0]), pfx);
+        out->n_home_imsi_prefix++;
+    }
+}
 static void gsup_roam_key(iwf_config_t *out, const char *key, const char *val)
 {
     if (strncmp(key, "mnc", 3) != 0) {
@@ -476,6 +518,9 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             } else if (!strcmp(key, "pgw_cache_ttl_s")) {
                 int ttl = atoi(val);
                 out->pgw_cache_ttl_s = (ttl > 0) ? ttl : 300;
+            } else if (!strcmp(key, "home_imsi_prefix") ||
+                       !strcmp(key, "local_imsi_prefix")) {
+                home_imsi_prefix_add(out, val);
             } else LOGW("config", "unknown key [iwf].%s", key);
         } else if (!strcmp(section, "sgsn")) {
             if      (!strcmp(key, "ip"))   copy_str(out->sgsn_ip, sizeof(out->sgsn_ip), val);
@@ -645,6 +690,9 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "listen_ips"))     gsup_listen_ips_split(out, val);
             else if (!strcmp(key, "local_mcc"))      copy_str(out->gsup_local_mcc, sizeof(out->gsup_local_mcc), val);
             else if (!strcmp(key, "local_mnc"))      copy_str(out->gsup_local_mnc, sizeof(out->gsup_local_mnc), val);
+            else if (!strcmp(key, "home_imsi_prefix") ||
+                     !strcmp(key, "local_imsi_prefix"))
+                home_imsi_prefix_add(out, val);
             else if (!strcmp(key, "timeout_ms"))     out->gsup_timeout_ms = atoi(val);
             else if (!strcmp(key, "cs_backend"))     out->gsup_cs_backend = parse_gsup_backend(val);
             else if (!strcmp(key, "ps_backend"))     out->gsup_ps_backend = parse_gsup_backend(val);
@@ -832,6 +880,20 @@ void iwf_config_dump(const iwf_config_t *c)
              c->gsup_cs_backend == GSUP_BACKEND_MAP ? "map" : "diameter",
              c->gsup_ps_backend == GSUP_BACKEND_MAP ? "map" : "diameter");
     }
+    if (c->n_home_imsi_prefix > 0) {
+        char list[256];
+        size_t off = 0;
+        list[0] = '\0';
+        for (int i = 0; i < c->n_home_imsi_prefix; i++) {
+            int n = snprintf(list + off, sizeof(list) - off, "%s%s",
+                             i ? "," : "", c->home_imsi_prefix[i]);
+            if (n < 0 || (size_t)n >= sizeof(list) - off)
+                break;
+            off += (size_t)n;
+        }
+        LOGI("config", "home_imsi_prefix=%s (bare APN); others get APN FQDN",
+             list);
+    }
     for (int i = 0; i < c->gsup_n_roam_routes; i++) {
         const typeof(c->gsup_roam_routes[0]) *r = &c->gsup_roam_routes[i];
         if (r->n_apn_acl <= 0)
@@ -1012,11 +1074,24 @@ int iwf_config_visited_plmn(const iwf_config_t *cfg,
     return 0;
 }
 
-int iwf_config_imsi_is_roamer(const iwf_config_t *cfg, const char *imsi)
+int iwf_config_imsi_is_home(const iwf_config_t *cfg, const char *imsi)
 {
+    if (!cfg || !imsi || strlen(imsi) < 5)
+        return 0;
+
+    /* Explicit home IMSI prefix list wins when configured. */
+    if (cfg->n_home_imsi_prefix > 0) {
+        for (int i = 0; i < cfg->n_home_imsi_prefix; i++) {
+            size_t pl = strlen(cfg->home_imsi_prefix[i]);
+            if (pl && strncmp(imsi, cfg->home_imsi_prefix[i], pl) == 0)
+                return 1;
+        }
+        return 0;
+    }
+
+    /* Fallback: IMSI PLMN matches visited local_mcc/local_mnc. */
     uint16_t vmcc = 0, vmnc = 0;
-    if (iwf_config_visited_plmn(cfg, &vmcc, &vmnc) < 0 || !imsi ||
-        strlen(imsi) < 5)
+    if (iwf_config_visited_plmn(cfg, &vmcc, &vmnc) < 0)
         return 0;
     unsigned a = 0, b = 0, c = 0, d = 0, e = 0;
     if (sscanf(imsi, "%1u%1u%1u%1u%1u", &a, &b, &c, &d, &e) != 5)
@@ -1024,17 +1099,29 @@ int iwf_config_imsi_is_roamer(const iwf_config_t *cfg, const char *imsi)
     uint16_t imsi_mcc = (uint16_t)(a * 100u + b * 10u + c);
     uint16_t imsi_mnc2 = (uint16_t)(d * 10u + e);
     if (imsi_mcc != vmcc)
-        return 1;
-    /* local_mnc "012" -> 12; IMSI …12… -> 12. Also accept exact 3-digit match. */
-    if (imsi_mnc2 == vmnc || imsi_mnc2 == (vmnc % 100))
         return 0;
+    if (imsi_mnc2 == vmnc || imsi_mnc2 == (vmnc % 100))
+        return 1;
     if (strlen(imsi) >= 6 && isdigit((unsigned char)imsi[5])) {
         uint16_t imsi_mnc3 = (uint16_t)(d * 100u + e * 10u +
                                         (unsigned)(imsi[5] - '0'));
         if (imsi_mnc3 == vmnc)
+            return 1;
+    }
+    return 0;
+}
+
+int iwf_config_imsi_is_roamer(const iwf_config_t *cfg, const char *imsi)
+{
+    if (!cfg || !imsi || strlen(imsi) < 5)
+        return 0;
+    /* Need either an explicit prefix list or visited PLMN to classify. */
+    if (cfg->n_home_imsi_prefix <= 0) {
+        uint16_t dmcc = 0, dmnc = 0;
+        if (iwf_config_visited_plmn(cfg, &dmcc, &dmnc) < 0)
             return 0;
     }
-    return 1;
+    return !iwf_config_imsi_is_home(cfg, imsi);
 }
 
 void iwf_apn_for_s4(const iwf_config_t *cfg, const char *imsi,
@@ -1049,12 +1136,26 @@ void iwf_apn_for_s4(const iwf_config_t *cfg, const char *imsi,
     out[out_cap - 1] = '\0';
     iwf_apn_normalize(out);
 
-    /* Already an OI-bearing FQDN (.mnc… / .gprs / 3gppnetwork.org). */
+    /* Home / local subscribers: SGW-C expects bare APN-NI (no OI). */
+    if (!iwf_config_imsi_is_roamer(cfg, imsi)) {
+        char *cut = strstr(out, ".mnc");
+        if (!cut)
+            cut = strstr(out, ".apn.epc.");
+        if (!cut)
+            cut = strstr(out, ".gprs");
+        if (!cut)
+            cut = strstr(out, ".3gppnetwork.org");
+        if (cut)
+            *cut = '\0';
+        return;
+    }
+
+    /* Roamers: already an OI-bearing FQDN — keep as-is. */
     if (strstr(out, ".mnc") || strstr(out, ".gprs") ||
         strstr(out, ".3gppnetwork.org"))
         return;
 
-    if (!iwf_config_imsi_is_roamer(cfg, imsi) || !imsi || strlen(imsi) < 5)
+    if (!imsi || strlen(imsi) < 5)
         return;
 
     unsigned a = 0, b = 0, c = 0, d = 0, e = 0;
