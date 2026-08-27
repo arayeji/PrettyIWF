@@ -655,6 +655,42 @@ bool gsup_map_proxy_hss_clr(iwf_runtime_t *rt, const char *imsi,
     return sent;
 }
 
+bool gsup_map_proxy_push_cs_isd(iwf_runtime_t *rt, const char *imsi,
+                                const char *msisdn)
+{
+    if (!rt || !imsi || !imsi[0]) return false;
+    if (!rt->cfg.gsup_server_enabled) return false;
+
+    int conn_id = gsup_map_proxy_cs_conn_for_imsi(imsi);
+    if (conn_id < 0) {
+        LOGW("gsup",
+             "[%s] inbound MAP UL: no CS GSUP conn for MSC ISD",
+             imsi);
+        return false;
+    }
+
+    const char *hlr = rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt : NULL;
+    uint8_t gsup[512];
+    int n = gsup_build_isd_req(imsi, msisdn, NULL, 0,
+                               GSUP_CN_DOMAIN_CS, hlr,
+                               gsup, sizeof(gsup));
+    if (n <= 0) return false;
+    if (proxy_send_gsup(conn_id, gsup, (size_t)n) < 0)
+        return false;
+
+    if (msisdn && msisdn[0])
+        gsup_map_proxy_note_msisdn(imsi, msisdn);
+    gsup_track_conn(imsi, conn_id, GSUP_CN_DOMAIN_CS);
+
+    LOGI("gsup",
+         "[%s] TX ISD_REQ (inbound MAP UL) msisdn=%s conn=%d peer=%s",
+         imsi,
+         msisdn && msisdn[0] ? msisdn : "-",
+         conn_id,
+         gsup_server_conn_peer(conn_id));
+    return true;
+}
+
 bool gsup_map_proxy_hss_idr(iwf_runtime_t *rt, const char *imsi,
                             uint8_t cn_domain, const char *msisdn,
                             const map_ula_apn_entry_t *apns, size_t n_apns)
@@ -963,7 +999,12 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
         if (!s)
             s = map_sess_find_gsup_pending(req.imsi, MAP_OP_UL);
         if (!s) {
-            LOGD("gsup", "[%s] ISD response for unknown session", req.imsi);
+            LOGI("gsup",
+                 "[%s] RX ISD_RES (inbound MAP UL push) conn=%d peer=%s",
+                 req.imsi,
+                 conn_id,
+                 gsup_server_conn_peer(conn_id));
+            gsup_track_conn(req.imsi, conn_id, GSUP_CN_DOMAIN_CS);
             return;
         }
         if (req.msg_type == GSUP_MSG_ISD_ERR) {
