@@ -1575,6 +1575,14 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_TEID_DATA_I)))
         gtpv1_decode_teid(ie, &s->sgsn_data_teid);
 
+    /* Pass-through addressing: present the SGSN's own control TEID to the
+     * SGW-C instead of minting one, so every GTPv2 response arrives carrying
+     * the exact value the Gn header needs and the two sides can never hold
+     * different names for the same context. sess_adopt_* falls back to a
+     * minted TEID if the SGSN omitted the IE or another session already holds
+     * the value. */
+    (void)sess_adopt_iwf_s4_c_teid(s, s->sgsn_ctrl_teid);
+
     if (!s->apn[0]) {
         /* The MS may omit the APN and leave the choice to the network
          * (TS 23.060 §9.2.1: the SGSN then supplies the subscribed APN).
@@ -1739,7 +1747,32 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             uli_mnc = mnc_imsi;
         }
 
-        if ((ie = gtpv1_find_ie(v1, GTPV1_IE_RAI)) && ie->length >= 6) {
+        /* For UTRAN/GERAN the correct ULI is the real CGI/SAI the RNC put in
+         * the Gn User Location Information IE. The Routing Area Identity IE
+         * is not a substitute: OsmoSGSN always fills it with a placeholder
+         * LAC/RAC, which is what forced the EUTRAN TAI/ECGI workaround in the
+         * first place. Only fall back to RAI/synthetic when the SGSN sent no
+         * ULI IE or its Geographic Location Type is one we do not map. */
+        const iwf_ie_t *v1uli = gtpv1_find_ie(v1, GTPV1_IE_ULI);
+        int used_v1_uli = 0;
+        if (rt->cfg.rat_type != GTPV2_RAT_EUTRAN &&
+            rt->cfg.rat_type != GTPV2_RAT_WLAN &&
+            v1uli && v1uli->length >= 8 &&
+            gtpv2_enc_uli_from_v1_uli(&e, v1uli->value, v1uli->length) == 0) {
+            uint16_t cp = v1uli->length;
+            if (cp > sizeof(s->uli_v1)) cp = sizeof(s->uli_v1);
+            memcpy(s->uli_v1, v1uli->value, cp);
+            s->uli_v1_len = (uint8_t)cp;
+            s->uli_kind   = 3;
+            used_v1_uli   = 1;
+            LOGI("translate",
+                 "[%s] ULI from Gn ULI IE (geo_type=%u) for rat_type=%u",
+                 imsi, (unsigned)v1uli->value[0], (unsigned)rt->cfg.rat_type);
+        }
+
+        if (used_v1_uli) {
+            /* already encoded above */
+        } else if ((ie = gtpv1_find_ie(v1, GTPV1_IE_RAI)) && ie->length >= 6) {
             memcpy(s->uli_rai6, ie->value, 6);
             s->uli_kind = 1;
             if (uli_mcc == 0) {
@@ -2047,10 +2080,13 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
     sess_touch(s);
 
     LOGI("translate",
-         "[%s] TX-S4 Create-Session-Req seq=%u len=%d",
+         "[%s] TX-S4 Create-Session-Req seq=%u len=%d s4_c_teid=0x%08x%s",
          imsi,
          s->gtpv2_seq,
-         total);
+         total,
+         s->iwf_s4_c_teid,
+         s->iwf_s4_c_teid == s->sgsn_ctrl_teid ? " (SGSN pass-through)"
+                                               : " (minted)");
     iwf_log_hex("translate", "CSReq", outbuf, (size_t)total);
 
     return iwf_send_v2_sess(rt, s, outbuf, (size_t)total);
@@ -2317,7 +2353,10 @@ static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
                     s->sgwc_ctrl_teid, s->gtpv2_seq);
 
     /* User Location Information — same RAT-aware form as Create Session. */
-    if (s->uli_kind == 1) {
+    if (s->uli_kind == 3 && s->uli_v1_len >= 8) {
+        if (gtpv2_enc_uli_from_v1_uli(&e, s->uli_v1, s->uli_v1_len) != 0)
+            LOGW("translate", "replaying Gn ULI failed");
+    } else if (s->uli_kind == 1) {
         gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, s->uli_rai6,
                               s->uli_mcc, s->uli_mnc,
                               rt->cfg.uli_tac, rt->cfg.uli_eci);
@@ -2463,6 +2502,13 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
         }
     }
 
+    /* Pass-through the other way: the TEID-C handed to osmo-sgsn in the
+     * Create PDP Context Response is the SGW-C's, so the Update/Delete PDP
+     * Context the SGSN later sends already carries the GTPv2 header TEID
+     * verbatim. Again sess_adopt_* mints if the SGW-C sent no F-TEID or the
+     * value collides with another SGW-C's. */
+    (void)sess_adopt_iwf_ctrl_teid(s, s->sgwc_ctrl_teid);
+
     /* PAA - the UE IP. */
     if ((ie = gtpv2_find_ie(v2, GTPV2_IE_PAA, 0))) {
         uint8_t pt; uint32_t ip;
@@ -2585,6 +2631,11 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
 
         /* TEID Control Plane = IWF's GGSN-side ctrl TEID. */
         gtpv1_enc_tv_u32(&e, GTPV1_IE_TEID_CTRL_PLANE, s->iwf_ctrl_teid);
+        LOGD("translate",
+     "[%s] Gn TEID-C=0x%08x%s",
+     s->key.imsi, s->iwf_ctrl_teid,
+     s->iwf_ctrl_teid == s->sgwc_ctrl_teid ? " (SGW-C pass-through)"
+                                           : " (minted)");
 
         /* Two GTPv1 IE type 133 (GSN Address) — TS 29.060 Table 6: Control Plane
          * then user traffic. osmo-sgsn/libgtp maps by order; if reversed, GTP-U

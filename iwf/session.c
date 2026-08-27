@@ -166,18 +166,32 @@ sess_t *sess_find_active_by_imsi_apn_other_nsapi(const char *imsi,
 
 static void teid_index_insert(teid_idx_t **idx, uint32_t teid, sess_t *s)
 {
-    teid_idx_t *e = (teid_idx_t *)calloc(1, sizeof(*e));
+    if (!teid) return;
+    /* Peer TEIDs are reused as soon as the peer frees the slot (libgtp hands
+     * out the pdp array index), so an entry for this TEID may still exist and
+     * point at a session we have not torn down yet. Rebind it rather than
+     * adding a second entry with the same key - uthash would keep both and
+     * HASH_FIND would return either one. Newest binding wins; the old session
+     * stays reachable by (IMSI, NSAPI). */
+    teid_idx_t *e = NULL;
+    HASH_FIND(hh, *idx, &teid, sizeof(uint32_t), e);
+    if (e) { e->sess = s; return; }
+    e = (teid_idx_t *)calloc(1, sizeof(*e));
     if (!e) return;
     e->teid = teid;
     e->sess = s;
     HASH_ADD(hh, *idx, teid, sizeof(uint32_t), e);
 }
 
-static void teid_index_remove(teid_idx_t **idx, uint32_t teid)
+/* Drop the index entry only when it still points at `owner`; after a peer
+ * reused the TEID for a different session the entry belongs to that one. */
+static void teid_index_remove_owned(teid_idx_t **idx, uint32_t teid,
+                                    const sess_t *owner)
 {
+    if (!teid) return;
     teid_idx_t *e = NULL;
     HASH_FIND(hh, *idx, &teid, sizeof(uint32_t), e);
-    if (e) { HASH_DEL(*idx, e); free(e); }
+    if (e && (!owner || e->sess == owner)) { HASH_DEL(*idx, e); free(e); }
 }
 
 sess_t *sess_create(const char *imsi, uint8_t nsapi)
@@ -200,19 +214,16 @@ sess_t *sess_create(const char *imsi, uint8_t nsapi)
     s->created_at    = time(NULL);
     s->last_activity = s->created_at;
 
-    s->iwf_ctrl_teid  = sess_new_teid();
-    s->iwf_s4_c_teid  = sess_new_teid();
+    /* No TEIDs are minted here. They are adopted from the peers as they
+     * arrive: the SGSN's TEID-C on Create PDP Context Request, the SGW-C's on
+     * Create Session Response. Until then the session is addressable only by
+     * (IMSI, NSAPI), which is all the create exchange needs. */
+    s->iwf_ctrl_teid  = 0;
+    s->iwf_s4_c_teid  = 0;
 
     HASH_ADD(hh, g_by_key, key, sizeof(sess_key_t), s);
-    teid_index_insert(&g_iwf_c_idx,  s->iwf_ctrl_teid, s);
-    teid_index_insert(&g_iwf_s4_idx, s->iwf_s4_c_teid, s);
 
-    LOGI("session",
-         "[%s] created nsapi=%u iwf_c=0x%08x iwf_s4=0x%08x",
-         imsi,
-         nsapi,
-         s->iwf_ctrl_teid,
-         s->iwf_s4_c_teid);
+    LOGI("session", "[%s] created nsapi=%u", imsi, nsapi);
     return s;
 }
 
@@ -224,10 +235,68 @@ void sess_remove(sess_t *s)
          s->key.imsi,
          s->key.nsapi,
          sess_state_str(s->state));
-    teid_index_remove(&g_iwf_c_idx,  s->iwf_ctrl_teid);
-    teid_index_remove(&g_iwf_s4_idx, s->iwf_s4_c_teid);
+    teid_index_remove_owned(&g_iwf_c_idx,  s->iwf_ctrl_teid,  s);
+    teid_index_remove_owned(&g_iwf_s4_idx, s->iwf_s4_c_teid, s);
     HASH_DEL(g_by_key, s);
     free(s);
+}
+
+static sess_t *teid_index_owner(teid_idx_t *idx, uint32_t teid)
+{
+    teid_idx_t *e = NULL;
+    if (!teid) return NULL;
+    HASH_FIND(hh, idx, &teid, sizeof(uint32_t), e);
+    return e ? e->sess : NULL;
+}
+
+static uint32_t sess_adopt_teid(teid_idx_t **idx, uint32_t *field,
+                                sess_t *s, uint32_t teid, const char *what)
+{
+    if (teid && *field == teid)
+        return teid;
+    /* Peer offered nothing (e.g. a Create Session Response that failed and
+     * carried no F-TEID) and we already hold a usable value - keep it rather
+     * than churning the index. */
+    if (!teid && *field)
+        return *field;
+
+    sess_t *owner = teid_index_owner(*idx, teid);
+    if (owner && owner != s) {
+        LOGW("session",
+     "[%s] %s 0x%08x offered by peer is already bound to [%s] nsapi=%u - minting instead",
+     s->key.imsi, what, teid, owner->key.imsi, owner->key.nsapi);
+        teid = 0;
+    }
+
+    if (!teid) {
+        /* Mint a value no live session holds. Bounded so a pathological index
+         * cannot spin; a duplicate would only cost us pass-through, and
+         * teid_index_insert rebinds rather than corrupting the table. */
+        for (int i = 0; i < 64; i++) {
+            teid = sess_new_teid();
+            if (!teid_index_owner(*idx, teid))
+                break;
+        }
+    }
+
+    teid_index_remove_owned(idx, *field, s);
+    *field = teid;
+    teid_index_insert(idx, teid, s);
+    return teid;
+}
+
+uint32_t sess_adopt_iwf_ctrl_teid(sess_t *s, uint32_t teid)
+{
+    if (!s) return 0;
+    return sess_adopt_teid(&g_iwf_c_idx, &s->iwf_ctrl_teid, s, teid,
+                           "SGW-C TEID-C");
+}
+
+uint32_t sess_adopt_iwf_s4_c_teid(sess_t *s, uint32_t teid)
+{
+    if (!s) return 0;
+    return sess_adopt_teid(&g_iwf_s4_idx, &s->iwf_s4_c_teid, s, teid,
+                           "SGSN TEID-C");
 }
 
 void sess_touch(sess_t *s)

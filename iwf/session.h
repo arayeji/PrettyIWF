@@ -59,7 +59,13 @@ typedef struct sess_s {
     uint16_t    sgsn_seq;             /* last GTPv1 request seq we answer with */
     iwf_endpoint_t sgsn_ep;           /* where the request came from */
 
-    /* IWF-allocated TEIDs we advertise to peers. */
+    /* TEIDs the IWF advertises to each peer. These are NOT minted: the IWF
+     * is a converter, so what it presents on one side is the peer TEID from
+     * the other side (see sess_set_iwf_ctrl_teid / sess_set_iwf_s4_c_teid).
+     *   iwf_ctrl_teid == sgwc_ctrl_teid  (told to osmo-sgsn as GGSN TEID-C)
+     *   iwf_s4_c_teid == sgsn_ctrl_teid  (told to SGW-C as S4/S11 F-TEID)
+     * so a Gn request already carries the TEID the GTPv2 header needs, and a
+     * GTPv2 response already carries the TEID the Gn header needs. */
     uint32_t    iwf_ctrl_teid;        /* TEID we tell osmo-sgsn (GGSN ctrl) */
 
     /* GTPv2 (S4 / SGW-C side) */
@@ -110,9 +116,15 @@ typedef struct sess_s {
 
     /* User Location Information cached from Create PDP, replayed in MBReq.
      * uli_kind: 0 = none, 1 = real RAI (uli_rai6 holds the 6 octets),
-     *           2 = synthetic from IMSI PLMN (uli_mcc/uli_mnc used). */
+     *           2 = synthetic from IMSI PLMN (uli_mcc/uli_mnc used),
+     *           3 = verbatim GTPv1 ULI IE (uli_v1[0..uli_v1_len-1], the real
+     *               CGI/SAI the RNC reported - preferred for UTRAN/GERAN,
+     *               where the Gn Routing Area Identity IE only ever carries
+     *               OsmoSGSN's placeholder LAC/RAC). */
     uint8_t     uli_kind;
     uint8_t     uli_rai6[6];
+    uint8_t     uli_v1[16];
+    uint8_t     uli_v1_len;
     uint16_t    uli_mcc;
     uint16_t    uli_mnc;
 
@@ -150,6 +162,19 @@ void    sess_remove(sess_t *s);
 
 /* Mint new locally-unique TEIDs. */
 uint32_t sess_new_teid(void);
+
+/* Adopt a peer TEID as the value the IWF advertises on the opposite side,
+ * keeping the lookup index in step. These are learned, not minted: the
+ * SGSN's TEID-C arrives in Create PDP Context Request, the SGW-C's in Create
+ * Session Response, so they are set after sess_create().
+ *
+ * A TEID only has to be unique to the node that allocated it, and the IWF may
+ * face several SGSNs and several SGW-Cs. If the offered value is already
+ * bound to a different live session - or is 0 because the peer omitted the IE
+ * - a unique one is minted instead, so pass-through never costs correctness.
+ * Returns the value actually in effect. */
+uint32_t sess_adopt_iwf_ctrl_teid(sess_t *s, uint32_t teid);
+uint32_t sess_adopt_iwf_s4_c_teid(sess_t *s, uint32_t teid);
 
 void sess_touch(sess_t *s);
 const char *sess_state_str(sess_state_t st);

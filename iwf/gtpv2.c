@@ -424,6 +424,26 @@ int gtpv2_enc_uli_from_v1_rai(gtpv2_enc_t *e, const uint8_t rai6[6])
     return gtpv2_enc_tlv(e, GTPV2_IE_ULI, 0, v, sizeof(v));
 }
 
+int gtpv2_enc_uli_from_v1_uli(gtpv2_enc_t *e, const uint8_t *v1uli,
+                              uint16_t len)
+{
+    if (!v1uli || len < 8)
+        return -1;
+    /* TS 29.060 7.7.51 Geographic Location Type: 0 = CGI, 1 = SAI, 2 = RAI.
+     * CGI/SAI value is PLMN(3) + LAC(2) + CI|SAC(2) - byte-identical to the
+     * GTPv2 CGI/SAI fields, so only the flag differs. */
+    uint8_t flag;
+    switch (v1uli[0]) {
+    case 0: flag = 0x01; break;     /* CGI */
+    case 1: flag = 0x02; break;     /* SAI */
+    default: return -1;             /* RAI and anything else: caller decides */
+    }
+    uint8_t v[1 + 7];
+    v[0] = flag;
+    memcpy(v + 1, v1uli + 1, 7);
+    return gtpv2_enc_tlv(e, GTPV2_IE_ULI, 0, v, sizeof(v));
+}
+
 /* TAI (5) + ECGI (7) from PLMN + TAC + ECI. Flags: TAI=0x08, ECGI=0x10. */
 static int gtpv2_enc_uli_tai_ecgi(gtpv2_enc_t *e, const uint8_t plmn[3],
                                   uint16_t tac, uint32_t eci)

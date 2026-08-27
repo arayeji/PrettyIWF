@@ -78,6 +78,13 @@ int gtpv2_enc_cause(gtpv2_enc_t *e, uint8_t cause);
 int gtpv2_enc_ipv4_ip_address(gtpv2_enc_t *e, uint8_t instance, uint32_t ipv4_be);
 /* ULI with RAI only, from 6-octet GTPv1 / TS 24.008 RAI (PLMN+LAC+RAC). */
 int gtpv2_enc_uli_from_v1_rai(gtpv2_enc_t *e, const uint8_t rai6[6]);
+/* Map a GTPv1 User Location Information IE (TS 29.060 7.7.51: 1 octet
+ * Geographic Location Type then the value) onto the GTPv2 ULI (TS 29.274
+ * 8.21). CGI and SAI share the PLMN(3)+LAC(2)+CI/SAC(2) layout, so the value
+ * is copied verbatim under the right flag. Returns -1 for a type we do not
+ * map, leaving the caller to fall back. */
+int gtpv2_enc_uli_from_v1_uli(gtpv2_enc_t *e, const uint8_t *v1uli,
+                              uint16_t len);
 /* Same wire shape, PLMN from MCC/MNC and LAC=RAC=0 (lab fallback when Gn has no RAI). */
 int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc);
 /* ULI for configured RAT: EUTRAN/WLAN → TAI+ECGI with gateway tac/eci;

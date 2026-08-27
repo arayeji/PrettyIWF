@@ -29,9 +29,12 @@ static void defaults(iwf_config_t *c)
     strncpy(c->metrics_listen_ip, "127.0.0.1", sizeof(c->metrics_listen_ip) - 1);
     c->metrics_listen_port = 9090;
     c->synthetic_uli_no_rai = 0;
-    /* Open5GS SMF only accepts EUTRAN (6) and WLAN (3); UTRAN (1) is rejected
-     * with "Unknown RAT Type" -> SGW-C surfaces it as GTP cause 70.
-     * Default to EUTRAN so the IWF works against vanilla Open5GS out of the box. */
+    /* Default EUTRAN for out-of-the-box compatibility. UTRAN (1) is fully
+     * supported by current Open5GS on both SGW-C and SMF (sgwc/gn-handler.c,
+     * smf/gsm-sm.c, smf/s5c-build.c and smf/gx-path.c all switch on it), and
+     * it is the truthful value for 3G subscribers - set [iwf] rat_type = utran
+     * so the SGW-C and the PGW can tell them apart. Pair it with a real Gn ULI
+     * IE from the SGSN; see gtpv2_enc_uli_from_v1_uli(). */
     c->rat_type = 6;
     /* Gn RAI is always LAC=0xfffe/RAC=0xff from OsmoSGSN — not a real cell.
      * Emit a fixed gateway TAI/ECGI for EUTRAN (MME-accepted roaming TAC). */
