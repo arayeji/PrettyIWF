@@ -36,6 +36,14 @@ static const char *v1_msg_str(uint8_t t)
  * for the Update-PDP-Context-triggered MBReq path. */
 static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi);
 
+static int iwf_send_v2_sess(iwf_runtime_t *rt, const sess_t *s,
+                            const uint8_t *buf, size_t len)
+{
+    if (!s)
+        return iwf_send_v2(rt, buf, len);
+    return iwf_send_v2_to(rt, s->sgwc_addr_ipv4, s->sgwc_port, buf, len);
+}
+
 static const char *v2_msg_str(uint8_t t)
 {
     switch (t) {
@@ -1296,7 +1304,9 @@ static int try_handle_gtpu_context_response_reverse(iwf_runtime_t *rt,
  * TEID -> not found -> WARN -> drop, which is fine. */
 static int send_orphan_delete_session_req(iwf_runtime_t *rt,
                                           uint32_t sgwc_ctrl_teid,
-                                          uint8_t  nsapi)
+                                          uint8_t  nsapi,
+                                          uint32_t sgwc_ipv4,
+                                          uint16_t sgwc_port)
 {
     if (!sgwc_ctrl_teid)
         return 0;
@@ -1312,7 +1322,7 @@ static int send_orphan_delete_session_req(iwf_runtime_t *rt,
     int total = gtpv2_enc_finish(&e);
     if (total <= 0) return -1;
     iwf_log_hex("translate", "DSReq(orphan)", outbuf, (size_t)total);
-    return iwf_send_v2(rt, outbuf, (size_t)total);
+    return iwf_send_v2_to(rt, sgwc_ipv4, sgwc_port, outbuf, (size_t)total);
 }
 
 static int translate_create_pdp_context(iwf_runtime_t *rt,
@@ -1371,7 +1381,9 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             if (stale->sgwc_ctrl_teid)
                 (void)send_orphan_delete_session_req(rt,
                                                      stale->sgwc_ctrl_teid,
-                                                     stale->key.nsapi);
+                                                     stale->key.nsapi,
+                                                     stale->sgwc_addr_ipv4,
+                                                     stale->sgwc_port);
             sess_remove(stale);
         }
     }
@@ -1527,8 +1539,38 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         s->qos_len = cp;
     }
 
-    /* SGW-C transport. */
-    s->sgwc_addr_ipv4 = ntohl(rt->sgwc_addr.sin_addr.s_addr);
+    /* SGW-C transport — default [sgwc] or per-IMSI-PLMN override. */
+    {
+        char sip[64];
+        uint16_t sport = 0;
+        if (iwf_config_sgwc_for_imsi(&rt->cfg, imsi, sip, sizeof(sip),
+                                     &sport) == 0) {
+            struct in_addr a;
+            if (inet_pton(AF_INET, sip, &a) == 1) {
+                s->sgwc_addr_ipv4 = ntohl(a.s_addr);
+                s->sgwc_port = sport;
+            } else {
+                LOGE("translate", "[%s] bad sgwc ip %s", imsi, sip);
+                sess_remove(s);
+                return -1;
+            }
+        } else {
+            s->sgwc_addr_ipv4 = ntohl(rt->sgwc_addr.sin_addr.s_addr);
+            s->sgwc_port = ntohs(rt->sgwc_addr.sin_port);
+        }
+        if (s->sgwc_addr_ipv4 != ntohl(rt->sgwc_addr.sin_addr.s_addr) ||
+            s->sgwc_port != ntohs(rt->sgwc_addr.sin_port)) {
+            LOGI("translate",
+                 "[%s] SGW-C override %u.%u.%u.%u:%u (default %s:%u)",
+                 imsi,
+                 (s->sgwc_addr_ipv4 >> 24) & 0xff,
+                 (s->sgwc_addr_ipv4 >> 16) & 0xff,
+                 (s->sgwc_addr_ipv4 >> 8) & 0xff,
+                 s->sgwc_addr_ipv4 & 0xff,
+                 (unsigned)s->sgwc_port,
+                 rt->cfg.sgwc_ip, (unsigned)rt->cfg.sgwc_port);
+        }
+    }
 
     /* New GTPv2 transaction. */
     s->gtpv2_seq = ++rt->v2_seq;
@@ -1555,14 +1597,14 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             gtpv2_enc_tlv(&e, GTPV2_IE_MEI, 0, imei_ie->value, imei_ie->length);
     }
 
-    uint16_t mcc_sn = 0, mnc_sn = 0;
-    int      have_sn = 0;
+    uint16_t mcc_imsi = 0, mnc_imsi = 0;
+    int      have_imsi_plmn = 0;
     if (strlen(imsi) >= 5) {
         char mc[4] = { imsi[0], imsi[1], imsi[2], 0 };
         char mn[4] = { imsi[3], imsi[4], 0, 0 };
-        mcc_sn = (uint16_t)atoi(mc);
-        mnc_sn = (uint16_t)atoi(mn);
-        have_sn = 1;
+        mcc_imsi = (uint16_t)atoi(mc);
+        mnc_imsi = (uint16_t)atoi(mn);
+        have_imsi_plmn = 1;
     }
 
     /* ULI (RAI) — Open5GS SGW-C often requires this for UTRAN (GTPv2 cause 103
@@ -1574,26 +1616,32 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         s->uli_kind = 1;
         if (gtpv2_enc_uli_from_v1_rai(&e, ie->value) != 0)
             LOGW("translate", "encoding ULI from RAI failed");
-    } else if (rt->cfg.synthetic_uli_no_rai && have_sn) {
+    } else if (rt->cfg.synthetic_uli_no_rai && have_imsi_plmn) {
         s->uli_kind = 2;
-        s->uli_mcc  = mcc_sn;
-        s->uli_mnc  = mnc_sn;
-        if (gtpv2_enc_uli_synthetic_plmn(&e, mcc_sn, mnc_sn) != 0)
+        s->uli_mcc  = mcc_imsi;
+        s->uli_mnc  = mnc_imsi;
+        if (gtpv2_enc_uli_synthetic_plmn(&e, mcc_imsi, mnc_imsi) != 0)
             LOGW("translate", "encoding synthetic ULI failed");
         else
             LOGI("translate",
                  "encoded synthetic ULI (Gn had no RAI; synthetic_uli_no_rai=1) mcc=%u mnc=%u",
-                 (unsigned)mcc_sn, (unsigned)mnc_sn);
+                 (unsigned)mcc_imsi, (unsigned)mnc_imsi);
     } else {
         LOGW("translate",
              "Create PDP has no RAI IE — Create Session may be rejected (e.g. gtpv2 cause 103); "
              "enable [iwf] synthetic_uli_no_rai=1 for lab emulators that omit RAI");
     }
 
-    /* IE: Serving Network - take MCC/MNC from the IMSI's first 5 digits
-     * (heuristic: 3-digit MCC + 2-digit MNC). */
-    if (have_sn)
-        gtpv2_enc_serving_network(&e, mcc_sn, mnc_sn);
+    /* Serving Network = visited PLMN (the home PLMN), not the IMSI home PLMN.
+     * Open5GS sgwc_sess_is_inbound_roam() needs Serving Network ≠ IMSI PLMN
+     * so NWI selection can use the APN FQDN for roamers. */
+    {
+        uint16_t vmcc = 0, vmnc = 0;
+        if (iwf_config_visited_plmn(&rt->cfg, &vmcc, &vmnc) == 0)
+            gtpv2_enc_serving_network(&e, vmcc, vmnc);
+        else if (have_imsi_plmn)
+            gtpv2_enc_serving_network(&e, mcc_imsi, mnc_imsi);
+    }
 
     /* RAT Type is configurable: real UTRAN (1) but Open5GS SMF only accepts
      * EUTRAN (6) / WLAN (3). Default of 6 is set in config defaults. */
@@ -1707,8 +1755,19 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         }
     }
 
-    /* APN. */
-    if (s->apn[0]) gtpv2_enc_apn(&e, s->apn);
+    /* APN: Gn sends bare NI; for inbound roamers append home OI so SGW-C
+     * selects the FQDN Network Instance (matches MME behaviour). */
+    {
+        char apn_s4[IWF_APN_MAX];
+        iwf_apn_for_s4(&rt->cfg, imsi, s->apn, apn_s4, sizeof(apn_s4));
+        if (apn_s4[0]) {
+            gtpv2_enc_apn(&e, apn_s4);
+            if (strcmp(apn_s4, s->apn) != 0)
+                LOGI("translate",
+                     "[%s] APN S4 %s (Gn %s)",
+                     imsi, apn_s4, s->apn[0] ? s->apn : "(none)");
+        }
+    }
 
     /* Selection Mode = MS or network provided APN, subscribed verified (0). */
     gtpv2_enc_selection_mode(&e, 0);
@@ -1778,7 +1837,7 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
          total);
     iwf_log_hex("translate", "CSReq", outbuf, (size_t)total);
 
-    return iwf_send_v2(rt, outbuf, (size_t)total);
+    return iwf_send_v2_sess(rt, s, outbuf, (size_t)total);
 }
 
 static int translate_update_pdp_context(iwf_runtime_t *rt,
@@ -1910,7 +1969,7 @@ static int translate_delete_pdp_context(iwf_runtime_t *rt,
          s->sgwc_ctrl_teid);
     iwf_log_hex("translate", "DSReq", outbuf, (size_t)total);
 
-    return iwf_send_v2(rt, outbuf, (size_t)total);
+    return iwf_send_v2_sess(rt, s, outbuf, (size_t)total);
 }
 
 int translate_v1_request(iwf_runtime_t *rt,
@@ -1995,7 +2054,7 @@ static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
 
     sess_touch(s);
     iwf_log_hex("translate", "MBReq", outbuf, (size_t)total);
-    return iwf_send_v2(rt, outbuf, (size_t)total);
+    return iwf_send_v2_sess(rt, s, outbuf, (size_t)total);
 }
 
 /* ------------------------------------------------------------------- */

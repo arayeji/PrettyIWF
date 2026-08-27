@@ -34,5 +34,8 @@ int  iwf_send_v1(iwf_runtime_t *rt, const iwf_endpoint_t *to,
 int  iwf_send_v2(iwf_runtime_t *rt, const uint8_t *buf, size_t len);
 int  iwf_send_v2_addr(iwf_runtime_t *rt, const struct sockaddr_in *to,
                       socklen_t tolen, const uint8_t *buf, size_t len);
+/* GTPv2 to an explicit SGW-C (host-order IPv4 + port; 0 port → default). */
+int  iwf_send_v2_to(iwf_runtime_t *rt, uint32_t sgwc_ipv4_host,
+                    uint16_t sgwc_port, const uint8_t *buf, size_t len);
 
 #endif /* IWF_RUNTIME_H */

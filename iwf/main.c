@@ -152,6 +152,19 @@ int iwf_send_v2(iwf_runtime_t *rt, const uint8_t *buf, size_t len)
     return iwf_send_v2_addr(rt, &rt->sgwc_addr, sizeof(rt->sgwc_addr), buf, len);
 }
 
+int iwf_send_v2_to(iwf_runtime_t *rt, uint32_t sgwc_ipv4_host,
+                   uint16_t sgwc_port, const uint8_t *buf, size_t len)
+{
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(sgwc_ipv4_host ? sgwc_ipv4_host
+                                              : ntohl(rt->sgwc_addr.sin_addr.s_addr));
+    to.sin_port = htons(sgwc_port ? sgwc_port
+                                  : ntohs(rt->sgwc_addr.sin_port));
+    return iwf_send_v2_addr(rt, &to, sizeof(to), buf, len);
+}
+
 /* Epoll role tags. SOCK_GTP / SOCK_TIMER are the original GTP IWF roles;
  * the MAP-IWF roles are defined in map_iwf.h (MAP_EPOLL_ROLE_*) and sit
  * in a disjoint numeric range so there is no overlap. */

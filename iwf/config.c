@@ -67,7 +67,8 @@ static void defaults(iwf_config_t *c)
 
     c->gsup_server_enabled = 0;
     c->gsup_listen_port      = 4222;
-    strncpy(c->gsup_local_mnc, "012", sizeof(c->gsup_local_mnc) - 1);
+    snprintf(c->gsup_local_mcc, sizeof(c->gsup_local_mcc), "432");
+    snprintf(c->gsup_local_mnc, sizeof(c->gsup_local_mnc), "012");
     c->gsup_timeout_ms       = 10000;
     c->gsup_cs_backend       = GSUP_BACKEND_DIAMETER;
     c->gsup_ps_backend       = GSUP_BACKEND_DIAMETER;
@@ -455,9 +456,38 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "port")) out->mme_port = (uint16_t)atoi(val);
             else LOGW("config", "unknown key [mme].%s", key);
         } else if (!strcmp(section, "sgwc")) {
-            if      (!strcmp(key, "ip"))   copy_str(out->sgwc_ip, sizeof(out->sgwc_ip), val);
-            else if (!strcmp(key, "port")) out->sgwc_port = (uint16_t)atoi(val);
-            else LOGW("config", "unknown key [sgwc].%s", key);
+            if (!strcmp(key, "ip")) {
+                copy_str(out->sgwc_ip, sizeof(out->sgwc_ip), val);
+            } else if (!strcmp(key, "port")) {
+                out->sgwc_port = (uint16_t)atoi(val);
+            } else if (strncmp(key, "mnc", 3) == 0 &&
+                       key[3] >= '0' && key[3] <= '9' &&
+                       key[4] >= '0' && key[4] <= '9' &&
+                       key[5] >= '0' && key[5] <= '9' &&
+                       key[6] == '\0') {
+                /* mncNNN = ip  or  mncNNN = ip:port */
+                if (out->sgwc_n_by_mnc >= IWF_SGWC_MAX_BY_MNC) {
+                    LOGW("config", "too many [sgwc] mncNNN entries (max %d)",
+                         IWF_SGWC_MAX_BY_MNC);
+                } else {
+                    int i = out->sgwc_n_by_mnc++;
+                    copy_str(out->sgwc_by_mnc[i].mnc,
+                             sizeof(out->sgwc_by_mnc[i].mnc), key + 3);
+                    char buf[80];
+                    copy_str(buf, sizeof(buf), val);
+                    char *colon = strchr(buf, ':');
+                    if (colon) {
+                        *colon = '\0';
+                        out->sgwc_by_mnc[i].port = (uint16_t)atoi(colon + 1);
+                    } else {
+                        out->sgwc_by_mnc[i].port = 0;
+                    }
+                    copy_str(out->sgwc_by_mnc[i].ip,
+                             sizeof(out->sgwc_by_mnc[i].ip), buf);
+                }
+            } else {
+                LOGW("config", "unknown key [sgwc].%s", key);
+            }
         } else if (!strcmp(section, "smf")) {
             if      (!strcmp(key, "ip"))   copy_str(out->smf_ip, sizeof(out->smf_ip), val);
             else if (!strcmp(key, "teid")) out->smf_teid = (uint32_t)strtoul(val, NULL, 0);
@@ -583,6 +613,7 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "listen_port"))    out->gsup_listen_port = (uint16_t)atoi(val);
             else if (!strcmp(key, "listen_ip"))      gsup_listen_ip_add(out, val);
             else if (!strcmp(key, "listen_ips"))     gsup_listen_ips_split(out, val);
+            else if (!strcmp(key, "local_mcc"))      copy_str(out->gsup_local_mcc, sizeof(out->gsup_local_mcc), val);
             else if (!strcmp(key, "local_mnc"))      copy_str(out->gsup_local_mnc, sizeof(out->gsup_local_mnc), val);
             else if (!strcmp(key, "timeout_ms"))     out->gsup_timeout_ms = atoi(val);
             else if (!strcmp(key, "cs_backend"))     out->gsup_cs_backend = parse_gsup_backend(val);
@@ -703,6 +734,16 @@ void iwf_config_dump(const iwf_config_t *c)
          sel[0] ? sel : "-",
          c->pgw_cache_ttl_s,
          c->log_level, c->log_file);
+    if (c->sgwc_n_by_mnc > 0) {
+        for (int i = 0; i < c->sgwc_n_by_mnc; i++) {
+            LOGI("config",
+                 "sgwc mnc%s -> %s:%u",
+                 c->sgwc_by_mnc[i].mnc,
+                 c->sgwc_by_mnc[i].ip,
+                 (unsigned)(c->sgwc_by_mnc[i].port
+                            ? c->sgwc_by_mnc[i].port : c->sgwc_port));
+        }
+    }
 
     if (c->map_iwf_enabled) {
         LOGI("config",
@@ -862,4 +903,136 @@ int iwf_config_pgw_select(const iwf_config_t *cfg, const char *imsi,
         n = IWF_PGW_SELECT_MAX;
     memcpy(out, cfg->pgw_select, (size_t)n);
     return n;
+}
+
+static int sgwc_by_mnc_idx(const iwf_config_t *cfg, const char *mnc_key)
+{
+    for (int i = 0; i < cfg->sgwc_n_by_mnc; i++)
+        if (!strcmp(cfg->sgwc_by_mnc[i].mnc, mnc_key))
+            return i;
+    return -1;
+}
+
+static int sgwc_idx_for_imsi(const iwf_config_t *cfg, const char *imsi)
+{
+    if (!cfg || !imsi || strlen(imsi) < 5)
+        return -1;
+    char key[4];
+    snprintf(key, sizeof(key), "%03u",
+             (unsigned)((imsi[3] - '0') * 10 + (imsi[4] - '0')));
+    int idx = sgwc_by_mnc_idx(cfg, key);
+    if (idx < 0 && strlen(imsi) >= 6 &&
+        imsi[5] >= '0' && imsi[5] <= '9') {
+        snprintf(key, sizeof(key), "%03u",
+                 (unsigned)((imsi[3] - '0') * 100 + (imsi[4] - '0') * 10 +
+                            (imsi[5] - '0')));
+        idx = sgwc_by_mnc_idx(cfg, key);
+    }
+    return idx;
+}
+
+int iwf_config_sgwc_for_imsi(const iwf_config_t *cfg, const char *imsi,
+                             char *ip_out, size_t ip_cap, uint16_t *port_out)
+{
+    if (!cfg || !ip_out || !ip_cap || !port_out)
+        return -1;
+    ip_out[0] = '\0';
+    *port_out = cfg->sgwc_port ? cfg->sgwc_port : (uint16_t)2123;
+
+    int idx = sgwc_idx_for_imsi(cfg, imsi);
+    if (idx >= 0 && cfg->sgwc_by_mnc[idx].ip[0]) {
+        copy_str(ip_out, ip_cap, cfg->sgwc_by_mnc[idx].ip);
+        if (cfg->sgwc_by_mnc[idx].port)
+            *port_out = cfg->sgwc_by_mnc[idx].port;
+        return 0;
+    }
+    if (!cfg->sgwc_ip[0])
+        return -1;
+    copy_str(ip_out, ip_cap, cfg->sgwc_ip);
+    return 0;
+}
+
+int iwf_config_visited_plmn(const iwf_config_t *cfg,
+                            uint16_t *mcc, uint16_t *mnc)
+{
+    if (!cfg || !mcc || !mnc)
+        return -1;
+    if (!cfg->gsup_local_mnc[0])
+        return -1;
+    *mcc = cfg->gsup_local_mcc[0]
+               ? (uint16_t)atoi(cfg->gsup_local_mcc)
+               : (uint16_t)432;
+    *mnc = (uint16_t)atoi(cfg->gsup_local_mnc);
+    return 0;
+}
+
+int iwf_config_imsi_is_roamer(const iwf_config_t *cfg, const char *imsi)
+{
+    uint16_t vmcc = 0, vmnc = 0;
+    if (iwf_config_visited_plmn(cfg, &vmcc, &vmnc) < 0 || !imsi ||
+        strlen(imsi) < 5)
+        return 0;
+    unsigned a = 0, b = 0, c = 0, d = 0, e = 0;
+    if (sscanf(imsi, "%1u%1u%1u%1u%1u", &a, &b, &c, &d, &e) != 5)
+        return 0;
+    uint16_t imsi_mcc = (uint16_t)(a * 100u + b * 10u + c);
+    uint16_t imsi_mnc2 = (uint16_t)(d * 10u + e);
+    if (imsi_mcc != vmcc)
+        return 1;
+    /* local_mnc "012" -> 12; IMSI …12… -> 12. Also accept exact 3-digit match. */
+    if (imsi_mnc2 == vmnc || imsi_mnc2 == (vmnc % 100))
+        return 0;
+    if (strlen(imsi) >= 6 && isdigit((unsigned char)imsi[5])) {
+        uint16_t imsi_mnc3 = (uint16_t)(d * 100u + e * 10u +
+                                        (unsigned)(imsi[5] - '0'));
+        if (imsi_mnc3 == vmnc)
+            return 0;
+    }
+    return 1;
+}
+
+void iwf_apn_for_s4(const iwf_config_t *cfg, const char *imsi,
+                    const char *src_apn, char *out, size_t out_cap)
+{
+    if (!out || !out_cap)
+        return;
+    out[0] = '\0';
+    if (!src_apn || !src_apn[0])
+        return;
+    strncpy(out, src_apn, out_cap - 1);
+    out[out_cap - 1] = '\0';
+    iwf_apn_normalize(out);
+
+    /* Already an OI-bearing FQDN (.mnc… / .gprs / 3gppnetwork.org). */
+    if (strstr(out, ".mnc") || strstr(out, ".gprs") ||
+        strstr(out, ".3gppnetwork.org"))
+        return;
+
+    if (!iwf_config_imsi_is_roamer(cfg, imsi) || !imsi || strlen(imsi) < 5)
+        return;
+
+    unsigned a = 0, b = 0, c = 0, d = 0, e = 0;
+    if (sscanf(imsi, "%1u%1u%1u%1u%1u", &a, &b, &c, &d, &e) != 5)
+        return;
+    uint16_t mcc = (uint16_t)(a * 100u + b * 10u + c);
+    /* Prefer configured partner 3-digit MNC; else zero-pad IMSI 2-digit MNC
+     * (00102 -> mnc002, 00103 -> mnc003 — matches MME / VPP NWI form). */
+    uint16_t mnc = (uint16_t)(d * 10u + e);
+    int ridx = roam_route_idx_for_imsi(cfg, imsi);
+    if (ridx >= 0)
+        mnc = (uint16_t)atoi(cfg->gsup_roam_routes[ridx].mnc);
+    else {
+        int sidx = sgwc_idx_for_imsi(cfg, imsi);
+        if (sidx >= 0)
+            mnc = (uint16_t)atoi(cfg->sgwc_by_mnc[sidx].mnc);
+    }
+
+    char oi[48];
+    snprintf(oi, sizeof(oi), ".mnc%03u.mcc%03u.gprs",
+             (unsigned)mnc, (unsigned)mcc);
+    size_t al = strlen(out);
+    size_t ol = strlen(oi);
+    if (al + ol + 1 > out_cap)
+        return;
+    memcpy(out + al, oi, ol + 1);
 }

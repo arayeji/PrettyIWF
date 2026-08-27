@@ -63,7 +63,8 @@ typedef struct sess_s {
     uint32_t    iwf_ctrl_teid;        /* TEID we tell osmo-sgsn (GGSN ctrl) */
 
     /* GTPv2 (S4 / SGW-C side) */
-    uint32_t    sgwc_addr_ipv4;       /* SGW-C control IP */
+    uint32_t    sgwc_addr_ipv4;       /* SGW-C control IP (host order) */
+    uint16_t    sgwc_port;            /* SGW-C UDP port (host order); 0 = default */
     uint32_t    sgwc_ctrl_teid;       /* SGW-C control-plane TEID for this session */
     uint32_t    iwf_s4_c_teid;        /* TEID we present as S4-SGSN GTP-C F-TEID */
     uint32_t    sgwu_addr_ipv4;       /* SGW-U IP returned in CSResp F-TEID */

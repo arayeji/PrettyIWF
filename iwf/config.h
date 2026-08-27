@@ -20,9 +20,18 @@ typedef struct {
     char        mme_ip[64];
     uint16_t    mme_port;
 
-    /* [sgwc] - the Open5GS SGW-C we send GTPv2-C to */
+    /* [sgwc] - default Open5GS SGW-C for GTPv2-C, plus optional per-MNC
+     * overrides (IMSI home PLMN). Keys: mnc002 = 10.0.0.30 or
+     * mnc003 = 10.0.0.31:2123. Unmatched IMSI uses sgwc_ip/sgwc_port. */
     char        sgwc_ip[64];
     uint16_t    sgwc_port;
+#define IWF_SGWC_MAX_BY_MNC 8
+    struct {
+        char     mnc[4];              /* three-digit MNC, e.g. "035" */
+        char     ip[64];
+        uint16_t port;                /* 0 = inherit default sgwc_port */
+    } sgwc_by_mnc[IWF_SGWC_MAX_BY_MNC];
+    int         sgwc_n_by_mnc;
 
     /* [smf] PGW-C / SMF GTP-C (S5/S8) — F-TEID IE instance 1 in Create Session Request.
      * Used when pgw_select includes smf. Optional if ULA / per-partner PGW covers all. */
@@ -160,7 +169,8 @@ typedef struct {
 #define GSUP_MAX_LISTEN_IPS 8
     char        gsup_listen_ips[GSUP_MAX_LISTEN_IPS][64];
     int         gsup_n_listen_ips;
-    char        gsup_local_mnc[4];        /* home PLMN MNC digits, default 012 */
+    char        gsup_local_mcc[4];        /* visited/home MCC digits, default 432 */
+    char        gsup_local_mnc[4];        /* visited PLMN MNC digits, default 012 */
     int         gsup_timeout_ms;
     /* CN-domain eastbound backends for GSUP combine mode (CSFB vs PS):
      *   cs_backend = map|diameter   (default diameter)
@@ -251,5 +261,23 @@ int  iwf_config_roam_pgw(const iwf_config_t *cfg, const char *imsi,
  * Writes up to IWF_PGW_SELECT_MAX tokens into out[]; returns count (>= 1). */
 int  iwf_config_pgw_select(const iwf_config_t *cfg, const char *imsi,
                            uint8_t out[IWF_PGW_SELECT_MAX]);
+
+/* Resolve SGW-C peer for an IMSI (per-MNC override or default [sgwc]).
+ * Writes IPv4 string + port; returns 0 on success, -1 if no usable address. */
+int  iwf_config_sgwc_for_imsi(const iwf_config_t *cfg, const char *imsi,
+                              char *ip_out, size_t ip_cap, uint16_t *port_out);
+
+/* Visited PLMN (Serving Network) from [gsup_server] local_mcc/local_mnc.
+ * Returns 0 and fills mcc/mnc out-params, or -1 if unset. */
+int  iwf_config_visited_plmn(const iwf_config_t *cfg,
+                             uint16_t *mcc, uint16_t *mnc);
+
+/* 1 if IMSI home PLMN differs from visited PLMN (inbound roamer on this IWF). */
+int  iwf_config_imsi_is_roamer(const iwf_config_t *cfg, const char *imsi);
+
+/* Build S4 APN: bare NI from Gn, or NI.mncXXX.mccYYY.gprs for roamers.
+ * Copies src_apn as-is when already FQDN / home subscriber / empty. */
+void iwf_apn_for_s4(const iwf_config_t *cfg, const char *imsi,
+                    const char *src_apn, char *out, size_t out_cap);
 
 #endif /* IWF_CONFIG_H */
