@@ -75,6 +75,7 @@
 #define GTPV1_CAUSE_NO_RESOURCES           199
 #define GTPV1_CAUSE_SERVICE_NOT_SUPPORTED  200
 #define GTPV1_CAUSE_SYSTEM_FAILURE         204
+#define GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN 219 /* TS 29.060 §7.7.1 */
 /* "Unknown PDP address or PDP type" — osmo-sgsn maps this to SM cause 28
  * (gtp2sm_cause_map in sgsn_libgtp.c). Per TS 24.008 §6.1.3.1.5, an MS that
  * receives SM cause 28 in response to a *secondary* Activate-PDP for the

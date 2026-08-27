@@ -37,7 +37,7 @@ typedef enum {
 } sess_state_t;
 
 #define IWF_IMSI_MAX 20       /* 15-digit IMSI + NUL; 8 BCD octets can hold up to 16 digits */
-#define IWF_APN_MAX  64
+#define IWF_APN_MAX  128 /* NI + .mncXXX.mccYYY.gprs for inbound roamers */
 #define IWF_MSISDN_MAX 24     /* E.164 BCD in IE can be long; + NUL */
 
 typedef struct {

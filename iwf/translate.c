@@ -1520,6 +1520,25 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
         gtpv1_decode_teid(ie, &s->sgsn_ctrl_teid);
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_TEID_DATA_I)))
         gtpv1_decode_teid(ie, &s->sgsn_data_teid);
+
+    if (!s->apn[0]) {
+        /* Open5GS SGW-C rejects CSReq without APN (cause 70); answer Gn
+         * immediately instead of burning an S11 transaction. */
+        LOGW("translate",
+             "[%s] Create-PDP has no APN — rejecting (Missing or unknown APN)",
+             imsi);
+        uint8_t outbuf[IWF_MAX_PKT];
+        gtpv1_enc_t er;
+        gtpv1_enc_init(&er, outbuf, sizeof(outbuf));
+        gtpv1_enc_begin(&er, GTPV1_CREATE_PDP_CONTEXT_RESPONSE,
+                        s->sgsn_ctrl_teid, (uint16_t)v1->seq);
+        gtpv1_enc_cause(&er, GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN);
+        int total = gtpv1_enc_finish(&er);
+        if (total > 0)
+            (void)iwf_send_v1(rt, from, outbuf, (size_t)total);
+        sess_remove(s);
+        return 0;
+    }
     /* S4-SGSN-U F-TEID IPv4 must match the source of real GTP-U (sgsnemu host).
      * TS 29.060 orders two IE 133 as Control Plane then User Traffic; the first
      * IE alone is often only control — Open5GS would then expect GTP-U from the
@@ -1651,8 +1670,10 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
      * (bit 5 of octet 2) to advertise Direct Tunnel support. */
     gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00);
 
-    /* Sender F-TEID for Control Plane = S4-SGSN GTP-C, our own. */
-    gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S4_SGSN_GTPC,
+    /* Sender F-TEID = S11 MME GTP-C. This Open5GS SGW-C only speaks S11
+     * (logs peer as MME[IWF]); iface 17 (S4-SGSN) is accepted for TEID
+     * storage but diverges from the working MME Create Session path. */
+    gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S11_MME_GTPC,
                          s->iwf_s4_c_teid, ntohl(rt->local_ipv4_be));
 
     /* PGW/SMF S5/S8-C F-TEID (instance 1) — Open5GS SGWC requires this IE or
@@ -1799,25 +1820,22 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
                         &mbr_ul, &mbr_dl, &gbr_ul, &gbr_dl,
                         &ambr_ul, &ambr_dl);
 
-    /* Bearer Context to be created (grouped IE 93, instance 0). */
+    /* Bearer Context to be created — match working MME: EBI + QoS only.
+     * Access-side U-plane F-TEID is supplied on Modify Bearer (after CSResp),
+     * not on Create Session. */
+    if (!s->sgsn_addr_ipv4) {
+        LOGE("translate",
+             "[%s] Create-Session: cannot derive access GTP-U IPv4 "
+             "(no GSN IE, invalid peer)",
+             imsi);
+        sess_remove(s);
+        return -1;
+    }
     size_t patch_pos;
     gtpv2_enc_group_begin(&e, GTPV2_IE_BEARER_CONTEXT, 0, &patch_pos);
         gtpv2_enc_ebi(&e, /*instance*/ 0, nsapi);       /* NSAPI -> EBI */
         gtpv2_enc_bearer_qos(&e, pci, pl, pvi, qci,
                              mbr_ul, mbr_dl, gbr_ul, gbr_dl);
-        /* S4-SGSN F-TEID for User Plane. For Direct Tunnel this will be
-         * updated later via Modify Bearer Request once the RNC TEID is
-         * known.  We send a placeholder (the SGSN's data TEID) here so the
-         * SGW-U has somewhere to forward DL packets if Update is delayed. */
-        if (!s->sgsn_addr_ipv4) {
-            LOGE("translate",
-         "[%s] Create-Session: cannot derive S4-SGSN-U IPv4 (no GSN IE, invalid peer)",
-         imsi);
-            sess_remove(s);
-            return -1;
-        }
-        gtpv2_enc_fteid_ipv4(&e, /*instance*/ 1, FTEID_IFACE_S4_SGSN_GTPU,
-                             s->sgsn_data_teid, s->sgsn_addr_ipv4);
     gtpv2_enc_group_finish(&e, patch_pos);
 
     int total = gtpv2_enc_finish(&e);
@@ -2027,25 +2045,20 @@ static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
         gtpv2_enc_uli_synthetic_plmn(&e, s->uli_mcc, s->uli_mnc);
     }
 
-    /* Sender F-TEID for Control Plane (S4-SGSN GTP-C) — Open5GS sgwcd treats
-     * this as conditional/mandatory on MBReq to identify the S4-SGSN peer. */
-    gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S4_SGSN_GTPC,
+    /* Sender F-TEID = S11 MME GTP-C (same peer identity as Create Session). */
+    gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S11_MME_GTPC,
                          s->iwf_s4_c_teid, ntohl(rt->local_ipv4_be));
 
     gtpv2_enc_rat_type(&e, rt->cfg.rat_type);
     gtpv2_enc_indication(&e, 0x00, 0x40, 0x00, 0x00); /* DTF */
 
-    /* Bearer Context (modified). Open5GS sgwc validates the access-side F-TEID
-     * by *instance number* (sgwc/s11-handler.c looks at instance 0, which it
-     * names s1_u_enodeb_f_teid), not by interface-type. For S4 interworking we
-     * still set Interface Type = S4-SGSN GTP-U (15) — Open5GS only reads
-     * TEID + IPv4 on this path — but the IE instance must be 0 or cause 70
-     * (Mandatory IE Missing) comes back even though instance 1 is the spec
-     * slot for S4-SGSN F-TEID in Modify Bearer Request. */
+    /* Bearer Context (modified). Open5GS sgwc reads access F-TEID from
+     * bearer instance 0 (field named s1_u_enodeb_f_teid). Use S1-U eNB
+     * iface type 0 like the MME; only TEID+IPv4 are consumed. */
     size_t patch_pos;
     gtpv2_enc_group_begin(&e, GTPV2_IE_BEARER_CONTEXT, 0, &patch_pos);
         gtpv2_enc_ebi(&e, 0, ebi);
-        gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S4_SGSN_GTPU,
+        gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S1U_ENB_GTPU,
                              s->sgsn_data_teid, s->sgsn_addr_ipv4);
     gtpv2_enc_group_finish(&e, patch_pos);
 
