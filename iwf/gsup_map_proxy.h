@@ -48,12 +48,6 @@ bool gsup_map_proxy_hss_idr(struct iwf_runtime *rt, const char *imsi,
                             uint8_t cn_domain, const char *msisdn,
                             const map_ula_apn_entry_t *apns, size_t n_apns);
 
-/* Inbound MAP-C UL from a visited VLR (outbound roam): push GSUP ISD_REQ to
- * the home MSC so it learns IMSI+MSISDN for MT-SMS / SGs delivery.  Does not
- * block the MAP UL dialogue toward the foreign VLR. */
-bool gsup_map_proxy_push_cs_isd(struct iwf_runtime *rt, const char *imsi,
-                                const char *msisdn);
-
 /* True if IMSI has a live tracked GSUP connection for cn_domain (or either
  * if cn_domain == 0). */
 bool gsup_map_proxy_imsi_known(const char *imsi, uint8_t cn_domain);

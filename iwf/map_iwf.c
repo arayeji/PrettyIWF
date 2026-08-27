@@ -28,8 +28,8 @@
  *   VLR -> IWF: TCAP-Begin (AARQ=networkLocUpContext-v3, Invoke updateLocation)
  *   IWF -> HSS: Diameter ULR (CS flags, SGSN-Number = MAP vlr-Number)
  *   HSS -> IWF: Diameter ULA + MSISDN
- *   IWF -> MSC: GSUP ISD_REQ (home MSC learns IMSI+MSISDN for MT-SMS/SGs)
  *   IWF -> VLR: TCAP-Continue (AARE + Invoke ISD) on the same dialogue
+ *   (GSUP ISD to home MSC only after MSC GSUP UL_REQ — VLR row from SGs LU)
  *   VLR -> IWF: TCAP-Continue/End (ISD ReturnResult)
  *   IWF -> VLR: TCAP-End (updateLocation ReturnResult)
  *
@@ -2038,10 +2038,15 @@ void map_iwf_on_ula(struct iwf_runtime *rt, map_session_t *s,
                     (s->map_op == MAP_OP_UGL && s->n_ula_apns > 0);
     if (s->have_ula_subdata && need_isd) {
 #ifdef GSUP_PROXY_ENABLED
-        /* Outbound roam: foreign VLR UL updates HSS; home MSC still needs
-         * GSUP ISD so MT-SMS / SGs delivery has a local VLR record. */
-        if (s->map_op == MAP_OP_UL && s->msisdn_str[0])
-            (void)gsup_map_proxy_push_cs_isd(rt, s->imsi_str, s->msisdn_str);
+        /* Outbound roam: a roaming partner MAP UL updates HSS. Do not push GSUP ISD to
+         * home MSC here — OsmoMSC VLR only accepts ISD after its own GSUP
+         * UL_REQ (SGs/Iu attach). ISD follows MSC UL in gsup_map_proxy_send_isd. */
+        if (s->map_op == MAP_OP_UL && s->msisdn_str[0]) {
+            gsup_map_proxy_note_msisdn(s->imsi_str, s->msisdn_str);
+            LOGI("map",
+                 "[%s] inbound MAP UL: MSISDN noted; GSUP ISD deferred until MSC UL_REQ",
+                 s->imsi_str);
+        }
 #endif
         send_isd_invoke(rt, s, rt->cfg.map_isd_before_loc_up);
         return;
