@@ -1,29 +1,75 @@
-***REMOVED***
-***REMOVED***
+# Redact production deployment data from entire git history (git filter-repo --replace-text).
+# Longest / most specific literals first.
 
-literal:10.0.0.50==>10.0.0.50
-literal:10.0.0.42==>10.0.0.42
-literal:10.0.0.40==>10.0.0.40
-literal:10.0.0.33==>10.0.0.33
-literal:10.0.0.30==>10.0.0.30
-literal:10.0.0.21==>10.0.0.21
-literal:10.0.0.20==>10.0.0.20
-literal:10.0.0.5==>10.0.0.5
-literal:10.0.0.9==>10.0.0.9
-literal:10.0.0.x==>10.0.0.x
-literal:1234567890123==>1234567890123
-literal:1234567890123==>1234567890123
-literal:1234567890==>1234567890
-literal:1234567890006==>1234567890006
-literal:1234567890000==>1234567890000
-literal:changeme==>changeme
-literal:lab-epc01==>lab-epc01
-literal:lab-msc01==>lab-msc01
-literal:deploy-user==>deploy-user
-literal:12345,12346,12347==>12345,12346,12347
-literal:22345,22346,22347==>22345,22346,22347
-literal:partner.example==>partner.example
-literal:partner.example2==>partner.example2
-literal:FILL_IN_PARTNER_HLR_GT==>FILL_IN_PARTNER_HLR_GT
-literal:FILL_IN_PARTNER2_HLR_GT==>FILL_IN_PARTNER2_HLR_GT
-literal:roaming partner route via `as-roam`==>roaming partner route via `as-roam`
+literal:10.234.241.50==>10.0.0.50
+literal:10.234.241.42==>10.0.0.42
+literal:10.234.241.40==>10.0.0.40
+literal:10.234.241.33==>10.0.0.33
+literal:10.234.241.30==>10.0.0.30
+literal:10.234.241.21==>10.0.0.21
+literal:10.234.241.20==>10.0.0.20
+literal:10.234.241.10==>10.0.0.5
+literal:10.234.241.9==>10.0.0.9
+literal:10.234.241.x==>10.0.0.x
+literal:989350020001==>1234567890123
+literal:989110020001==>1234567890123
+literal:98921000000==>1234567890
+literal:989000002006==>1234567890006
+literal:989000002000==>1234567890000
+literal:iwfsms==>changeme
+literal:THR1EPC01==>lab-epc01
+literal:THR1MSC01==>lab-msc01
+literal:superadmin==>deploy-user
+literal:98910,98911,98912,98913,98914,98919==>12345,12346,12347
+literal:98935,98936,98937,98938,98941,98930==>22345,22346,22347
+literal:partner.mci==>partner.example
+literal:partner.mtni==>partner.example2
+literal:FILL_IN_MCI_HLR_GT==>FILL_IN_PARTNER_HLR_GT
+literal:FILL_IN_MTNI_HLR_GT==>FILL_IN_PARTNER2_HLR_GT
+literal:Irancell route via `as-mtni`==>roaming partner route via `as-roam`
+
+# --- PLMN identity, subscriber identifiers and operator names ---------------
+# Test PLMN per ITU-T E.212: MCC 001. Home = mnc001, partners mnc002..mnc004.
+# Longest first, so the msisdn_prefixes lists above are consumed before the
+# bare prefixes below.
+literal:432350745708372==>001010000000001
+literal:432129951502906==>001010000000002
+literal:432120000000001==>001010000000003
+literal:989950090000-989950099999==>990000000000-990000009999
+literal:989950080000-989950089999==>990000010000-990000019999
+literal:989950090123==>990000000123
+literal:989000002001==>990000000004
+literal:989950002001==>990000000003
+literal:mnc012.mcc432==>mnc001.mcc001
+literal:mnc011.mcc432==>mnc002.mcc001
+literal:mnc035.mcc432==>mnc003.mcc001
+literal:mnc020.mcc432==>mnc004.mcc001
+literal:mnc012==>mnc001
+literal:mnc011==>mnc002
+literal:mnc035==>mnc003
+literal:mnc020==>mnc004
+literal:mcc432==>mcc001
+literal:43212,43246==>00101,00102
+literal:432350==>001010
+literal:43211==>00102
+literal:43212==>00101
+literal:43235==>00103
+literal:43246==>00102
+literal:98935==>99001
+literal:mcinet==>partnernet
+literal:Irancell==>a roaming partner
+literal:HiWEB==>the home PLMN
+literal:hiweb==>partnernet
+literal::thr1==>:msc1
+literal::thr2==>:msc2
+literal:98921000001==>990000000001
+literal:98921000002==>990000000002
+literal:THR1EPC==>lab-epc
+literal:THR1MSC==>lab-msc
+literal:THR1==>lab1
+literal:THR2==>lab2
+literal:http://172.16.7.42/DefaultCollection/IWF/_git/IWF==>http://git.internal.example/IWF/_git/IWF
+literal:172.16.7.42==>172.16.0.1
+
+# Commit messages are NOT covered by --replace-text; the script passes this
+# same file to --replace-message as well so names in messages are scrubbed too.
