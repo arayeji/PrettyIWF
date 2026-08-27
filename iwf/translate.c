@@ -683,21 +683,25 @@ static uint8_t map_gtpu_v2_cause_to_v1_basic(uint8_t c)
 }
 
 /* Map a GTPv2 cause (TS 29.274 §8.4) to a GTPv1 cause (TS 29.060 §7.7.1)
- * for Create / Modify / Update / Delete PDP Context Responses. We have only
- * a handful of GTPv1 causes available, so this is a many-to-few mapping; we
- * default to "No resources available" (199) which is what osmo-sgsn already
- * surfaces as a generic attach failure. */
+ * for Create / Modify / Update / Delete PDP Context Responses.
+ *
+ * Do NOT map SGW-C IE/path failures to GTPv1 193 "Invalid message format":
+ * that cause is displayed on the *Gn* Create-PDP Response and makes the
+ * SGSN request look malformed when the real failure was S11/S4 (e.g. no
+ * APN, bad NWI, missing PGW). Prefer 199 / 204 so Wireshark matches reality. */
 static uint8_t map_gtpv2_cause_to_v1_pdp_resp(uint8_t c)
 {
     switch (c) {
     case 16:  return GTPV1_CAUSE_REQUEST_ACCEPTED;   /* Request accepted    */
     case 64:  return GTPV1_CAUSE_NON_EXISTENT;       /* Context Not Found   */
-    case 65:                                          /* Invalid Message Fmt */
+    case 72:  return GTPV1_CAUSE_SYSTEM_FAILURE;     /* System failure      */
+    case 73:                                          /* No resources from SGW */
+    case 74:  return GTPV1_CAUSE_NO_RESOURCES;       /* No resources avail. */
+    case 65:                                          /* Invalid msg (on S11) */
     case 67:                                          /* Invalid length      */
     case 69:                                          /* Mandatory IE incorr.*/
     case 70:                                          /* Mandatory IE missing*/
-    case 103: return GTPV1_CAUSE_INVALID_MESSAGE;    /* Conditional IE miss.*/
-    case 72:  return GTPV1_CAUSE_SYSTEM_FAILURE;     /* System failure      */
+    case 103: return GTPV1_CAUSE_NO_RESOURCES;       /* Cond. IE missing    */
     default:  return GTPV1_CAUSE_NO_RESOURCES;
     }
 }
