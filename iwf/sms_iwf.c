@@ -287,6 +287,32 @@ static int sms_mt_err_absent(const sms_session_t *s)
            ? MAP_ERR_ABSENT_SUBSCRIBER_SM : MAP_ERR_ABSENT_SUBSCRIBER;
 }
 
+/* MAP error for MT-ForwardSM failure relayed from osmo-msc over GSUP.
+ * MSC returns GMM cause 0x02 (IMSI unknown in VLR) when the subscriber
+ * never LU'd here — map to unidentifiedSubscriber so the SMSC/HLR treat
+ * this as "not at this MSC", not an IWF crash (systemFailure). */
+static int sms_mt_map_error(const sms_session_t *s, const gsup_parsed_t *m)
+{
+    if (m->have_cause) {
+        switch (m->cause) {
+        case GSUP_CAUSE_IMSI_UNKNOWN:
+            return MAP_ERR_UNIDENTIFIED_SUBSCRIBER;
+        case GSUP_CAUSE_ROAM_NOTALLOWED:
+        case GSUP_CAUSE_PLMN_NOTALLOWED:
+            return MAP_ERR_ROAMING_NOT_ALLOWED;
+        default:
+            break;
+        }
+    }
+    if (m->have_sm_rp_cause) {
+        uint8_t rp = m->sm_rp_cause;
+        /* GSM 04.11: UE unreachable / unknown at this node. */
+        if (rp == 27 || rp == 28 || rp == 30)
+            return sms_mt_err_absent(s);
+    }
+    return MAP_ERR_SYSTEM_FAILURE;
+}
+
 void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
                        const ss7_sccp_addr_t *calling,
                        const tcap_msg_t *tmsg,
@@ -398,13 +424,17 @@ void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *m)
              found->imsi, (unsigned)found->sm_rp_mr);
         sms_mt_send_end(found, 0, found->mt_op, NULL, 0);
     } else {
-        /* GSM 04.11 RP causes 27/28/30 mean the UE is unreachable/unknown
-         * here -> absentSubscriber so the SMSC retries + sets MWD. */
-        uint8_t rp = m->have_sm_rp_cause ? m->sm_rp_cause : 38;
-        int ec = (rp == 27 || rp == 28 || rp == 30)
-                 ? sms_mt_err_absent(found) : MAP_ERR_SYSTEM_FAILURE;
-        LOGI("sms", "[%s] MT-FSM failed rp_cause=%u -> MAP err=%d",
-             found->imsi, (unsigned)rp, ec);
+        int ec = sms_mt_map_error(found, m);
+        if (m->have_cause)
+            LOGI("sms",
+                 "[%s] MT-FSM failed gsup_cause=0x%02x rp_cause=%u -> MAP err=%d",
+                 found->imsi, (unsigned)m->cause,
+                 m->have_sm_rp_cause ? (unsigned)m->sm_rp_cause : 255u, ec);
+        else
+            LOGI("sms",
+                 "[%s] MT-FSM failed rp_cause=%u -> MAP err=%d",
+                 found->imsi,
+                 m->have_sm_rp_cause ? (unsigned)m->sm_rp_cause : 255u, ec);
         sms_mt_send_end(found, 1, ec, NULL, 0);
     }
     sms_sess_remove(found);

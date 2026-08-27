@@ -111,6 +111,8 @@ typedef struct {
     bool     have_resync_auts;
     uint8_t  sm_rp_mr;
     bool     have_sm_rp_mr;
+    uint8_t  cause;              /* GSUP_IE_CAUSE (GMM cause, e.g. IMSI unknown) */
+    bool     have_cause;
     uint8_t  sm_rp_cause;
     bool     have_sm_rp_cause;
     uint8_t  sm_alert_reason;

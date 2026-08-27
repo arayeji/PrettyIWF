@@ -57,6 +57,7 @@
 
 /* MAP error codes we may receive/send (TS 29.002 §17.6). */
 #define MAP_ERR_UNKNOWN_SUBSCRIBER          1
+#define MAP_ERR_UNIDENTIFIED_SUBSCRIBER     5   /* MT-ForwardSM: not at this VLR */
 #define MAP_ERR_ABSENT_SUBSCRIBER_SM        6   /* MAP v3 SMS */
 #define MAP_ERR_ABSENT_SUBSCRIBER           27  /* MAP v1/v2 SMS */
 #define MAP_ERR_ROAMING_NOT_ALLOWED         8

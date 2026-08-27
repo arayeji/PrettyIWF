@@ -82,6 +82,12 @@ int gsup_parse_payload(const uint8_t *body, size_t len, gsup_parsed_t *out)
                 out->have_sm_rp_mr = true;
             }
             break;
+        case GSUP_IE_CAUSE:
+            if (l >= 1) {
+                out->cause = v[0];
+                out->have_cause = true;
+            }
+            break;
         case GSUP_IE_SM_RP_CAUSE:
             if (l >= 1) {
                 out->sm_rp_cause = v[0];
