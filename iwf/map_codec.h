@@ -185,9 +185,11 @@ int map_decode_mt_fsm_arg(const uint8_t *p, size_t n,
                           const uint8_t **ui, size_t *ui_len,
                           int *more);
 /* MO submission relay: [MO-]ForwardSM-Arg with sm-RP-DA =
- * serviceCentreAddressDA, sm-RP-OA = msisdn, sm-RP-UI = SMS-SUBMIT TPDU. */
+ * serviceCentreAddressDA, sm-RP-OA = msisdn, sm-RP-UI = SMS-SUBMIT TPDU,
+ * and optional trailing imsi (needed by many home SMSCs for roaming MO). */
 int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
                              const uint8_t *tpdu, size_t tpdu_len,
+                             const char *imsi_str,
                              uint8_t *out, size_t out_cap);
 
 /* ReadyForSM-Arg (our VLR -> home HLR): imsi [0], alertReason ENUMERATED

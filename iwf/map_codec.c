@@ -1595,12 +1595,16 @@ static int enc_addr_string_91(const char *digits, uint8_t *out, size_t cap)
 
 int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
                              const uint8_t *tpdu, size_t tpdu_len,
+                             const char *imsi_str,
                              uint8_t *out, size_t out_cap)
 {
-    /* ForwardSM-Arg ::= SEQUENCE {
-     *   sm-RP-DA serviceCentreAddressDA [4] IMPLICIT AddressString,
-     *   sm-RP-OA msisdn [2] IMPLICIT ISDN-AddressString,
-     *   sm-RP-UI OCTET STRING }                                          */
+    /* MO-ForwardSM-Arg ::= SEQUENCE {
+     *   sm-RP-DA  serviceCentreAddressDA [4] IMPLICIT AddressString,
+     *   sm-RP-OA  msisdn [2] IMPLICIT ISDN-AddressString,
+     *   sm-RP-UI  SignalInfo,
+     *   extensionContainer ExtensionContainer OPTIONAL,
+     *   ...,
+     *   imsi IMSI OPTIONAL }                                             */
     if (!tpdu || !tpdu_len) return -1;
     uint8_t da[16], oa[16];
     int dl = enc_addr_string_91(smsc_digits, da, sizeof(da));
@@ -1615,6 +1619,14 @@ int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
         return -1;
     if (ber_enc_tlv(body, sizeof(body), &bo, 0x04, tpdu, tpdu_len) < 0)
         return -1;
+    if (imsi_str && imsi_str[0]) {
+        uint8_t imsi_bcd[8];
+        int il = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
+        if (il < 0) return -1;
+        /* Untagged IMSI after extension marker — OCTET STRING (TBCD). */
+        if (ber_enc_tlv(body, sizeof(body), &bo, 0x04, imsi_bcd, (size_t)il) < 0)
+            return -1;
+    }
 
     size_t off = 0;
     if (ber_enc_tlv(out, out_cap, &off, 0x30, body, bo) < 0) return -1;

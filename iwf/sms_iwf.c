@@ -727,7 +727,7 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
 
     uint8_t arg[400];
     int an = map_encode_mo_fwd_sm_arg(smsc, oa, m->sm_rp_ui, m->sm_rp_ui_len,
-                                      arg, sizeof(arg));
+                                      m->imsi, arg, sizeof(arg));
     if (an < 0) {
         sms_mo_reply_err(conn_id, m->imsi, mr, 41 /* temporary failure */);
         return;
