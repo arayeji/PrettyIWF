@@ -184,10 +184,11 @@ int map_decode_mt_fsm_arg(const uint8_t *p, size_t n,
                           uint8_t *sc_addr, size_t sc_cap, size_t *sc_len,
                           const uint8_t **ui, size_t *ui_len,
                           int *more);
-/* MO submission relay: [MO-]ForwardSM-Arg with sm-RP-DA =
- * serviceCentreAddressDA, sm-RP-OA = msisdn, sm-RP-UI = SMS-SUBMIT TPDU,
- * and optional trailing imsi (needed by many home SMSCs for roaming MO). */
-int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
+/* MO submission relay: [MO-]ForwardSM-Arg.
+ * da_addr/oa_addr are MAP AddressString values (TON/NPI + TBCD), already
+ * IMPLICIT-tag-ready. imsi_str is optional (roaming MO to home SMSC). */
+int map_encode_mo_fwd_sm_arg(const uint8_t *da_addr, size_t da_len,
+                             const uint8_t *oa_addr, size_t oa_len,
                              const uint8_t *tpdu, size_t tpdu_len,
                              const char *imsi_str,
                              uint8_t *out, size_t out_cap);

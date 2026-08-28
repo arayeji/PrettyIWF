@@ -674,21 +674,62 @@ static void handle_outbound_tcap(const tcap_msg_t *tmsg)
 
 /* ----- Outbound MO-SMS relay (our subscriber -> home SMSC) ------------- */
 
-/* GSUP SM-RP-DA/OA value: [id-type][address]. The address (GSM 04.11) may
- * carry a leading length byte, then TON/NPI, then TBCD digits. */
-static int gsup_sm_addr_digits(const uint8_t *v, size_t l,
-                               uint8_t *type_out, char *digits, size_t cap)
+/* Osmocom GSUP SM-RP-DA/OA: [id-type][identity].
+ * id-type: 1=IMSI, 2=MSISDN, 3=SMSC (libosmocore osmo_gsup_sms_sm_rp_oda_t).
+ * identity for MSISDN/SMSC is GSM 04.11 style: optional length, TON/NPI, TBCD.
+ * We rebuild a MAP AddressString (TON/NPI + TBCD), preserving the original
+ * TON/NPI when present instead of always forcing 0x91. */
+#define GSUP_SM_ODA_IMSI   1
+#define GSUP_SM_ODA_MSISDN 2
+#define GSUP_SM_ODA_SMSC   3
+
+static int toa_looks_valid(uint8_t b)
 {
-    if (!v || l < 2 || !digits || !cap) return -1;
+    /* TS 23.040 / 24.008 type-of-address: ext=1, TON 0..7, NPI 0..15.
+     * Require ext bit so we do not treat a TBCD digit-pair as TOA. */
+    return (b & 0x80) != 0;
+}
+
+/* Parse GSUP address into MAP AddressString + digit string for GT/logging.
+ * Returns 0 on success. */
+static int gsup_sm_addr_parse(const uint8_t *v, size_t l,
+                              uint8_t *type_out,
+                              uint8_t *addr_out, size_t addr_cap, size_t *addr_len,
+                              char *digits, size_t dig_cap)
+{
+    if (!v || l < 2 || !addr_out || addr_cap < 2 || !addr_len ||
+        !digits || !dig_cap)
+        return -1;
     digits[0] = '\0';
-    if (type_out) *type_out = v[0];
-    size_t i = 1;
-    if (i + 1 < l && v[i] == l - i - 1)
-        i++;                            /* 04.11 length byte */
-    if (i < l && (v[i] & 0x80))
-        i++;                            /* TON/NPI octet */
-    if (i >= l) return -1;
-    map_bcd_to_str(v + i, l - i, digits, cap);
+    *addr_len = 0;
+    uint8_t type = v[0];
+    if (type_out) *type_out = type;
+
+    const uint8_t *id = v + 1;
+    size_t idl = l - 1;
+    if (idl == 0) return -1;
+
+    /* Optional GSM 04.11 length byte (length of the rest of the IE). */
+    if (idl >= 2 && id[0] == (uint8_t)(idl - 1)) {
+        id++;
+        idl--;
+    }
+    if (idl == 0) return -1;
+
+    uint8_t ton = 0x91;
+    const uint8_t *tbcd = id;
+    size_t tbcd_len = idl;
+    if (toa_looks_valid(id[0])) {
+        ton = id[0];
+        tbcd = id + 1;
+        tbcd_len = idl - 1;
+    }
+    if (tbcd_len == 0 || tbcd_len + 1 > addr_cap) return -1;
+
+    addr_out[0] = ton;
+    memcpy(addr_out + 1, tbcd, tbcd_len);
+    *addr_len = 1 + tbcd_len;
+    map_bcd_to_str(tbcd, tbcd_len, digits, dig_cap);
     return digits[0] ? 0 : -1;
 }
 
@@ -706,29 +747,67 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
     if (!g_rt || !m) return;
     uint8_t mr = m->have_sm_rp_mr ? m->sm_rp_mr : 0;
 
-    char smsc[20], oa[20];
+    char smsc[20], oa_dig[20];
     uint8_t da_type = 0, oa_type = 0;
-    if (!m->sm_rp_da_len || !m->sm_rp_ui_len ||
-        gsup_sm_addr_digits(m->sm_rp_da, m->sm_rp_da_len,
-                            &da_type, smsc, sizeof(smsc)) < 0 ||
-        da_type != 0x03 /* SMSC address */) {
-        LOGW("sms", "[%s] MO-FSM: bad SM-RP-DA/UI (da_len=%u ui_len=%u)",
-             m->imsi, (unsigned)m->sm_rp_da_len, (unsigned)m->sm_rp_ui_len);
-        sms_mo_reply_err(conn_id, m->imsi, mr, 96 /* invalid mandatory info */);
+    uint8_t da_addr[16], oa_addr[16];
+    size_t da_alen = 0, oa_alen = 0;
+
+    if (!m->sm_rp_ui_len) {
+        LOGW("sms",
+             "[%s] MO-FSM reject RP-96: missing SM-RP-UI ui_len=0 mr=%u",
+             m->imsi, (unsigned)mr);
+        sms_mo_reply_err(conn_id, m->imsi, mr, 96);
+        return;
+    }
+    if (!m->sm_rp_da_len ||
+        gsup_sm_addr_parse(m->sm_rp_da, m->sm_rp_da_len,
+                           &da_type, da_addr, sizeof(da_addr), &da_alen,
+                           smsc, sizeof(smsc)) < 0) {
+        LOGW("sms",
+             "[%s] MO-FSM reject RP-96: bad SM-RP-DA parse da_len=%u "
+             "da_type=%u mr=%u",
+             m->imsi, (unsigned)m->sm_rp_da_len, (unsigned)(m->sm_rp_da_len ? m->sm_rp_da[0] : 0),
+             (unsigned)mr);
+        sms_mo_reply_err(conn_id, m->imsi, mr, 96);
+        return;
+    }
+    if (da_type != GSUP_SM_ODA_SMSC) {
+        LOGW("sms",
+             "[%s] MO-FSM reject RP-96: SM-RP-DA type=%u want SMSC(%u) "
+             "digits=%s mr=%u",
+             m->imsi, (unsigned)da_type, GSUP_SM_ODA_SMSC, smsc, (unsigned)mr);
+        sms_mo_reply_err(conn_id, m->imsi, mr, 96);
         return;
     }
     if (!m->sm_rp_oa_len ||
-        gsup_sm_addr_digits(m->sm_rp_oa, m->sm_rp_oa_len,
-                            &oa_type, oa, sizeof(oa)) < 0) {
-        LOGW("sms", "[%s] MO-FSM: missing SM-RP-OA MSISDN", m->imsi);
+        gsup_sm_addr_parse(m->sm_rp_oa, m->sm_rp_oa_len,
+                           &oa_type, oa_addr, sizeof(oa_addr), &oa_alen,
+                           oa_dig, sizeof(oa_dig)) < 0) {
+        LOGW("sms",
+             "[%s] MO-FSM reject RP-96: bad SM-RP-OA parse oa_len=%u "
+             "oa_type=%u mr=%u",
+             m->imsi, (unsigned)m->sm_rp_oa_len,
+             (unsigned)(m->sm_rp_oa_len ? m->sm_rp_oa[0] : 0), (unsigned)mr);
+        sms_mo_reply_err(conn_id, m->imsi, mr, 96);
+        return;
+    }
+    if (oa_type != GSUP_SM_ODA_MSISDN) {
+        LOGW("sms",
+             "[%s] MO-FSM reject RP-96: SM-RP-OA type=%u want MSISDN(%u) "
+             "digits=%s mr=%u",
+             m->imsi, (unsigned)oa_type, GSUP_SM_ODA_MSISDN, oa_dig,
+             (unsigned)mr);
         sms_mo_reply_err(conn_id, m->imsi, mr, 96);
         return;
     }
 
     uint8_t arg[400];
-    int an = map_encode_mo_fwd_sm_arg(smsc, oa, m->sm_rp_ui, m->sm_rp_ui_len,
+    int an = map_encode_mo_fwd_sm_arg(da_addr, da_alen, oa_addr, oa_alen,
+                                      m->sm_rp_ui, m->sm_rp_ui_len,
                                       m->imsi, arg, sizeof(arg));
     if (an < 0) {
+        LOGW("sms", "[%s] MO-FSM: MAP encode failed smsc=%s oa=%s",
+             m->imsi, smsc, oa_dig);
         sms_mo_reply_err(conn_id, m->imsi, mr, 41 /* temporary failure */);
         return;
     }
@@ -770,8 +849,11 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
     HASH_ADD(hh, g_sessions, otid, sizeof(s->otid), s);
     sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
     LOGI("sms",
-         "[%s] RX GSUP MO-FSM mr=%u smsc=%s oa=%s ui_len=%u -> MAP fwdSM otid=0x%08x",
-         m->imsi, (unsigned)mr, smsc, oa, (unsigned)m->sm_rp_ui_len, s->otid);
+         "[%s] RX GSUP MO-FSM mr=%u smsc=%s ton=0x%02x oa=%s ton=0x%02x "
+         "ui_len=%u -> MAP fwdSM+imsi otid=0x%08x",
+         m->imsi, (unsigned)mr, smsc, (unsigned)da_addr[0],
+         oa_dig, (unsigned)oa_addr[0],
+         (unsigned)m->sm_rp_ui_len, s->otid);
 }
 
 bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg)

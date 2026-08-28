@@ -1583,17 +1583,8 @@ int map_encode_mt_fwd_sm_arg(const char *imsi_digits, const char *smsc_gt_digits
     return (int)off;
 }
 
-/* AddressString: 0x91 (international, E.164) + TBCD digits. */
-static int enc_addr_string_91(const char *digits, uint8_t *out, size_t cap)
-{
-    if (!digits || !digits[0] || cap < 2) return -1;
-    out[0] = 0x91;
-    int bl = map_str_to_bcd(digits, out + 1, cap - 1);
-    if (bl < 0) return -1;
-    return 1 + bl;
-}
-
-int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
+int map_encode_mo_fwd_sm_arg(const uint8_t *da_addr, size_t da_len,
+                             const uint8_t *oa_addr, size_t oa_len,
                              const uint8_t *tpdu, size_t tpdu_len,
                              const char *imsi_str,
                              uint8_t *out, size_t out_cap)
@@ -1605,17 +1596,14 @@ int map_encode_mo_fwd_sm_arg(const char *smsc_digits, const char *oa_msisdn,
      *   extensionContainer ExtensionContainer OPTIONAL,
      *   ...,
      *   imsi IMSI OPTIONAL }                                             */
-    if (!tpdu || !tpdu_len) return -1;
-    uint8_t da[16], oa[16];
-    int dl = enc_addr_string_91(smsc_digits, da, sizeof(da));
-    int ol = enc_addr_string_91(oa_msisdn, oa, sizeof(oa));
-    if (dl < 0 || ol < 0) return -1;
+    if (!tpdu || !tpdu_len || !da_addr || da_len < 2 || !oa_addr || oa_len < 2)
+        return -1;
 
     uint8_t body[320];
     size_t bo = 0;
-    if (ber_enc_tlv(body, sizeof(body), &bo, 0x84, da, (size_t)dl) < 0)
+    if (ber_enc_tlv(body, sizeof(body), &bo, 0x84, da_addr, da_len) < 0)
         return -1;
-    if (ber_enc_tlv(body, sizeof(body), &bo, 0x82, oa, (size_t)ol) < 0)
+    if (ber_enc_tlv(body, sizeof(body), &bo, 0x82, oa_addr, oa_len) < 0)
         return -1;
     if (ber_enc_tlv(body, sizeof(body), &bo, 0x04, tpdu, tpdu_len) < 0)
         return -1;
