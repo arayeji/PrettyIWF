@@ -166,9 +166,18 @@ static int unwrap_seq(const uint8_t *p, size_t n,
 int map_decode_sai_arg(const uint8_t *p, size_t n, map_sai_req_t *out)
 {
     /* SendAuthenticationInfoArg ::= SEQUENCE {
-     *   imsi                  [0]  IMPLICIT IMSI,           -- OCTET STRING (BCD)
-     *   numberOfRequestedVectors [2] IMPLICIT INTEGER (1..5),
-     *   ...                                                                  */
+     *   imsi                              [0] IMSI,
+     *   numberOfRequestedVectors              NumberOfRequestedVectors, -- untagged INTEGER
+     *   segmentationProhibited                NULL OPTIONAL,
+     *   immediateResponsePreferred        [1] NULL OPTIONAL,
+     *   re-synchronisationInfo                Re-synchronisationInfo OPTIONAL,
+     *   extensionContainer                [2] ExtensionContainer OPTIONAL,
+     *   ...,
+     *   requestingNodeType                [3] RequestingNodeType OPTIONAL,
+     *   requestingPLMN-Id                 [4] PLMN-Id OPTIONAL,
+     *   numberOfRequestedAdditional-Vectors [5] NumberOfRequestedVectors OPTIONAL,
+     *   additionalVectorsAreForEPS        [6] NULL OPTIONAL }
+     * TS 29.002 / MAP-MS-DataTypes.asn                                    */
     if (!p || !out) return -1;
     memset(out, 0, sizeof(*out));
     out->num_vectors = 1;
@@ -180,7 +189,6 @@ int map_decode_sai_arg(const uint8_t *p, size_t n, map_sai_req_t *out)
         if (unwrap_seq(p, n, &body, &blen) < 0) return -1;
     }
 
-    /* Walk fields by their context-specific tags. */
     size_t off = 0;
     while (off < blen) {
         uint8_t tag;
@@ -193,22 +201,25 @@ int map_decode_sai_arg(const uint8_t *p, size_t n, map_sai_req_t *out)
             memcpy(out->imsi_bcd, v, l);
             out->imsi_bcd_len = (uint8_t)l;
             map_bcd_to_str(v, l, out->imsi_str, sizeof(out->imsi_str));
-        } else if (tag == 0x82) {                    /* [2] numberOfRequestedVectors */
+        } else if (tag == 0x02) {                    /* untagged INTEGER vectors */
             uint32_t nv = 1;
             ber_dec_integer_u32(v, l, &nv);
             if (nv >= 1 && nv <= 5) out->num_vectors = (uint8_t)nv;
-        } else if (tag == 0x83) {                    /* [3] segmentationProhibited (NULL) */
-            /* present = TRUE; we don't need to do anything */
-        } else if (tag == 0x84) {                    /* [4] immediateResponsePreferred (NULL) */
-        } else if (tag == 0x85 || tag == 0x95) {     /* [5] requestingNodeType */
+        } else if (tag == 0x05) {                    /* segmentationProhibited NULL */
+        } else if (tag == 0x81) {                    /* [1] immediateResponsePreferred */
+        } else if (tag == 0x30) {                    /* re-synchronisationInfo SEQUENCE */
+        } else if (tag == 0xA2 || tag == 0x82) {     /* [2] extensionContainer */
+        } else if (tag == 0x83 || tag == 0x93) {     /* [3] requestingNodeType */
             uint32_t v32 = 0;
             ber_dec_integer_u32(v, l, &v32);
             out->requesting_node_type = (uint8_t)v32;
             out->have_requesting_node_type = true;
-        } else if (tag == 0x86) {                    /* [6] requestingPLMN-Id */
-            /* TBCD MCC+MNC, 3 octets; we store nothing here; map_iwf.c derives
-             * visited PLMN from this exact tag via direct lookup below. */
+        } else if (tag == 0x84 || tag == 0x94) {     /* [4] requestingPLMN-Id */
+            /* TBCD MCC+MNC; map_iwf may also scan this tag directly. */
+        } else if (tag == 0x85 || tag == 0x95) {     /* [5] additional vectors */
+            /* Optional; ignore count — we already have num_vectors. */
         }
+        /* Unknown / extension fields skipped. */
     }
     return out->imsi_bcd_len ? 0 : -1;
 }
@@ -308,6 +319,10 @@ int map_decode_purge_arg(const uint8_t *p, size_t n, map_purge_req_t *out)
 int map_encode_sai_arg(const char *imsi_str, uint8_t num_vectors,
                        uint8_t *out, size_t out_cap)
 {
+    /* Wire shape (TS 29.002):
+     *   [0] IMSI, then mandatory untagged INTEGER numberOfRequestedVectors,
+     *   then optional [3] requestingNodeType.  Encoding the vector count as
+     *   context [2] made Irancell answer dataMissing (35) on every SAI. */
     if (!imsi_str || !out) return -1;
     uint8_t imsi_bcd[8];
     int bl = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
@@ -319,11 +334,12 @@ int map_encode_sai_arg(const char *imsi_str, uint8_t num_vectors,
     size_t io = 0;
     if (ber_enc_tlv(inner, sizeof(inner), &io, 0x80, imsi_bcd, (size_t)bl) < 0)
         return -1;
+    /* numberOfRequestedVectors — UNIVERSAL INTEGER, not context-tagged. */
     uint8_t nv[1] = { num_vectors };
-    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x82, nv, 1) < 0) return -1;
-    /* requestingNodeType = sgsn (1) */
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x02, nv, 1) < 0) return -1;
+    /* requestingNodeType [3] = sgsn (1) */
     uint8_t rnt[1] = { 1 };
-    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x85, rnt, 1) < 0) return -1;
+    if (ber_enc_tlv(inner, sizeof(inner), &io, 0x83, rnt, 1) < 0) return -1;
 
     size_t off = 0;
     if (ber_enc_tlv(out, out_cap, &off, 0x30, inner, io) < 0) return -1;
