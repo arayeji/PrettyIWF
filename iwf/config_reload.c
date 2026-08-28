@@ -9,6 +9,7 @@
 #include "msrn_pool.h"
 #include "subscr_cache.h"
 #include "pgw_dns.h"
+#include "isup_call.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -114,6 +115,12 @@ static bool cfg_needs_restart(const iwf_config_t *old, const iwf_config_t *nc,
         old->gsup_remote_port != nc->gsup_remote_port)
         restart_reason_add(why, cap, &off, "sms_iwf");
 #endif
+    if (old->sip_iwf_enabled != nc->sip_iwf_enabled ||
+        !streq(old->sip_listen_ip, nc->sip_listen_ip) ||
+        old->sip_listen_port != nc->sip_listen_port ||
+        old->sip_transport_udp != nc->sip_transport_udp ||
+        old->sip_transport_tcp != nc->sip_transport_tcp)
+        restart_reason_add(why, cap, &off, "sip_iwf");
     if (!streq(old->log_file, nc->log_file))
         restart_reason_add(why, cap, &off, "log_file");
 
@@ -180,6 +187,7 @@ int iwf_config_reload(iwf_runtime_t *rt)
                                           sizeof(restart_why));
 
     rt->cfg = nc;
+    (void)isup_call_reconfigure(rt);
 
     if (need_restart)
         LOGW("config",

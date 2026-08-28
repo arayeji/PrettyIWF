@@ -105,6 +105,16 @@ int  ss7_link_send_tcap_ex(struct iwf_runtime *rt,
                            const ss7_sccp_addr_t *calling,
                            const uint8_t *tcap, size_t tcap_len);
 
+/* Packed ITU point code from dotted "a.b.c". 0xffffffff on failure. */
+uint32_t ss7_link_pack_pc(const char *dotted);
+
+/* MTP-TRANSFER for ISUP/BICC (SI=5 or 13). opc/dpc are dotted strings
+ * in config; empty opc uses [map_iwf] local_pc. DPC is the far-end PC
+ * (STP routes by PC). Returns 0 / -1. */
+int ss7_link_send_mtp(struct iwf_runtime *rt, uint8_t si,
+                      const char *opc_dotted, const char *dpc_dotted,
+                      const uint8_t *payload, size_t len);
+
 /* Build ss7_sccp_addr_t from E.164 digit string (international 0x91 prefix). */
 void ss7_gt_from_digits(const char *digits, uint8_t ssn, ss7_sccp_addr_t *out);
 

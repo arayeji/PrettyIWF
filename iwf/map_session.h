@@ -28,6 +28,8 @@
 #include <netinet/in.h>
 #include <time.h>
 
+struct iwf_runtime;
+
 /* Logical MAP operation classes - drives the dispatch table in map_iwf.c. */
 typedef enum {
     MAP_OP_NONE             = 0,
@@ -169,6 +171,12 @@ typedef struct map_session {
      * When cmd_test is true and fd < 0 (e.g. SIGUSR1), only log vectors. */
     bool                cmd_test;
     int                 cmd_test_reply_fd;
+
+    /* SIP GMSC originated PRN (no inbound MAP SRI to answer). */
+    bool                sip_prn;
+    void              (*sip_prn_cb)(struct iwf_runtime *rt, void *user,
+                                    int map_err, const char *msrn);
+    void               *sip_user;
 
     /* GSUP proxy: osmo-sgsn/msc originated auth/UL via TCP GSUP (not MAP). */
     bool                gsup_originated;

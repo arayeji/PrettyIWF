@@ -103,6 +103,31 @@ static void defaults(iwf_config_t *c)
     strncpy(c->smpp_system_id, "iwf", sizeof(c->smpp_system_id) - 1);
     strncpy(c->smpp_password, "changeme", sizeof(c->smpp_password) - 1);
 #endif
+
+    c->sip_iwf_enabled = 0;
+    strncpy(c->sip_listen_ip, "0.0.0.0", sizeof(c->sip_listen_ip) - 1);
+    c->sip_listen_port = 5060;
+    c->sip_transport_udp = 1;
+    c->sip_transport_tcp = 1;
+    strncpy(c->sip_local_uri, "sip:iwf@localhost", sizeof(c->sip_local_uri) - 1);
+    strncpy(c->sip_codec_offer, "pcmu,pcma", sizeof(c->sip_codec_offer) - 1);
+    c->sip_media_mode = IWF_SIP_MEDIA_PASSTHROUGH;
+    c->sip_max_sessions = 200;
+    c->sip_options_interval_s = 30;
+    c->sip_invite_timeout_ms = 8000;
+    c->sip_sri_timeout_ms = 4000;
+    c->sip_prn_timeout_ms = 5000;
+    c->sip_session_timer_s = 1800;
+    c->hlr_mode = IWF_HLR_MODE_MONGO_CS;
+    c->local_cs_route_mode = IWF_CS_ROUTE_SIP_MSISDN;
+    c->roam_cs_route_mode = IWF_ROAM_CS_ROUTE_SIPI;
+    c->bicc_cic_selection = IWF_CIC_SEL_EVEN;
+    c->bicc_si = IWF_BICC_SI_BICC;
+    c->bicc_bearer_mode = IWF_BEARER_BICC;
+    c->in_mode = 0; /* IWF_IN_NONE */
+    c->in_timeout_ms = 5000;
+    for (int i = 0; i < IWF_CS_ROUTE_MAX; i++)
+        c->cs_route[i].in_mode = -1;
 }
 
 static int parse_gsup_backend(const char *val)
@@ -116,6 +141,142 @@ static int parse_gsup_backend(const char *val)
         return GSUP_BACKEND_DIAMETER;
     LOGW("config", "unknown gsup backend '%s' (use map|diameter)", val);
     return GSUP_BACKEND_DIAMETER;
+}
+
+static void copy_str(char *dst, size_t dst_sz, const char *src);
+
+static void sip_transport_parse(iwf_config_t *out, const char *val)
+{
+    if (!out || !val) return;
+    out->sip_transport_udp = 0;
+    out->sip_transport_tcp = 0;
+    char buf[64];
+    copy_str(buf, sizeof(buf), val);
+    for (char *p = buf, *tok; (tok = strtok(p, ", \t")); p = NULL) {
+        if (!strcasecmp(tok, "udp"))
+            out->sip_transport_udp = 1;
+        else if (!strcasecmp(tok, "tcp"))
+            out->sip_transport_tcp = 1;
+        else
+            LOGW("config", "unknown [sip_iwf] transport '%s' (udp|tcp)", tok);
+    }
+    if (!out->sip_transport_udp && !out->sip_transport_tcp)
+        out->sip_transport_udp = 1;
+}
+
+static void roam_cs_prefix_add(iwf_config_t *out, const char *val)
+{
+    if (!out || !val || !val[0]) return;
+    char buf[128];
+    copy_str(buf, sizeof(buf), val);
+    for (char *p = buf, *tok; (tok = strtok(p, ", \t")); p = NULL) {
+        if (out->n_roam_cs_vlr_prefix >= IWF_ROAM_CS_PREFIX_MAX) {
+            LOGW("config", "too many [roam_cs] vlr_gt_prefix (max %d)",
+                 IWF_ROAM_CS_PREFIX_MAX);
+            return;
+        }
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (!*tok) continue;
+        int i = out->n_roam_cs_vlr_prefix++;
+        copy_str(out->roam_cs_vlr_prefix[i],
+                 sizeof(out->roam_cs_vlr_prefix[i]), tok);
+    }
+}
+
+static int cs_route_index(iwf_config_t *out, const char *section)
+{
+    if (strncmp(section, "cs_route.", 9) != 0) return -1;
+    const char *name = section + 9;
+    if (!name[0]) return -1;
+    for (int i = 0; i < out->n_cs_route; i++) {
+        if (!strcmp(out->cs_route[i].name, name))
+            return i;
+    }
+    if (out->n_cs_route >= IWF_CS_ROUTE_MAX) {
+        LOGW("config", "too many [cs_route.*] sections (max %d)",
+             IWF_CS_ROUTE_MAX);
+        return -1;
+    }
+    int idx = out->n_cs_route++;
+    memset(&out->cs_route[idx], 0, sizeof(out->cs_route[idx]));
+    copy_str(out->cs_route[idx].name, sizeof(out->cs_route[idx].name), name);
+    out->cs_route[idx].in_mode = -1;
+    return idx;
+}
+
+static void cs_route_prefix_add(iwf_cs_route_t *r, const char *val)
+{
+    if (!r || !val) return;
+    char buf[256];
+    copy_str(buf, sizeof(buf), val);
+    for (char *p = buf, *tok; (tok = strtok(p, ", \t")); p = NULL) {
+        if (r->n_prefix >= IWF_CS_ROUTE_PFX_MAX) {
+            LOGW("config", "too many prefixes in [cs_route.%s]", r->name);
+            return;
+        }
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (!*tok) continue;
+        copy_str(r->prefix[r->n_prefix], sizeof(r->prefix[0]), tok);
+        r->n_prefix++;
+    }
+}
+
+static void bicc_cic_map_add(iwf_config_t *out, const char *val)
+{
+    if (!out || !val) return;
+    char buf[1024];
+    copy_str(buf, sizeof(buf), val);
+    for (char *p = buf, *tok; (tok = strtok(p, ", \t")); p = NULL) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (!*tok) continue;
+        unsigned cic = 0, port = 0;
+        char ip[64] = "";
+        char *c1 = strchr(tok, ':');
+        if (!c1) {
+            LOGW("config", "bad cic_map entry '%s' (want cic:ip:port)", tok);
+            continue;
+        }
+        *c1 = '\0';
+        char *rest = c1 + 1;
+        char *c2 = strrchr(rest, ':');
+        if (!c2) {
+            LOGW("config", "bad cic_map entry '%s' (want cic:ip:port)", tok);
+            continue;
+        }
+        *c2 = '\0';
+        cic = (unsigned)atoi(tok);
+        copy_str(ip, sizeof(ip), rest);
+        port = (unsigned)atoi(c2 + 1);
+        if (!cic || cic > 4095 || !ip[0] || port == 0 || port > 65535) {
+            LOGW("config", "bad cic_map cic=%u ip=%s port=%u",
+                 cic, ip, port);
+            continue;
+        }
+        if (out->bicc_n_cic_map >= IWF_CIC_MAP_MAX) {
+            LOGW("config", "cic_map full (max %d)", IWF_CIC_MAP_MAX);
+            return;
+        }
+        int i = out->bicc_n_cic_map++;
+        out->bicc_cic_map[i].cic = (uint16_t)cic;
+        copy_str(out->bicc_cic_map[i].ip, sizeof(out->bicc_cic_map[i].ip), ip);
+        out->bicc_cic_map[i].port = (uint16_t)port;
+    }
+}
+
+static int parse_in_mode(const char *val)
+{
+    if (!val || !*val) return 0;
+    if (!strcasecmp(val, "none") || !strcasecmp(val, "off")) return 0;
+    if (!strcasecmp(val, "camel") || !strcasecmp(val, "cap") ||
+        !strcasecmp(val, "cap2"))
+        return 1;
+    if (!strcasecmp(val, "inap") || !strcasecmp(val, "cs1"))
+        return 2;
+    if (!strcasecmp(val, "sip") || !strcasecmp(val, "sip_as") ||
+        !strcasecmp(val, "sip-as"))
+        return 3;
+    LOGW("config", "unknown [in] mode '%s' (none|camel|inap|sip_as)", val);
+    return 0;
 }
 
 static uint8_t parse_network_indicator(const char *val)
@@ -486,6 +647,7 @@ int iwf_config_load(const char *path, iwf_config_t *out)
     char  line[512];
     char  section[64] = "";
     int   lineno = 0;
+    int   err = 0;
 
     while (fgets(line, sizeof(line), fp)) {
         lineno++;
@@ -733,6 +895,168 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else LOGW("config", "unknown key [gsup_server].%s", key);
         } else if (!strcmp(section, "roaming_hlr")) {
             gsup_roam_key(out, key, val);
+        } else if (!strcmp(section, "sip_iwf")) {
+            if      (!strcmp(key, "enabled"))
+                out->sip_iwf_enabled = (atoi(val) != 0);
+            else if (!strcmp(key, "listen_ip"))
+                copy_str(out->sip_listen_ip, sizeof(out->sip_listen_ip), val);
+            else if (!strcmp(key, "listen_port"))
+                out->sip_listen_port = (uint16_t)atoi(val);
+            else if (!strcmp(key, "transport"))
+                sip_transport_parse(out, val);
+            else if (!strcmp(key, "kamailio_peer"))
+                copy_str(out->sip_kamailio_peer, sizeof(out->sip_kamailio_peer), val);
+            else if (!strcmp(key, "local_uri"))
+                copy_str(out->sip_local_uri, sizeof(out->sip_local_uri), val);
+            else if (!strcmp(key, "codec_offer"))
+                copy_str(out->sip_codec_offer, sizeof(out->sip_codec_offer), val);
+            else if (!strcmp(key, "media_mode")) {
+                if (!strcasecmp(val, "anchor"))
+                    out->sip_media_mode = IWF_SIP_MEDIA_ANCHOR;
+                else
+                    out->sip_media_mode = IWF_SIP_MEDIA_PASSTHROUGH;
+            } else if (!strcmp(key, "max_sessions"))
+                out->sip_max_sessions = atoi(val) > 0 ? atoi(val) : 200;
+            else if (!strcmp(key, "options_interval_s"))
+                out->sip_options_interval_s = atoi(val);
+            else if (!strcmp(key, "invite_timeout_ms"))
+                out->sip_invite_timeout_ms = atoi(val) > 0 ? atoi(val) : 8000;
+            else if (!strcmp(key, "sri_timeout_ms"))
+                out->sip_sri_timeout_ms = atoi(val) > 0 ? atoi(val) : 4000;
+            else if (!strcmp(key, "prn_timeout_ms"))
+                out->sip_prn_timeout_ms = atoi(val) > 0 ? atoi(val) : 5000;
+            else if (!strcmp(key, "session_timer_s"))
+                out->sip_session_timer_s = atoi(val) > 0 ? atoi(val) : 1800;
+            else LOGW("config", "unknown key [sip_iwf].%s", key);
+        } else if (!strcmp(section, "hlr")) {
+            if (!strcmp(key, "mode")) {
+                if (!strcasecmp(val, "mongo_cs")) {
+                    out->hlr_mode = IWF_HLR_MODE_MONGO_CS;
+                } else {
+                    LOGE("config",
+                         "[hlr] mode=%s is not implemented (lookup is always "
+                         "HSS Mongo). Leave [hlr] out or set mode=mongo_cs",
+                         val);
+                    err = 1;
+                }
+            } else if (!strcmp(key, "home_hlr_gt") || !strcmp(key, "hlr_gt"))
+                copy_str(out->hlr_home_gt, sizeof(out->hlr_home_gt), val);
+            else LOGW("config", "unknown key [hlr].%s", key);
+        } else if (!strcmp(section, "local_msc")) {
+            if      (!strcmp(key, "vlr_gt"))
+                copy_str(out->local_msc_vlr_gt, sizeof(out->local_msc_vlr_gt), val);
+            else if (!strcmp(key, "msc_gt"))
+                copy_str(out->local_msc_msc_gt, sizeof(out->local_msc_msc_gt), val);
+            else LOGW("config", "unknown key [local_msc].%s", key);
+        } else if (!strcmp(section, "local_cs")) {
+            if      (!strcmp(key, "sip_peer"))
+                copy_str(out->local_cs_sip_peer, sizeof(out->local_cs_sip_peer), val);
+            else if (!strcmp(key, "route_mode")) {
+                if (strcasecmp(val, "sip_msisdn") != 0) {
+                    LOGE("config",
+                         "[local_cs] route_mode=%s is not implemented "
+                         "(sip_msisdn only). Omit route_mode",
+                         val);
+                    err = 1;
+                } else {
+                    out->local_cs_route_mode = IWF_CS_ROUTE_SIP_MSISDN;
+                }
+            } else LOGW("config", "unknown key [local_cs].%s", key);
+        } else if (!strcmp(section, "roam_cs") ||
+                   !strcmp(section, "irancell")) {
+            /* [irancell] is a deprecated alias for [roam_cs]. */
+            if (!strcmp(section, "irancell"))
+                LOGW("config", "[irancell] is deprecated; use [roam_cs]");
+            if      (!strcmp(key, "vlr_gt_prefix"))
+                roam_cs_prefix_add(out, val);
+            else if (!strcmp(key, "route_mode")) {
+                if (!strcasecmp(val, "sipi")) {
+                    out->roam_cs_route_mode = IWF_ROAM_CS_ROUTE_SIPI;
+                } else if (!strcasecmp(val, "isup") ||
+                           !strcasecmp(val, "bicc")) {
+                    out->roam_cs_route_mode = IWF_ROAM_CS_ROUTE_ISUP;
+                    LOGI("config",
+                         "[roam_cs] route_mode=%s (BICC/ISUP; "
+                         "sipi remains default if omitted)",
+                         val);
+                } else {
+                    LOGE("config",
+                         "[roam_cs] route_mode=%s unknown (sipi|isup|bicc)",
+                         val);
+                    err = 1;
+                }
+            } else if (!strcmp(key, "sipi_peer"))
+                copy_str(out->roam_cs_sipi_peer, sizeof(out->roam_cs_sipi_peer), val);
+            else if (!strcmp(key, "cli"))
+                copy_str(out->roam_cs_cli, sizeof(out->roam_cs_cli), val);
+            else if (!strcmp(key, "msrn_prefix_ok"))
+                copy_str(out->roam_cs_msrn_prefix_ok,
+                         sizeof(out->roam_cs_msrn_prefix_ok), val);
+            else LOGW("config", "unknown key [roam_cs].%s", key);
+        } else if (!strncmp(section, "cs_route.", 9)) {
+            int ridx = cs_route_index(out, section);
+            if (ridx < 0) {
+                err = 1;
+            } else if (!strcmp(key, "prefixes") || !strcmp(key, "prefix"))
+                cs_route_prefix_add(&out->cs_route[ridx], val);
+            else if (!strcmp(key, "south")) {
+                if (!strcasecmp(val, "sip") || !strcasecmp(val, "sipi"))
+                    out->cs_route[ridx].south = IWF_CS_SOUTH_SIP;
+                else if (!strcasecmp(val, "bicc") || !strcasecmp(val, "isup"))
+                    out->cs_route[ridx].south = IWF_CS_SOUTH_BICC;
+                else {
+                    LOGE("config", "[%s] south=%s unknown (sip|bicc)",
+                         section, val);
+                    err = 1;
+                }
+            } else if (!strcmp(key, "sip_peer"))
+                copy_str(out->cs_route[ridx].sip_peer,
+                         sizeof(out->cs_route[ridx].sip_peer), val);
+            else if (!strcmp(key, "in_mode"))
+                out->cs_route[ridx].in_mode = parse_in_mode(val);
+            else LOGW("config", "unknown key [%s].%s", section, key);
+        } else if (!strcmp(section, "bicc") || !strcmp(section, "isup")) {
+            if      (!strcmp(key, "opc"))
+                copy_str(out->bicc_opc, sizeof(out->bicc_opc), val);
+            else if (!strcmp(key, "dpc"))
+                copy_str(out->bicc_dpc, sizeof(out->bicc_dpc), val);
+            else if (!strcmp(key, "cic_range"))
+                copy_str(out->bicc_cic_range, sizeof(out->bicc_cic_range), val);
+            else if (!strcmp(key, "cic_selection")) {
+                if (!strcasecmp(val, "odd"))
+                    out->bicc_cic_selection = IWF_CIC_SEL_ODD;
+                else
+                    out->bicc_cic_selection = IWF_CIC_SEL_EVEN;
+            } else if (!strcmp(key, "si")) {
+                if (!strcasecmp(val, "isup"))
+                    out->bicc_si = IWF_BICC_SI_ISUP;
+                else
+                    out->bicc_si = IWF_BICC_SI_BICC;
+            } else if (!strcmp(key, "bearer_mode")) {
+                if (!strcasecmp(val, "static_map") ||
+                    !strcasecmp(val, "static"))
+                    out->bicc_bearer_mode = IWF_BEARER_STATIC_MAP;
+                else
+                    out->bicc_bearer_mode = IWF_BEARER_BICC;
+            } else if (!strcmp(key, "rtp_ip"))
+                copy_str(out->bicc_rtp_ip, sizeof(out->bicc_rtp_ip), val);
+            else if (!strcmp(key, "rtp_port_base"))
+                out->bicc_rtp_port_base = (uint16_t)atoi(val);
+            else if (!strcmp(key, "cic_map"))
+                bicc_cic_map_add(out, val);
+            else LOGW("config", "unknown key [%s].%s", section, key);
+        } else if (!strcmp(section, "in")) {
+            if      (!strcmp(key, "mode"))
+                out->in_mode = parse_in_mode(val);
+            else if (!strcmp(key, "scp_gt"))
+                copy_str(out->in_scp_gt, sizeof(out->in_scp_gt), val);
+            else if (!strcmp(key, "scp_ssn"))
+                out->in_scp_ssn = (uint8_t)atoi(val);
+            else if (!strcmp(key, "sip_as"))
+                copy_str(out->in_sip_as, sizeof(out->in_sip_as), val);
+            else if (!strcmp(key, "timeout_ms"))
+                out->in_timeout_ms = atoi(val) > 0 ? atoi(val) : 5000;
+            else LOGW("config", "unknown key [in].%s", key);
 #ifdef SMS_IWF_ENABLED
         } else if (!strcmp(section, "sms_iwf")) {
             if      (!strcmp(key, "enabled"))           out->sms_iwf_enabled = (atoi(val) != 0);
@@ -813,6 +1137,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
     if (out->pgw_cache_ttl_s <= 0)
         out->pgw_cache_ttl_s = 300;
 
+    if (err)
+        return -1;
     return 0;
 }
 
@@ -955,6 +1281,71 @@ void iwf_config_dump(const iwf_config_t *c)
         }
         LOGI("config", "roaming_hlr mnc%s apn_acl=%s", r->mnc, list);
     }
+    if (c->sip_iwf_enabled) {
+        char prefs[128];
+        size_t poff = 0;
+        prefs[0] = '\0';
+        for (int i = 0; i < c->n_roam_cs_vlr_prefix; i++) {
+            int n = snprintf(prefs + poff, sizeof(prefs) - poff, "%s%s",
+                             i ? "," : "", c->roam_cs_vlr_prefix[i]);
+            if (n < 0 || (size_t)n >= sizeof(prefs) - poff)
+                break;
+            poff += (size_t)n;
+        }
+        LOGI("config",
+             "sip_iwf: listen=%s:%u transport=%s%s kamailio=%s local_uri=%s "
+             "max_sessions=%d invite/sri/prn=%d/%d/%dms",
+             c->sip_listen_ip[0] ? c->sip_listen_ip : "0.0.0.0",
+             (unsigned)c->sip_listen_port,
+             c->sip_transport_udp ? "udp" : "",
+             c->sip_transport_tcp ? (c->sip_transport_udp ? ",tcp" : "tcp") : "",
+             c->sip_kamailio_peer[0] ? c->sip_kamailio_peer : "(any)",
+             c->sip_local_uri[0] ? c->sip_local_uri : "(unset)",
+             c->sip_max_sessions,
+             c->sip_invite_timeout_ms, c->sip_sri_timeout_ms,
+             c->sip_prn_timeout_ms);
+        LOGI("config",
+             "sip_iwf: hlr_mode=%s local_vlr=%s local_cs=%s roam_vlr_prefix=%s "
+             "sipi=%s msrn_ok=%s roam_cli=%s",
+             c->hlr_mode == IWF_HLR_MODE_MAP_SRI ? "map_sri" : "mongo_cs",
+             c->local_msc_vlr_gt[0] ? c->local_msc_vlr_gt : "(unset)",
+             c->local_cs_sip_peer[0] ? c->local_cs_sip_peer : "(unset)",
+             prefs[0] ? prefs : "(any-non-local)",
+             c->roam_cs_sipi_peer[0] ? c->roam_cs_sipi_peer : "(unset)",
+             c->roam_cs_msrn_prefix_ok[0] ? c->roam_cs_msrn_prefix_ok : "(any)",
+             c->roam_cs_cli[0] ? c->roam_cs_cli : "(derive)");
+        LOGI("config",
+             "sip_iwf: roam_route=%s bicc opc=%s dpc=%s cic=%s sel=%s si=%s "
+             "in_mode=%d scp=%s sip_as=%s cs_routes=%d",
+             c->roam_cs_route_mode == IWF_ROAM_CS_ROUTE_ISUP ? "bicc" : "sipi",
+             c->bicc_opc[0] ? c->bicc_opc : "(unset)",
+             c->bicc_dpc[0] ? c->bicc_dpc : "(unset)",
+             c->bicc_cic_range[0] ? c->bicc_cic_range : "(unset)",
+             c->bicc_cic_selection == IWF_CIC_SEL_ODD ? "odd" : "even",
+             c->bicc_si == IWF_BICC_SI_ISUP ? "isup" : "bicc",
+             c->in_mode,
+             c->in_scp_gt[0] ? c->in_scp_gt : "(unset)",
+             c->in_sip_as[0] ? c->in_sip_as : "(unset)",
+             c->n_cs_route);
+        for (int i = 0; i < c->n_cs_route; i++) {
+            const iwf_cs_route_t *r = &c->cs_route[i];
+            char px[128];
+            size_t po = 0;
+            px[0] = '\0';
+            for (int k = 0; k < r->n_prefix; k++) {
+                int n = snprintf(px + po, sizeof(px) - po, "%s%s",
+                                 k ? "," : "", r->prefix[k]);
+                if (n < 0 || (size_t)n >= sizeof(px) - po) break;
+                po += (size_t)n;
+            }
+            LOGI("config", "cs_route.%s prefixes=%s south=%s sip_peer=%s",
+                 r->name, px[0] ? px : "(none)",
+                 r->south == IWF_CS_SOUTH_BICC ? "bicc" : "sip",
+                 r->sip_peer[0] ? r->sip_peer : "(inherit)");
+        }
+    } else {
+        LOGI("config", "sip_iwf: disabled (set [sip_iwf].enabled = 1)");
+    }
 #ifdef SMS_IWF_ENABLED
     if (c->sms_iwf_enabled) {
         LOGI("config", "sms_iwf: msc_gt=%s smsc_gt=%s hlr_ssn=%u gsup_timeout=%dms",
@@ -967,6 +1358,46 @@ void iwf_config_dump(const iwf_config_t *c)
         LOGI("config", "sms_iwf: disabled (set [sms_iwf].enabled = 1; build SMS_IWF_ENABLED=1)");
     }
 #endif
+}
+
+static void digits_only(const char *in, char *out, size_t cap)
+{
+    size_t n = 0;
+    if (!out || !cap) return;
+    out[0] = '\0';
+    if (!in) return;
+    if (*in == '+') in++;
+    for (; *in && n + 1 < cap; in++) {
+        if (*in >= '0' && *in <= '9')
+            out[n++] = *in;
+    }
+    out[n] = '\0';
+}
+
+const iwf_cs_route_t *iwf_cs_route_lookup(const iwf_config_t *cfg,
+                                           const char *digits)
+{
+    if (!cfg || !digits) return NULL;
+    char num[32];
+    digits_only(digits, num, sizeof(num));
+    if (!num[0]) return NULL;
+    const iwf_cs_route_t *best = NULL;
+    int best_len = -1;
+    for (int i = 0; i < cfg->n_cs_route; i++) {
+        const iwf_cs_route_t *r = &cfg->cs_route[i];
+        for (int k = 0; k < r->n_prefix; k++) {
+            char pfx[24];
+            digits_only(r->prefix[k], pfx, sizeof(pfx));
+            if (!pfx[0]) continue;
+            size_t pl = strlen(pfx);
+            if (strncmp(num, pfx, pl) != 0) continue;
+            if ((int)pl > best_len) {
+                best_len = (int)pl;
+                best = r;
+            }
+        }
+    }
+    return best;
 }
 
 /* Find a [roaming_hlr] route by 3-digit MNC string key. */

@@ -7,7 +7,8 @@
  * SAI (Send Authentication Info)
  * ------------------------------
  *   SGSN -> IWF: TCAP-Begin (AARQ=infoRetrievalContext-v3, Invoke SAI)
- *   IWF  -> HSS: Diameter AIR (Authentication-Information-Request)
+ *   IWF  -> HSS: Diameter AIR (UTRAN 1409; Re-synchronization-Info 1411
+ *                when MAP SAI carried re-synchronisationInfo RAND+AUTS)
  *   HSS  -> IWF: Diameter AIA (with Authentication-Info AVP list)
  *   IWF  -> SGSN: TCAP-End   (AARE=infoRetrievalContext-v3,
  *                            ReturnResult: AuthenticationSetList)
@@ -59,7 +60,9 @@
  *   IWF allocates MSRN from configured pool, binds to IMSI (TTL),
  *   replies TCAP-End ReturnResult(roamingNumber). On pool miss/exhaustion
  *   replies ReturnError(noRoamingNumberAvailable) — never silent drop.
- *   SIP (outside repo) resolves inbound calls via cmd_sock msrn_lookup.
+ *   SIP GMSC ([sip_iwf]) originates PRN via map_iwf_prn_request() and
+ *   routes INVITE(MSRN) itself. cmd_sock msrn_lookup remains for foreign
+ *   GMSC / inbound MAP SRI answered from the local pool.
  *
  * Error paths
  * -----------
@@ -81,12 +84,13 @@
 #include "ss7_link.h"
 #include "runtime.h"
 #include "logging.h"
+#include "in_iwf.h"
 #include "test_cmd.h"
 #include "imsi_trace.h"
 #include "subscr_cache.h"
 #include "gsup_proto.h"
-#include "msisdn_db.h"
 #ifdef GSUP_PROXY_ENABLED
+#include "msisdn_db.h"
 #include "gsup_map_proxy.h"
 #include "ussd_iwf.h"
 #endif
@@ -198,17 +202,25 @@ static void map_sess_timeout_hook_cmd(map_session_t *s, void *hook_ctx)
                                          MAP_ERR_SYSTEM_FAILURE, 1);
             } else if (s->state == MAP_SESS_WAIT_MAP_ACK &&
                        s->map_op == MAP_OP_SRI) {
-                ss7_sccp_addr_t peer = s->peer_sccp;
-                uint32_t otid = s->peer_tcap_dialogue_id;
-                bool have_otid = s->have_peer_tid;
-                uint8_t inv = s->peer_invoke_id;
-                map_sess_remove(s);
-                if (peer.have_gt || peer.point_code) {
-                    tcap_msg_t fake = {0};
-                    fake.otid = otid;
-                    fake.have_otid = have_otid;
-                    sri_send_error(rt, &peer, &fake, inv,
-                                   MAP_ERR_SYSTEM_FAILURE);
+                if (s->sip_prn) {
+                    map_iwf_prn_cb_t cb = s->sip_prn_cb;
+                    void *user = s->sip_user;
+                    map_sess_remove(s);
+                    if (cb)
+                        cb(rt, user, MAP_ERR_SYSTEM_FAILURE, NULL);
+                } else {
+                    ss7_sccp_addr_t peer = s->peer_sccp;
+                    uint32_t otid = s->peer_tcap_dialogue_id;
+                    bool have_otid = s->have_peer_tid;
+                    uint8_t inv = s->peer_invoke_id;
+                    map_sess_remove(s);
+                    if (peer.have_gt || peer.point_code) {
+                        tcap_msg_t fake = {0};
+                        fake.otid = otid;
+                        fake.have_otid = have_otid;
+                        sri_send_error(rt, &peer, &fake, inv,
+                                       MAP_ERR_SYSTEM_FAILURE);
+                    }
                 }
             }
         }
@@ -283,6 +295,12 @@ static void handle_begin_sai(struct iwf_runtime *rt,
     memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
     s->imsi_bcd_len = req.imsi_bcd_len;
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
+    s->gsup_num_vectors = req.num_vectors;
+    if (req.have_resync) {
+        memcpy(s->resync_rand, req.resync_rand, sizeof(s->resync_rand));
+        memcpy(s->resync_auts, req.resync_auts, sizeof(s->resync_auts));
+        s->have_resync = true;
+    }
 
     /* Visited PLMN: derive from the IMSI MCC+MNC (TS 24.008).  This is a
      * fallback - a future patch can prefer the SCCP CallingParty GT's
@@ -292,12 +310,13 @@ static void handle_begin_sai(struct iwf_runtime *rt,
         s->have_visited_plmn = true;
 
     LOGI("map",
-         "[%s] RX BEGIN SAI tid=0x%08x peer_otid=0x%08x invoke=%u vec_req=%u",
+         "[%s] RX BEGIN SAI tid=0x%08x peer_otid=0x%08x invoke=%u vec_req=%u%s",
          s->imsi_str,
          s->tcap_dialogue_id,
          s->peer_tcap_dialogue_id,
          (unsigned)s->peer_invoke_id,
-         req.num_vectors);
+         req.num_vectors,
+         s->have_resync ? " resync=1" : "");
 
     if (diameter_send_air(rt, s) < 0) {
         LOGW("map", "[%s] AIR send failed; replying systemFailure", s->imsi_str);
@@ -406,6 +425,10 @@ static void handle_begin_purge(struct iwf_runtime *rt,
     map_session_t *s = map_sess_create(map_sess_new_tid());
     if (!s) return;
     s->map_op = MAP_OP_PURGE_MS;
+    /* MAP PurgeMS is CS (VLR). HSS matches PUR Origin-Host to vlr_host
+     * (origin_host_cs). Leaving cn_domain unset sends the PS origin_host
+     * and HSS logs "purge host mismatch - no purge flag update". */
+    s->gsup_cn_domain = GSUP_CN_DOMAIN_CS;
     s->state  = MAP_SESS_WAIT_DIAMETER;
     s->peer_tcap_dialogue_id = tmsg->otid;
     s->have_peer_tid         = tmsg->have_otid;
@@ -420,7 +443,7 @@ static void handle_begin_purge(struct iwf_runtime *rt,
                            s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
     LOGI("map",
-         "[%s] RX BEGIN PurgeMS tid=0x%08x invoke=%u",
+         "[%s] RX BEGIN PurgeMS tid=0x%08x invoke=%u cn=CS",
          s->imsi_str,
          s->tcap_dialogue_id,
          (unsigned)s->peer_invoke_id);
@@ -681,9 +704,17 @@ static bool vlr_gt_is_local(struct iwf_runtime *rt, const char *vlr_gt)
     if (!rt || !vlr_gt || !vlr_gt[0]) return false;
     if (rt->cfg.map_local_gt[0] && !strcmp(vlr_gt, rt->cfg.map_local_gt))
         return true;
+    if (rt->cfg.local_msc_vlr_gt[0] &&
+        !strcmp(vlr_gt, rt->cfg.local_msc_vlr_gt))
+        return true;
+    if (rt->cfg.local_msc_msc_gt[0] &&
+        !strcmp(vlr_gt, rt->cfg.local_msc_msc_gt))
+        return true;
+#ifdef SMS_IWF_ENABLED
     if (rt->cfg.sms_local_msc_gt[0] &&
         !strcmp(vlr_gt, rt->cfg.sms_local_msc_gt))
         return true;
+#endif
     return false;
 }
 
@@ -735,9 +766,15 @@ static int sri_send_prn_to_vlr(struct iwf_runtime *rt,
                                const char *vlr_gt,
                                const char *msisdn)
 {
-    const char *msc = rt->cfg.map_local_gt[0] ? rt->cfg.map_local_gt
-                      : (rt->cfg.sms_local_msc_gt[0]
-                         ? rt->cfg.sms_local_msc_gt : vlr_gt);
+    const char *msc = vlr_gt;
+    if (rt->cfg.local_msc_msc_gt[0])
+        msc = rt->cfg.local_msc_msc_gt;
+    else if (rt->cfg.map_local_gt[0])
+        msc = rt->cfg.map_local_gt;
+#ifdef SMS_IWF_ENABLED
+    else if (rt->cfg.sms_local_msc_gt[0])
+        msc = rt->cfg.sms_local_msc_gt;
+#endif
     uint8_t arg[256];
     int an = map_encode_prn_arg(s->imsi_str, msc, msisdn, arg, sizeof(arg));
     if (an < 0) return -1;
@@ -778,17 +815,37 @@ static int sri_send_prn_to_vlr(struct iwf_runtime *rt,
     return 0;
 }
 
+static void sip_prn_finish(struct iwf_runtime *rt, map_session_t *s,
+                           int map_err, const char *msrn)
+{
+    map_iwf_prn_cb_t cb = s->sip_prn_cb;
+    void *user = s->sip_user;
+    map_sess_remove(s);
+    if (cb)
+        cb(rt, user, map_err, msrn);
+}
+
 static void finish_sri_from_prn(struct iwf_runtime *rt, map_session_t *s,
                                 const uint8_t *params, size_t plen)
 {
     char msrn[24] = "";
     if (map_decode_prn_res(params, plen, msrn, sizeof(msrn)) < 0) {
+        if (s->sip_prn) {
+            sip_prn_finish(rt, s, MAP_ERR_SYSTEM_FAILURE, NULL);
+            return;
+        }
         tcap_msg_t fake = {0};
         fake.otid = s->peer_tcap_dialogue_id;
         fake.have_otid = s->have_peer_tid;
         sri_send_error(rt, &s->peer_sccp, &fake, s->peer_invoke_id,
                        MAP_ERR_SYSTEM_FAILURE);
         map_sess_remove(s);
+        return;
+    }
+    if (s->sip_prn) {
+        LOGI("map", "[%s] SIP PRN ok msisdn=%s msrn=%s",
+             s->imsi_str, s->msisdn_str[0] ? s->msisdn_str : "-", msrn);
+        sip_prn_finish(rt, s, 0, msrn);
         return;
     }
 
@@ -849,6 +906,7 @@ static void handle_begin_sri(struct iwf_runtime *rt,
     bool on_local_msc = false;
     char vlr_gt[24] = "";
 
+#ifdef GSUP_PROXY_ENABLED
     msisdn_db_cs_t cs;
     if (norm[0] && msisdn_db_lookup_cs(norm, &cs) == 0) {
         snprintf(imsi, sizeof(imsi), "%s", cs.imsi);
@@ -856,13 +914,9 @@ static void handle_begin_sri(struct iwf_runtime *rt,
         if (cs.have_vlr)
             snprintf(vlr_gt, sizeof(vlr_gt), "%s", cs.vlr_number);
         on_local_msc = cs_active_hss && vlr_gt_is_local(rt, vlr_gt);
-#ifdef GSUP_PROXY_ENABLED
         if (cs.imsi[0])
             gsup_map_proxy_note_msisdn(cs.imsi, norm);
-#endif
     }
-
-#ifdef GSUP_PROXY_ENABLED
     if (!imsi[0] &&
         gsup_map_proxy_imsi_for_msisdn(msisdn, imsi, sizeof(imsi)) == 0) {
         on_local_msc = gsup_map_proxy_cs_conn_for_imsi(imsi) >= 0;
@@ -971,6 +1025,12 @@ static void handle_continue_or_end(struct iwf_runtime *rt,
         for (size_t i = 0; i < tmsg->n_components; i++) {
             const tcap_component_t *c = &tmsg->components[i];
             if (c->kind == TCAP_CMP_KIND_ERR) {
+                int err = (c->error_code > 0) ? c->error_code
+                                              : MAP_ERR_SYSTEM_FAILURE;
+                if (s->sip_prn) {
+                    sip_prn_finish(rt, s, err, NULL);
+                    return;
+                }
                 tcap_msg_t fake = {0};
                 fake.otid = s->peer_tcap_dialogue_id;
                 fake.have_otid = s->have_peer_tid;
@@ -986,6 +1046,10 @@ static void handle_continue_or_end(struct iwf_runtime *rt,
             }
         }
         if (tmsg->type == TCAP_MSG_END) {
+            if (s->sip_prn) {
+                sip_prn_finish(rt, s, MAP_ERR_SYSTEM_FAILURE, NULL);
+                return;
+            }
             tcap_msg_t fake = {0};
             fake.otid = s->peer_tcap_dialogue_id;
             fake.have_otid = s->have_peer_tid;
@@ -1300,6 +1364,8 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
         if (gsup_map_proxy_on_tcap(rt, calling, &tmsg))
             return;
 #endif
+        if (in_iwf_on_tcap(rt, calling, &tmsg))
+            return;
         handle_continue_or_end(rt, &tmsg);
         return;
     }
@@ -1310,6 +1376,8 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
         if (gsup_map_proxy_on_tcap(rt, calling, &tmsg))
             return;
 #endif
+        if (in_iwf_on_tcap(rt, calling, &tmsg))
+            return;
         handle_abort(rt, &tmsg);
         return;
     }
@@ -1567,9 +1635,15 @@ void map_iwf_on_aia(struct iwf_runtime *rt, map_session_t *s,
     aia_finalize_vectors(s);
 
     LOGI("map",
-         "[%s] AIA vectors=%u -> emitting MAP SAI Resp",
+         "[%s] AIA vectors=%u -> emitting MAP SAI Resp%s",
          s->imsi_str,
-         s->n_av);
+         s->n_av,
+         (s->n_av > 0 && (s->av[0].autn[6] & 0x80))
+             ? " (AUTN AMF sep-bit=1; UTRAN expects 0)" : "");
+    if (s->n_av > 0 && (s->av[0].autn[6] & 0x80))
+        LOGW("map",
+         "[%s] SAI AUTN AMF=%02x%02x sep-bit=1 — HSS must generate UTRAN with bit 0",
+         s->imsi_str, s->av[0].autn[6], s->av[0].autn[7]);
     if (s->gsup_originated && s->n_av > 0 && !auth_vector_has_ckik(&s->av[0]))
         LOGW("map",
          "[%s] AIA: no CK/IK (Confidentiality-Key/625, Integrity-Key/626)",
@@ -2731,6 +2805,41 @@ void map_iwf_shutdown(struct iwf_runtime *rt)
     map_sess_shutdown();
     free(rt->map);
     rt->map = NULL;
+}
+
+int map_iwf_prn_request(struct iwf_runtime *rt,
+                        const char *imsi, const char *msisdn,
+                        const char *vlr_gt,
+                        map_iwf_prn_cb_t cb, void *user)
+{
+    if (!rt || !cb || !imsi || !imsi[0] || !vlr_gt || !vlr_gt[0])
+        return -1;
+    if (!map_iwf_enabled(rt)) {
+        LOGW("map", "SIP PRN: map_iwf disabled");
+        return -1;
+    }
+
+    map_session_t *s = map_sess_create(map_sess_new_tid());
+    if (!s)
+        return -1;
+    s->map_op = MAP_OP_SRI;
+    s->state = MAP_SESS_WAIT_MAP_ACK;
+    s->sip_prn = true;
+    s->sip_prn_cb = cb;
+    s->sip_user = user;
+    snprintf(s->imsi_str, sizeof(s->imsi_str), "%s", imsi);
+    if (msisdn && msisdn[0])
+        snprintf(s->msisdn_str, sizeof(s->msisdn_str), "%s", msisdn);
+    s->t_dialogue_ms = rt->cfg.sip_prn_timeout_ms > 0
+                       ? rt->cfg.sip_prn_timeout_ms
+                       : (rt->cfg.map_t_dialogue_ms > 0
+                          ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS);
+    if (sri_send_prn_to_vlr(rt, s, vlr_gt,
+                            s->msisdn_str[0] ? s->msisdn_str : msisdn) < 0) {
+        map_sess_remove(s);
+        return -1;
+    }
+    return 0;
 }
 
 /* ====================================================================== */

@@ -383,11 +383,17 @@ test_cmd.{c,h}     optional UNIX `sai <IMSI>` trigger (AIR/AIA lab test)
 # GTP-only build (default; no extra deps):
 make
 
-# Full build with MAP-IWF (requires libosmocore + libosmo-sigtran + libosmo-sccp):
-sudo apt install libosmocore-dev libosmo-sccp-dev libosmo-sigtran-dev
+# Full build with MAP-IWF. Prefers ../third_party/libosmo-sigtran
+# (custom Huawei-NA tree). Host still needs libosmocore + libosmo-netif:
+sudo apt install autoconf automake libtool libsctp-dev \
+  libosmocore-dev libosmo-netif-dev
 make clean
 make MAP_IWF_ENABLED=1
 ```
+
+SCCP is part of that in-tree libosmo-sigtran; do not use distro
+`libosmo-sigtran-dev` / `libosmo-sccp-dev` when the vendored tree is
+present (they are older and ABI-mismatch `libosmocore`).
 
 If `MAP_IWF_ENABLED=1` is omitted but `[map_iwf].enabled = 1` in
 `iwf.conf`, the binary refuses to bring MAP-IWF up at startup with a
@@ -574,3 +580,26 @@ arriving on the shared TCP connection can be routed back in O(1).
 ## License
 
 See the repository root [LICENSE](../LICENSE) (MIT-style permissive terms).
+
+## CS southbound: SIP (default) and BICC (opt-in)
+
+Roaming MT still does north SIP → PRN → one southbound attempt. Default
+`[roam_cs] route_mode` is `sipi` (plain SDP INVITE, not SIP-I). Switch back
+by omitting `route_mode` or setting `route_mode=sipi` and restarting.
+
+BICC (Q.1901 over M3UA SI=13) is opt-in. `[cs_route.<name>]` selects SIP vs
+BICC by longest match on called/MSRN digits. Fill `[bicc]` opc / dpc /
+cic_range when the interconnect assigns them. The BICC MTP user is
+registered next to SCCP on the existing ASP whenever MAP-IWF is up, so MAP
+traffic is unchanged with `route_mode=sipi`.
+
+Bearer: `bearer_mode=bicc` puts IPBCP (RTP ip/port) in IAM/APM. `static_map`
+uses `cic_map`. The IWF host may have no IP path to the NGN; RTP must land
+on a host that does.
+
+IN is choosable per `[in] mode=none|camel|inap|sip_as` (default none). One
+query, then continue/connect/fail. No retry.
+
+Lab: `make test-isup` for the Q.763 codec. Interconnect trials need a second
+IWF or an ISUP/BICC simulator, then a MAP soak with the BICC MTP user
+registered.

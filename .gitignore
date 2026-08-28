@@ -25,3 +25,10 @@ iwf/FileContentIndex/
 /tools/_*.py
 /tools/*.patch
 /tools/pcap_*.py
+
+# Codec unit-test binary
+iwf/isup_codec_test
+
+# In-tree custom libosmo-sigtran build (source stays tracked)
+/third_party/prefix/
+/third_party/build/

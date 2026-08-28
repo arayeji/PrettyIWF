@@ -104,6 +104,16 @@ int  map_iwf_cmd_test_sai(struct iwf_runtime *rt,
                           int reply_unix_fd);
 void map_iwf_sigusr1_test_sai(struct iwf_runtime *rt);
 
+/* SIP GMSC: originate ProvideRoamingNumber toward visited VLR.
+ * cb is invoked once (success, MAP error, or TCAP timeout). Returns 0 if
+ * the dialogue is in flight; -1 if PRN could not be sent (cb is not called). */
+typedef void (*map_iwf_prn_cb_t)(struct iwf_runtime *rt, void *user,
+                                 int map_err, const char *msrn);
+int map_iwf_prn_request(struct iwf_runtime *rt,
+                        const char *imsi, const char *msisdn,
+                        const char *vlr_gt,
+                        map_iwf_prn_cb_t cb, void *user);
+
 /* ------------------------------------------------------------------- */
 /* Cross-module callbacks invoked by the Diameter layer when a response */
 /* (AIA/ULA/CLA/PUA) arrives, keyed by Diameter Session-Id back to the  */

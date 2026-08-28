@@ -26,6 +26,7 @@
 #include "gtp_trace.h"
 #include "imsi_trace.h"
 #include "metrics_http.h"
+#include "sip_iwf.h"
 #include "gtpv1.h"
 #ifdef GSUP_PROXY_ENABLED
 #  include "gsup_server.h"
@@ -422,6 +423,23 @@ int main(int argc, char **argv)
     }
 #endif
 
+    if (sip_iwf_init(&rt, epfd) < 0) {
+        LOGE("iwf", "SIP GMSC init failed; check [sip_iwf] listen/transport");
+        if (rt.cfg.sip_iwf_enabled) {
+#ifdef SMS_IWF_ENABLED
+            sms_iwf_shutdown(&rt);
+#endif
+#ifdef GSUP_PROXY_ENABLED
+            gsup_server_shutdown();
+#endif
+            map_iwf_shutdown(&rt);
+            close(epfd);
+            close(tfd);
+            close(rt.v1_sock);
+            return 1;
+        }
+    }
+
     if (metrics_http_init(&rt, epfd) < 0) {
         LOGE("iwf", "metrics HTTP init failed; check [metrics] config");
         if (rt.cfg.metrics_enabled) {
@@ -451,13 +469,14 @@ int main(int argc, char **argv)
 #else
         const char *sms_s = "";
 #endif
+        const char *sip_s = sip_iwf_enabled(&rt) ? "; SIP-GMSC active" : "";
         LOGI("iwf", "ready: UDP %s:%u (listen_ip=%s) -> S4 SGW-C=%s:%u "
-                    "(F-TEID/GSN %s)%s%s%s; SIGHUP reloads config",
+                    "(F-TEID/GSN %s)%s%s%s%s; SIGHUP reloads config",
              bind_ip, rt.cfg.listen_port,
              rt.cfg.listen_ip,
              rt.cfg.sgwc_ip, rt.cfg.sgwc_port,
              inet_ntoa(*(struct in_addr *)&rt.local_ipv4_be),
-             map_s, gsup_s, sms_s);
+             map_s, gsup_s, sms_s, sip_s);
     }
 
     while (!g_stop) {
@@ -499,8 +518,15 @@ int main(int argc, char **argv)
                            translate_sess_timeout, &rt);
                 subscr_cache_sweep(time(NULL), rt.cfg.pgw_cache_ttl_s);
                 pgw_dns_cache_sweep(time(NULL));
+                sip_iwf_on_timer(&rt);
                 break;
             }
+            case SIP_EPOLL_ROLE_UDP:
+                sip_iwf_on_udp(&rt);
+                break;
+            case SIP_EPOLL_ROLE_TCP_LISTEN:
+                sip_iwf_on_tcp_listen(&rt);
+                break;
             case MAP_EPOLL_ROLE_SS7:
                 map_iwf_on_ss7_readable(&rt);
                 break;
@@ -543,6 +569,11 @@ int main(int argc, char **argv)
                 break;
 #endif
             default: {
+                int sip_tcp = sip_iwf_epoll_tcp_idx(role);
+                if (sip_tcp >= 0) {
+                    sip_iwf_on_tcp_conn(&rt, sip_tcp);
+                    break;
+                }
                 int diam_peer = map_iwf_epoll_diameter_peer(role);
                 if (diam_peer >= 0) {
                     map_iwf_on_diameter_peer_readable(&rt, diam_peer);
@@ -567,6 +598,7 @@ int main(int argc, char **argv)
     }
 
     LOGI("iwf", "shutting down");
+    sip_iwf_shutdown(&rt);
     metrics_http_shutdown();
     iwf_imsi_trace_shutdown();
 #ifdef SMS_IWF_ENABLED

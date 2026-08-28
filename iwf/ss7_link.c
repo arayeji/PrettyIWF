@@ -43,6 +43,7 @@
 #include "runtime.h"
 #include "logging.h"
 #include "map_iwf_priv.h"
+#include "isup_call.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +117,11 @@ static uint32_t pack_dotted_pc(const char *pcs)
     if (!pcs || !pcs[0] || !parse_pc_triplet(pcs, &a, &b, &c))
         return OSMO_SS7_PC_INVALID;
     return ((a & 0x7u) << 11) | ((b & 0xffu) << 3) | (c & 0x7u);
+}
+
+uint32_t ss7_link_pack_pc(const char *dotted)
+{
+    return pack_dotted_pc(dotted);
 }
 
 static uint32_t pack_map_local_pc(const struct iwf_runtime *rt)
@@ -200,12 +206,36 @@ struct ss7_impl_ctx {
     struct osmo_sccp_user *user_hlr;
     ss7_recv_cb_t          recv_cb_hlr;
 #endif
+    struct osmo_ss7_user *isup_user;
     int                    eventfd_to_main;       /* main thread polls this */
     uint32_t               local_pc;              /* packed [map_iwf] local_pc */
     uint32_t               stp_dpc;               /* packed [stp] remote_pc (MTP routes) */
     uint8_t                network_indicator;    /* [stp] network_indicator for MTP SIO */
     int                    sccp_ri;               /* IWF_SCCP_RI_GT or IWF_SCCP_RI_SSN */
 };
+
+static int isup_mtp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
+{
+    struct iwf_runtime *rt = priv;
+    struct msgb *msg = oph ? oph->msg : NULL;
+    if (!oph) return -1;
+    if (oph->primitive == OSMO_MTP_PRIM_TRANSFER &&
+        oph->operation == PRIM_OP_INDICATION && msg) {
+        struct osmo_mtp_prim *omp = (struct osmo_mtp_prim *)oph;
+        const uint8_t *pay = msgb_l2(msg);
+        size_t plen = msgb_l2len(msg);
+        if (!pay) {
+            pay = msgb_data(msg);
+            plen = msgb_length(msg);
+        }
+        uint8_t si = (uint8_t)(omp->u.transfer.sio & 0x0f);
+        isup_call_rx(rt, omp->u.transfer.opc, omp->u.transfer.dpc,
+                     si, pay, plen);
+    }
+    if (msg)
+        msgb_free(msg);
+    return 0;
+}
 
 bool ss7_link_is_active(const struct iwf_runtime *rt)
 {
@@ -650,6 +680,26 @@ int ss7_link_init(struct iwf_runtime *rt)
     /* osmo_sccp_user has its own priv pointer for the prim cb. */
     osmo_sccp_user_set_priv(ctx->user, rt);
 
+    ctx->isup_user = osmo_ss7_user_create(ctx->ss7, "iwf-bicc");
+    if (ctx->isup_user) {
+        osmo_ss7_user_set_prim_cb(ctx->isup_user, isup_mtp_prim_cb);
+        osmo_ss7_user_set_priv(ctx->isup_user, rt);
+        if (osmo_ss7_user_register(ctx->isup_user, MTP_SI_BICC) == 0)
+            LOGI("ss7", "MTP user iwf-bicc registered SI=%u (BICC) "
+                 "on existing M3UA (SCCP SI=3 unchanged)", MTP_SI_BICC);
+        else
+            LOGW("ss7", "MTP SI=BICC register failed");
+        if (osmo_ss7_user_register(ctx->isup_user, MTP_SI_ISUP) == 0)
+            LOGI("ss7", "MTP user iwf-bicc also registered SI=%u (ISUP)",
+                 MTP_SI_ISUP);
+        else
+            LOGW("ss7", "MTP SI=ISUP register failed");
+        if (isup_call_init(rt) < 0)
+            LOGW("ss7", "isup_call_init failed (CIC pool)");
+    } else {
+        LOGW("ss7", "osmo_ss7_user_create(iwf-bicc) failed");
+    }
+
     LOGI("ss7", "SS7 primary OPC packed 0x%x (config %s)",
          (unsigned)default_pc,
          rt->cfg.map_local_pc[0] ? rt->cfg.map_local_pc : "?");
@@ -813,6 +863,49 @@ static int ss7_tx_unitdata_mtp(struct ss7_impl_ctx *ctx,
     return osmo_ss7_user_mtp_sap_prim_down(mtp_user, omp);
 }
 
+int ss7_link_send_mtp(struct iwf_runtime *rt, uint8_t si,
+                       const char *opc_dotted, const char *dpc_dotted,
+                       const uint8_t *payload, size_t len)
+{
+    if (!rt || !rt->map || !rt->map->ss7.opaque || !payload || !len)
+        return -1;
+    struct ss7_impl_ctx *ctx = rt->map->ss7.opaque;
+    if (!ctx->isup_user) {
+        LOGE("isup", "no MTP user for ISUP/BICC");
+        return -1;
+    }
+    uint32_t opc = pack_dotted_pc(opc_dotted);
+    if (!osmo_ss7_pc_is_valid(opc))
+        opc = ctx->local_pc;
+    uint32_t dpc = pack_dotted_pc(dpc_dotted);
+    if (!osmo_ss7_pc_is_valid(dpc)) {
+        LOGE("isup", "[bicc] dpc unset — refusing MTP-TRANSFER");
+        return -1;
+    }
+    if (!osmo_ss7_pc_is_valid(opc)) {
+        LOGE("isup", "local opc unset — refusing TX");
+        return -1;
+    }
+    struct msgb *msg = msgb_alloc_headroom((int)len + 128, 128, "iwf-isup");
+    if (!msg) return -1;
+    uint8_t *p = msgb_put(msg, (int)len);
+    memcpy(p, payload, len);
+    msg->l2h = msg->data;
+    if (msgb_headroom(msg) < (int)sizeof(struct osmo_mtp_prim)) {
+        msgb_free(msg);
+        return -1;
+    }
+    struct osmo_mtp_prim *omp =
+        (struct osmo_mtp_prim *)msgb_push(msg, sizeof(*omp));
+    osmo_prim_init(&omp->oph, MTP_SAP_USER,
+                   OSMO_MTP_PRIM_TRANSFER, PRIM_OP_REQUEST, msg);
+    omp->u.transfer.opc = opc;
+    omp->u.transfer.dpc = dpc;
+    omp->u.transfer.sls = (uint8_t)(payload[0] & 0x0f);
+    omp->u.transfer.sio = MTP_SIO(si, ctx->network_indicator);
+    return osmo_ss7_user_mtp_sap_prim_down(ctx->isup_user, omp);
+}
+
 static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
                            struct osmo_sccp_user *user,
                            const ss7_sccp_addr_t *called,
@@ -884,6 +977,11 @@ void ss7_link_shutdown(struct iwf_runtime *rt)
 #ifdef SMS_IWF_ENABLED
     if (ctx->user_hlr) osmo_sccp_user_unbind(ctx->user_hlr);
 #endif
+    isup_call_shutdown();
+    if (ctx->isup_user) {
+        osmo_ss7_user_destroy(ctx->isup_user);
+        ctx->isup_user = NULL;
+    }
     if (ctx->sccp)  osmo_sccp_instance_destroy(ctx->sccp);
     if (ctx->ss7)   osmo_ss7_instance_destroy(ctx->ss7);
     if (ctx->tall_ctx) talloc_free(ctx->tall_ctx);
@@ -925,6 +1023,15 @@ int ss7_link_send_tcap_ex(struct iwf_runtime *rt,
                           const uint8_t *tcap, size_t tcap_len)
 {
     (void)rt; (void)called; (void)calling; (void)tcap; (void)tcap_len;
+    return -1;
+}
+
+int ss7_link_send_mtp(struct iwf_runtime *rt, uint8_t si,
+                       const char *opc_dotted, const char *dpc_dotted,
+                       const uint8_t *payload, size_t len)
+{
+    (void)rt; (void)si; (void)opc_dotted; (void)dpc_dotted;
+    (void)payload; (void)len;
     return -1;
 }
 

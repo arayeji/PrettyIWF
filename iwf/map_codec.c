@@ -14,7 +14,8 @@
  * -----------
  * Each MAP dialogue carries either an AARQ (in TCAP Begin) or AARE (in TCAP
  * Continue/End) inside the dialogue portion.  AARQ carries protocol-version
- * and application-context-name.  AARE additionally carries mandatory Q.773
+ * and application-context-name.  AARE omits protocol-version (Q.773 optional;
+ * omitted means version1) to match Irancell HLR; it still carries mandatory
  * result (accepted) and result-source-diagnostic (dialogue-service-user null).
  *
  * Note: MAP encoding has many vendor- and version-specific edge cases.  This
@@ -207,7 +208,26 @@ int map_decode_sai_arg(const uint8_t *p, size_t n, map_sai_req_t *out)
             if (nv >= 1 && nv <= 5) out->num_vectors = (uint8_t)nv;
         } else if (tag == 0x05) {                    /* segmentationProhibited NULL */
         } else if (tag == 0x81) {                    /* [1] immediateResponsePreferred */
-        } else if (tag == 0x30) {                    /* re-synchronisationInfo SEQUENCE */
+        } else if (tag == 0x30) {
+            /* Re-synchronisationInfo ::= SEQUENCE { rand RAND, auts AUTS } */
+            size_t ro = 0;
+            const uint8_t *randp = NULL, *autsp = NULL;
+            while (ro < l) {
+                uint8_t rtag;
+                const uint8_t *rv;
+                size_t rl;
+                if (ber_dec_tlv(v, l, &ro, &rtag, &rv, &rl) < 0)
+                    break;
+                if ((rtag == 0x04 || rtag == 0x80) && rl == 16 && !randp)
+                    randp = rv;
+                else if ((rtag == 0x04 || rtag == 0x81) && rl == 14 && !autsp)
+                    autsp = rv;
+            }
+            if (randp && autsp) {
+                memcpy(out->resync_rand, randp, 16);
+                memcpy(out->resync_auts, autsp, 14);
+                out->have_resync = true;
+            }
         } else if (tag == 0xA2 || tag == 0x82) {     /* [2] extensionContainer */
         } else if (tag == 0x83 || tag == 0x93) {     /* [3] requestingNodeType */
             uint32_t v32 = 0;
@@ -1302,6 +1322,7 @@ static int enc_aaXX_oid(uint8_t apdu_tag, const uint8_t *ac_oid, size_t ac_len,
 {
     /* AARQ/AARE body (ITU-T Q.773):
      *   [0] IMPLICIT protocol-version: { version1 (0) }   -> 80 02 07 80
+     *       Optional. Omitted on AARE (Irancell HLR style; version1 implied).
      *   [1] EXPLICIT application-context-name OID         -> A1 <len> 06 <len> <oid>
      * AARE only (mandatory):
      *   [2] EXPLICIT result accepted(0)                     -> A2 03 02 01 00
@@ -1310,9 +1331,11 @@ static int enc_aaXX_oid(uint8_t apdu_tag, const uint8_t *ac_oid, size_t ac_len,
      */
     uint8_t apdu[64];
     size_t  apo = 0;
-    /* protocol-version BIT STRING { version1(0) } */
-    static const uint8_t pv[] = { 0x07, 0x80 };
-    if (ber_enc_tlv(apdu, sizeof(apdu), &apo, 0x80, pv, sizeof(pv)) < 0) return -1;
+    if (apdu_tag != 0x61) {
+        static const uint8_t pv[] = { 0x07, 0x80 };
+        if (ber_enc_tlv(apdu, sizeof(apdu), &apo, 0x80, pv, sizeof(pv)) < 0)
+            return -1;
+    }
 
     uint8_t ac_tlv[32];
     size_t  at = 0;
@@ -1389,6 +1412,13 @@ int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap)
 int map_encode_aare(map_app_ctx_t ac, uint8_t *out, size_t out_cap)
 {
     return enc_aaXX(0x61 /* [APPLICATION 1] AARE */, ac, out, out_cap);
+}
+
+int map_encode_aarq_oid(const uint8_t *ac_oid, size_t ac_oid_len,
+                        uint8_t *out, size_t out_cap)
+{
+    if (!ac_oid || !ac_oid_len || ac_oid_len > 16) return -1;
+    return enc_aaXX_oid(0x60 /* AARQ */, ac_oid, ac_oid_len, out, out_cap);
 }
 
 int map_encode_aare_oid(const uint8_t *ac_oid, size_t ac_oid_len,

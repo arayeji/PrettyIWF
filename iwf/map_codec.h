@@ -87,6 +87,11 @@ typedef struct {
     uint8_t  requesting_node_type;
     bool     have_requesting_node_type;
 
+    /* re-synchronisationInfo { RAND(16), AUTS(14) } — optional. */
+    uint8_t  resync_rand[16];
+    uint8_t  resync_auts[14];
+    bool     have_resync;
+
     /* sgsn-Number (BCD E.164, MSC/SGSN GT).  Lets us derive the PLMN. */
     uint8_t  sgsn_number_bcd[8];
     uint8_t  sgsn_number_bcd_len;
@@ -316,6 +321,8 @@ int map_decode_aarq_ac(const uint8_t *p, size_t n, map_app_ctx_t *out);
  * dialogues whose AC we don't model (e.g. shortMsgMT-Relay v1/v2/v3). */
 int map_decode_aarq_ac_raw(const uint8_t *p, size_t n,
                            uint8_t *oid_out, size_t cap, size_t *oid_len);
+int map_encode_aarq_oid(const uint8_t *ac_oid, size_t ac_oid_len,
+                        uint8_t *out, size_t out_cap);
 int map_encode_aare_oid(const uint8_t *ac_oid, size_t ac_oid_len,
                         uint8_t *out, size_t out_cap);
 /* Target IMSI from the MAP-open destinationReference (network-initiated

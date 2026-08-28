@@ -276,7 +276,104 @@ typedef struct {
     int         sms_n_partners;
 #endif /* SMS_IWF_ENABLED */
 
+    /* [sip_iwf] SIP GMSC / B2BUA toward Kamailio (Mg/Mj). */
+    int         sip_iwf_enabled;
+    char        sip_listen_ip[64];
+    uint16_t    sip_listen_port;
+    int         sip_transport_udp;        /* default 1 */
+    int         sip_transport_tcp;        /* default 1 */
+    char        sip_kamailio_peer[128];   /* host or sip:host:port */
+    char        sip_local_uri[128];       /* Contact / From identity */
+    char        sip_codec_offer[64];      /* pcmu,pcma */
+#define IWF_SIP_MEDIA_PASSTHROUGH 0
+#define IWF_SIP_MEDIA_ANCHOR      1
+    int         sip_media_mode;
+    int         sip_max_sessions;         /* default 200 */
+    int         sip_options_interval_s;   /* 0 = do not originate OPTIONS */
+    int         sip_invite_timeout_ms;
+    int         sip_sri_timeout_ms;
+    int         sip_prn_timeout_ms;
+    int         sip_session_timer_s;
+
+    /* [hlr] MT resolution. Only mongo_cs (HSS vlr_number). map_sri is rejected. */
+#define IWF_HLR_MODE_MONGO_CS 0
+#define IWF_HLR_MODE_MAP_SRI  1  /* not implemented; config load fails */
+    int         hlr_mode;
+    char        hlr_home_gt[24];
+
+    /* [local_msc] home VLR/MSC GTs — match ⇒ local 3G (no roam PRN). */
+    char        local_msc_vlr_gt[24];
+    char        local_msc_msc_gt[24];
+
+    /* [local_cs] sip-connector peer. Always INVITE(MSISDN). Not for roamers. */
+    char        local_cs_sip_peer[128];
+#define IWF_CS_ROUTE_SIP_MSISDN 0
+    int         local_cs_route_mode;
+
+    /* [roam_cs] visited VLR prefix + SIP or BICC interconnect. */
+#define IWF_ROAM_CS_PREFIX_MAX 8
+    char        roam_cs_vlr_prefix[IWF_ROAM_CS_PREFIX_MAX][24];
+    int         n_roam_cs_vlr_prefix;
+#define IWF_ROAM_CS_ROUTE_SIPI 0
+#define IWF_ROAM_CS_ROUTE_ISUP 1  /* BICC (SI=13) or ISUP (SI=5); opt-in */
+    int         roam_cs_route_mode;
+    char        roam_cs_sipi_peer[128];
+    /* Empty = accept any PRN MSRN. Set only after you see the real range. */
+    char        roam_cs_msrn_prefix_ok[24];
+    /* Forced CLI on roaming-MT legs; empty = derive from north From. */
+    char        roam_cs_cli[32];
+
+    /* [cs_route.<name>] called/MSRN prefix -> sip | bicc */
+#define IWF_CS_ROUTE_MAX 8
+#define IWF_CS_ROUTE_PFX_MAX 8
+#define IWF_CS_SOUTH_SIP  0
+#define IWF_CS_SOUTH_BICC 1
+    struct iwf_cs_route {
+        char    name[32];
+        char    prefix[IWF_CS_ROUTE_PFX_MAX][24];
+        int     n_prefix;
+        int     south;
+        char    sip_peer[128];
+        int     in_mode;            /* -1 = inherit [in] mode */
+    } cs_route[IWF_CS_ROUTE_MAX];
+    int         n_cs_route;
+
+    /* [bicc] / [isup] — empty until you fill OPC/DPC/CIC. */
+#define IWF_CIC_SEL_EVEN 0
+#define IWF_CIC_SEL_ODD  1
+#define IWF_BICC_SI_BICC 0
+#define IWF_BICC_SI_ISUP 1
+#define IWF_BEARER_BICC        0
+#define IWF_BEARER_STATIC_MAP 1
+#define IWF_CIC_MAP_MAX 64
+    char        bicc_opc[16];
+    char        bicc_dpc[16];
+    char        bicc_cic_range[32];
+    int         bicc_cic_selection;
+    int         bicc_si;
+    int         bicc_bearer_mode;
+    char        bicc_rtp_ip[64];
+    uint16_t    bicc_rtp_port_base;
+    struct {
+        uint16_t cic;
+        char     ip[64];
+        uint16_t port;
+    } bicc_cic_map[IWF_CIC_MAP_MAX];
+    int         bicc_n_cic_map;
+
+    /* [in] choosable IN. Default none. */
+    int         in_mode;
+    char        in_scp_gt[24];
+    uint8_t     in_scp_ssn;
+    char        in_sip_as[128];
+    int         in_timeout_ms;
+
 } iwf_config_t;
+
+typedef struct iwf_cs_route iwf_cs_route_t;
+
+const iwf_cs_route_t *iwf_cs_route_lookup(const iwf_config_t *cfg,
+                                           const char *digits);
 
 struct iwf_runtime;
 
