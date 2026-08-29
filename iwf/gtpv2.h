@@ -89,6 +89,13 @@ int gtpv2_enc_uli_from_v1_uli(gtpv2_enc_t *e, const uint8_t *v1uli,
  * OsmoSGSN's placeholder and is treated as unusable. */
 int gtpv2_v1_uli_real_cgi_sai(const uint8_t *v1uli, uint16_t len,
                               uint8_t *rat_out);
+/* When S4 RAT is EUTRAN/WLAN, map a real Gn CGI/SAI onto TAI+ECGI
+ * (PLMN copied, TAC=LAC, ECI=CI/SAC). Returns -1 if ULI is dummy. */
+int gtpv2_enc_uli_tai_ecgi_from_v1_cgi_sai(gtpv2_enc_t *e,
+                                          const uint8_t *v1uli, uint16_t len);
+/* CGI/SAI copy when RAT is UTRAN/GERAN; TAI+ECGI map when EUTRAN/WLAN. */
+int gtpv2_enc_uli_from_v1_uli_for_rat(gtpv2_enc_t *e, uint8_t rat_type,
+                                     const uint8_t *v1uli, uint16_t len);
 /* Same wire shape, PLMN from MCC/MNC and LAC=RAC=0 (lab fallback when Gn has no RAI). */
 int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc);
 /* ULI for configured RAT: EUTRAN/WLAN → TAI+ECGI with gateway tac/eci;

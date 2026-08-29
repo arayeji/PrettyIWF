@@ -119,11 +119,10 @@ typedef struct sess_s {
     /* User Location Information cached from Create PDP, replayed in MBReq.
      * uli_kind: 0 = none, 1 = real RAI (uli_rai6 holds the 6 octets),
      *           2 = synthetic from IMSI PLMN (uli_mcc/uli_mnc used),
-     *           3 = verbatim GTPv1 ULI IE (uli_v1[0..uli_v1_len-1], the real
-     *               CGI/SAI the RNC reported - preferred for UTRAN/GERAN,
-     *               where the Gn Routing Area Identity IE only ever carries
-     *               OsmoSGSN's placeholder LAC/RAC). */
-    uint8_t     s4_rat;               /* RAT actually sent on S4 (may differ from cfg) */
+     *           3 = cached GTPv1 ULI IE (uli_v1[0..uli_v1_len-1], the real
+     *               CGI/SAI the RNC reported). Encoded as CGI/SAI when S4 RAT
+     *               is UTRAN/GERAN, or mapped to TAI+ECGI when cfg is eutran. */
+    uint8_t     s4_rat;               /* RAT actually sent on S4 (may differ from cell) */
     uint8_t     uli_kind;
     uint8_t     uli_rai6[6];
     uint8_t     uli_v1[16];

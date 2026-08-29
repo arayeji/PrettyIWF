@@ -85,7 +85,7 @@ TS 29.274 value **103** = *Conditional IE missing*. With **Open5GS SGW-C**, this
 
 ### GTPv2 Create Session Response: cause **70**
 
-`[smf] ERROR: Unknown RAT Type [1]` (smf/s5c-handler.c) means Open5GS SMF received **RAT Type = UTRAN (1)** and only accepts **EUTRAN (6)** and **WLAN (3)**. SMF returns Cause **MANDATORY_IE_INCORRECT**. When Gn Create PDP carries a **real CGI/SAI** (LAC not `0xfffe`), the IWF now sends that cell on S4 with matching RAT (SAI→UTRAN, CGI→GERAN). `[iwf] rat_type = eutran` plus gateway TAI/ECGI is only the fallback when Gn has no usable ULI. If the home SMF still rejects UTRAN, that core must allow UTRAN (or the session fails with the truthful location).
+`[smf] ERROR: Unknown RAT Type [1]` (smf/s5c-handler.c) means Open5GS SMF received **RAT Type = UTRAN (1)** and only accepts **EUTRAN (6)** and **WLAN (3)**. SMF returns Cause **MANDATORY_IE_INCORRECT**. **`[iwf] rat_type = eutran`** (or `wlan`) **wins**: S4 RAT stays 6, and a real Gn SAI/CGI is mapped to **TAI+ECGI** (PLMN from the cell, **TAC=LAC**, **ECI=CI/SAC**) so location is not dropped. Dummy LAC `0xfffe` / missing ULI still uses the configured gateway TAC/ECI. Set `rat_type = utran` only if the peer actually accepts UTRAN and should receive a truthful SAI.
 
 **ULI** can also trigger 103 for **RAT = UTRAN** if the SGW expects it. The IWF builds **ULI** from GTPv1 **RAI** when present; if your emulator omits RAI, use **`[iwf] synthetic_uli_no_rai = 1`** (lab only: IMSI PLMN + zero LAC/RAC).
 

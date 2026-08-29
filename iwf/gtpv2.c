@@ -480,6 +480,28 @@ static int gtpv2_enc_uli_tai_ecgi(gtpv2_enc_t *e, const uint8_t plmn[3],
     return gtpv2_enc_tlv(e, GTPV2_IE_ULI, 0, v, sizeof(v));
 }
 
+/* Map a real Gn CGI/SAI onto E-UTRAN TAI+ECGI so [iwf] rat_type=eutran
+ * can stay EUTRAN while still carrying the 3G cell. TAC=LAC, ECI=CI/SAC. */
+int gtpv2_enc_uli_tai_ecgi_from_v1_cgi_sai(gtpv2_enc_t *e,
+                                         const uint8_t *v1uli, uint16_t len)
+{
+    if (gtpv2_v1_uli_real_cgi_sai(v1uli, len, NULL) != 0)
+        return -1;
+    uint8_t plmn[3];
+    memcpy(plmn, v1uli + 1, 3);
+    uint16_t tac = (uint16_t)((v1uli[4] << 8) | v1uli[5]);
+    uint32_t eci = ((uint32_t)v1uli[6] << 8) | (uint32_t)v1uli[7];
+    return gtpv2_enc_uli_tai_ecgi(e, plmn, tac, eci);
+}
+
+int gtpv2_enc_uli_from_v1_uli_for_rat(gtpv2_enc_t *e, uint8_t rat_type,
+                                     const uint8_t *v1uli, uint16_t len)
+{
+    if (rat_type == GTPV2_RAT_EUTRAN || rat_type == GTPV2_RAT_WLAN)
+        return gtpv2_enc_uli_tai_ecgi_from_v1_cgi_sai(e, v1uli, len);
+    return gtpv2_enc_uli_from_v1_uli(e, v1uli, len);
+}
+
 int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc)
 {
     uint8_t plmn[3];

@@ -1357,9 +1357,12 @@ static int try_handle_gtpu_context_response_reverse(iwf_runtime_t *rt,
 /* Northbound: GTPv1-C from osmo-sgsn -> GTPv2-C to SGW-C               */
 /* ------------------------------------------------------------------- */
 
-/* Cache a real Gn CGI/SAI and the matching S4 RAT. Dummy LAC 0xfffe is
- * rejected so the EUTRAN TAI/ECGI fallback still applies for lab RAI. */
-static int sess_apply_real_gn_uli(sess_t *s, const iwf_ie_t *v1uli)
+/* Cache a real Gn CGI/SAI. Dummy LAC 0xfffe is rejected so the configured
+ * TAI/ECGI fallback still applies for lab RAI.
+ * Option A: [iwf] rat_type eutran/wlan wins over the cell type — S4 keeps
+ * EUTRAN and the SAI is mapped to TAI+ECGI at encode time. */
+static int sess_apply_real_gn_uli(sess_t *s, const iwf_ie_t *v1uli,
+                                  const iwf_runtime_t *rt)
 {
     uint8_t rat = 0;
     if (!v1uli ||
@@ -1371,7 +1374,11 @@ static int sess_apply_real_gn_uli(sess_t *s, const iwf_ie_t *v1uli)
     memcpy(s->uli_v1, v1uli->value, cp);
     s->uli_v1_len = (uint8_t)cp;
     s->uli_kind   = 3;
-    s->s4_rat     = rat;
+    if (rt && (rt->cfg.rat_type == GTPV2_RAT_EUTRAN ||
+               rt->cfg.rat_type == GTPV2_RAT_WLAN))
+        s->s4_rat = rt->cfg.rat_type;
+    else
+        s->s4_rat = rat;
     return 0;
 }
 
@@ -1778,25 +1785,32 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             uli_mnc = mnc_imsi;
         }
 
-        /* Prefer the real CGI/SAI from Gn ULI whenever it is usable, even
-         * if [iwf] rat_type is eutran. Configured TAI/ECGI is only for
-         * dummy/missing location (OsmoSGSN RAI LAC=0xfffe). RAT on S4
-         * follows the cell type so SAI is not sent as E-UTRAN. */
+        /* Prefer the real CGI/SAI from Gn ULI whenever it is usable.
+         * Dummy/missing location (OsmoSGSN RAI LAC=0xfffe) uses configured
+         * TAI/ECGI. When [iwf] rat_type is eutran/wlan, RAT stays that value
+         * and the SAI is mapped to TAI+ECGI (TAC=LAC, ECI=SAC) so home SMF
+         * accepts the session without dropping 3G location. */
         const iwf_ie_t *v1uli = gtpv1_find_ie(v1, GTPV1_IE_ULI);
         int used_v1_uli = 0;
         uint8_t uli_rat = 0;
         if (v1uli &&
             gtpv2_v1_uli_real_cgi_sai(v1uli->value, v1uli->length, &uli_rat) == 0 &&
-            gtpv2_enc_uli_from_v1_uli(&e, v1uli->value, v1uli->length) == 0) {
-            (void)sess_apply_real_gn_uli(s, v1uli);
+            sess_apply_real_gn_uli(s, v1uli, rt) == 0 &&
+            gtpv2_enc_uli_from_v1_uli_for_rat(&e, sess_s4_rat(s, rt),
+                                              v1uli->value, v1uli->length) == 0) {
             used_v1_uli = 1;
             LOGI("translate",
-                 "[%s] ULI from Gn ULI IE (geo_type=%u LAC=0x%04x) S4-RAT=%u (cfg=%u)",
+                 "[%s] ULI from Gn ULI IE (geo_type=%u LAC=0x%04x SAC/CI=0x%04x) "
+                 "S4-RAT=%u (cfg=%u)%s",
                  imsi,
                  (unsigned)v1uli->value[0],
                  (unsigned)(((uint16_t)v1uli->value[4] << 8) | v1uli->value[5]),
+                 (unsigned)(((uint16_t)v1uli->value[6] << 8) | v1uli->value[7]),
                  (unsigned)s->s4_rat,
-                 (unsigned)rt->cfg.rat_type);
+                 (unsigned)rt->cfg.rat_type,
+                 (s->s4_rat == GTPV2_RAT_EUTRAN ||
+                  s->s4_rat == GTPV2_RAT_WLAN)
+                     ? " mapped SAI→TAI+ECGI" : "");
         } else {
             s->s4_rat = rt->cfg.rat_type;
         }
@@ -1857,7 +1871,7 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             gtpv2_enc_serving_network(&e, mcc_imsi, mnc_imsi);
     }
 
-    /* RAT Type: real CGI/SAI above already set s4_rat; otherwise cfg. */
+    /* RAT Type: cfg eutran/wlan wins; otherwise real CGI/SAI sets GERAN/UTRAN. */
     gtpv2_enc_rat_type(&e, sess_s4_rat(s, rt));
 
     /* Indication flags (TS 29.274 §8.12): octet1 bit7=DTF (Direct Tunnel).
@@ -2183,10 +2197,12 @@ static int translate_update_pdp_context(iwf_runtime_t *rt,
     s->sgsn_data_teid   = rnc_teid;
     s->sgsn_addr_ipv4   = rnc_ipv4;
     if ((ie = gtpv1_find_ie(v1, GTPV1_IE_ULI)) &&
-        sess_apply_real_gn_uli(s, ie) == 0) {
+        sess_apply_real_gn_uli(s, ie, rt) == 0) {
         LOGI("translate",
-             "[%s] Update-PDP ULI from Gn (geo_type=%u) S4-RAT=%u",
-             s->key.imsi, (unsigned)ie->value[0], (unsigned)s->s4_rat);
+             "[%s] Update-PDP ULI from Gn (geo_type=%u) S4-RAT=%u%s",
+             s->key.imsi, (unsigned)ie->value[0], (unsigned)s->s4_rat,
+             (s->s4_rat == GTPV2_RAT_EUTRAN || s->s4_rat == GTPV2_RAT_WLAN)
+                 ? " (cfg; SAI→TAI+ECGI)" : "");
     }
     s->state            = SESS_MODIFYING;
 
@@ -2390,7 +2406,8 @@ static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
 
     /* User Location Information — same RAT-aware form as Create Session. */
     if (s->uli_kind == 3 && s->uli_v1_len >= 8) {
-        if (gtpv2_enc_uli_from_v1_uli(&e, s->uli_v1, s->uli_v1_len) != 0)
+        if (gtpv2_enc_uli_from_v1_uli_for_rat(&e, sess_s4_rat(s, rt),
+                                              s->uli_v1, s->uli_v1_len) != 0)
             LOGW("translate", "replaying Gn ULI failed");
     } else if (s->uli_kind == 1) {
         gtpv2_enc_uli_for_rat(&e, sess_s4_rat(s, rt), s->uli_rai6,
