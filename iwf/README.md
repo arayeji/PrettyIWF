@@ -91,6 +91,10 @@ TS 29.274 value **103** = *Conditional IE missing*. With **Open5GS SGW-C**, this
 
 If **Create Session Request** already includes **ULI** and **PGW/SMF F-TEID** (logged `len=` is larger than without `[smf]`) but the response is still **103**, Open5GS may be mapping a **PFCP** failure on **SGW-C ⇄ SGW-U** to GTP cause **103** (`gtp_cause_from_pfcp` maps PFCP *Conditional IE missing* to GTP **103**). Check **SGW-C** / **SGW-U** (or UPF) logs and **`sudo tcpdump -ni any udp port 8805 -vv`** during the attempt.
 
+### APN correction (`[apn_correction]`)
+
+Same policy as Pretty5GS MME `mme.apn_correction`. On Create PDP, if the UE APN is not in the ULA cache, the first matching rule either rewrites it (`on_apn_mismatch = correct`) or rejects (Gn **219**, SM #27). No matching rule and a cached subscription that does not list that APN is stock 3GPP (reject). Correction runs **before** `[roaming_hlr] mnc*_apn` ACL. SIGHUP reloads the section. `pdn_type` is accepted for MME config parity; S4 Create Session is already IPv4.
+
 ## Configuration
 
 Edit `iwf.conf` (the install target also drops a sample at

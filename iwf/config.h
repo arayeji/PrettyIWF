@@ -243,6 +243,32 @@ typedef struct {
     } gsup_roam_routes[GSUP_MAX_ROAM_ROUTES];
     int         gsup_n_roam_routes;
 
+    /* [apn_correction] — Pretty5GS MME mme.apn_correction (SMACTCTRL).
+     * File order, first match wins. Empty = stock 3GPP (no rewrite). */
+#define IWF_APN_POLICY_MAX        16
+#define IWF_APN_POLICY_MATCH_MAX   16
+#define IWF_APN_POLICY_NAME_MAX    48
+#define IWF_APN_POLICY_APN_MAX     64
+#define IWF_APN_POL_REJECT         0
+#define IWF_APN_POL_CORRECT         1
+#define IWF_APN_POL_TO_DEFAULT      0
+#define IWF_APN_POL_TO_FIRST        1
+#define IWF_APN_POL_TO_NAMED        2
+    struct {
+        char     name[IWF_APN_POLICY_NAME_MAX];
+        int      n_imsi_prefix;
+        char     imsi_prefix[IWF_APN_POLICY_MATCH_MAX][16];
+        int      n_apn;
+        char     apn[IWF_APN_POLICY_MATCH_MAX][IWF_APN_POLICY_APN_MAX];
+        uint8_t  on_mismatch;     /* REJECT | CORRECT */
+        uint8_t  target;          /* DEFAULT | FIRST | NAMED */
+        char     target_apn[IWF_APN_POLICY_APN_MAX];
+        int      correct_pdn_type;
+        uint8_t  pdn_type;        /* 0 none, else GTPV1_PDP_TYPE_* */
+        uint8_t  reject_cause;     /* GTP cause; 0 → 219 */
+    } apn_policy[IWF_APN_POLICY_MAX];
+    int         n_apn_policy;
+
 #ifdef SMS_IWF_ENABLED
     /* [sms_iwf] — MAP SMS interworking (requires MAP-IWF + SMS_IWF_ENABLED build). */
     int         sms_iwf_enabled;
@@ -420,6 +446,14 @@ void iwf_apn_for_s4(const iwf_config_t *cfg, const char *imsi,
  * no matching route or empty ACL → allow all; else APN-NI must be listed. */
 int  iwf_config_apn_allowed(const iwf_config_t *cfg, const char *imsi,
                             const char *apn);
+
+/* Pretty5GS MME apn_correction on Gn Create-PDP.
+ *  1 = keep requested (subscribed, or no cache and no matching rule)
+ *  0 = rewritten into out (NI)
+ * -1 = reject; *gtp_cause is a GTPv1 cause (default 219). */
+int  iwf_apn_policy_apply(const iwf_config_t *cfg, const char *imsi,
+                         const char *requested, char *out, size_t out_cap,
+                         uint8_t *gtp_cause);
 
 /* Build 3GPP PGW APN FQDN: <ni>.apn.epc.mncXXX.mccYYY.3gppnetwork.org
  * using the IMSI home PLMN. Returns 0 on success, -1 on bad input. */

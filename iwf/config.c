@@ -1,5 +1,7 @@
 #include "config.h"
 #include "logging.h"
+#include "iwf.h"
+#include "subscr_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,8 +9,6 @@
 #include <strings.h>
 #include <ctype.h>
 #include <errno.h>
-
-#include "iwf.h"
 
 static void defaults(iwf_config_t *c)
 {
@@ -626,6 +626,166 @@ static void gsup_roam_key(iwf_config_t *out, const char *key, const char *val)
         LOGW("config", "unknown key [roaming_hlr].%s", key);
 }
 
+static void apn_ni_inplace(char *apn)
+{
+    if (!apn)
+        return;
+    iwf_apn_normalize(apn);
+    char *cut = strstr(apn, ".mnc");
+    if (!cut)
+        cut = strstr(apn, ".apn.epc.");
+    if (!cut)
+        cut = strstr(apn, ".gprs");
+    if (!cut)
+        cut = strstr(apn, ".3gppnetwork.org");
+    if (cut)
+        *cut = '\0';
+}
+
+static typeof(((iwf_config_t *)0)->apn_policy[0]) *
+apn_pol_cur(iwf_config_t *out, int *cur)
+{
+    if (*cur < 0) {
+        if (out->n_apn_policy >= IWF_APN_POLICY_MAX) {
+            LOGW("config", "[apn_correction] rule table full (max %d)",
+                 IWF_APN_POLICY_MAX);
+            return NULL;
+        }
+        *cur = out->n_apn_policy++;
+        memset(&out->apn_policy[*cur], 0, sizeof(out->apn_policy[0]));
+    }
+    return &out->apn_policy[*cur];
+}
+
+static void apn_pol_csv(char arr[][IWF_APN_POLICY_APN_MAX], int *n, int max,
+                        const char *val, int as_apn)
+{
+    char buf[512];
+    copy_str(buf, sizeof(buf), val);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        tok = trim(tok);
+        if (!*tok)
+            continue;
+        if (*n >= max) {
+            LOGW("config", "[apn_correction] match list full (max %d)", max);
+            return;
+        }
+        if (as_apn) {
+            copy_str(arr[*n], IWF_APN_POLICY_APN_MAX, tok);
+            apn_ni_inplace(arr[*n]);
+        } else {
+            copy_str(arr[*n], IWF_APN_POLICY_APN_MAX, tok);
+        }
+        (*n)++;
+    }
+}
+
+static void apn_pol_imsi_csv(char arr[][16], int *n, int max, const char *val)
+{
+    char buf[512];
+    copy_str(buf, sizeof(buf), val);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        tok = trim(tok);
+        if (!*tok)
+            continue;
+        if (*n >= max) {
+            LOGW("config", "[apn_correction] imsi_prefix full (max %d)", max);
+            return;
+        }
+        copy_str(arr[*n], 16, tok);
+        (*n)++;
+    }
+}
+
+static uint8_t apn_pol_map_reject_cause(int c)
+{
+    if (c >= 128 && c <= 255)
+        return (uint8_t)c;
+    if (c == 27)
+        return GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN;
+    if (c == 28)
+        return GTPV1_CAUSE_UNKNOWN_PDP_ADDR_TYPE;
+    if (c > 0 && c <= 255)
+        return GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN;
+    return GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN;
+}
+
+static void apn_correction_key(iwf_config_t *out, int *cur,
+                                 const char *key, const char *val)
+{
+    typeof(((iwf_config_t *)0)->apn_policy[0]) *r;
+
+    if (!strcmp(key, "rule")) {
+        if (out->n_apn_policy >= IWF_APN_POLICY_MAX) {
+            LOGW("config", "[apn_correction] rule table full");
+            *cur = -1;
+            return;
+        }
+        *cur = out->n_apn_policy++;
+        memset(&out->apn_policy[*cur], 0, sizeof(out->apn_policy[0]));
+        copy_str(out->apn_policy[*cur].name,
+                 sizeof(out->apn_policy[0].name), val);
+        return;
+    }
+
+    r = apn_pol_cur(out, cur);
+    if (!r)
+        return;
+
+    if (!strcmp(key, "name")) {
+        copy_str(r->name, sizeof(r->name), val);
+    } else if (!strcmp(key, "imsi_prefix")) {
+        apn_pol_imsi_csv(r->imsi_prefix, &r->n_imsi_prefix,
+                           IWF_APN_POLICY_MATCH_MAX, val);
+    } else if (!strcmp(key, "requested_apn") || !strcmp(key, "apn") ||
+               !strcmp(key, "dnn")) {
+        apn_pol_csv(r->apn, &r->n_apn, IWF_APN_POLICY_MATCH_MAX, val, 1);
+    } else if (!strcmp(key, "on_apn_mismatch")) {
+        if (!strcasecmp(val, "correct"))
+            r->on_mismatch = IWF_APN_POL_CORRECT;
+        else if (!strcasecmp(val, "reject"))
+            r->on_mismatch = IWF_APN_POL_REJECT;
+        else
+            LOGW("config", "[apn_correction] on_apn_mismatch=%s "
+                 "(use: correct, reject)", val);
+    } else if (!strcmp(key, "correct_to")) {
+        if (!strcasecmp(val, "default"))
+            r->target = IWF_APN_POL_TO_DEFAULT;
+        else if (!strcasecmp(val, "first"))
+            r->target = IWF_APN_POL_TO_FIRST;
+        else if (val[0]) {
+            r->target = IWF_APN_POL_TO_NAMED;
+            copy_str(r->target_apn, sizeof(r->target_apn), val);
+            apn_ni_inplace(r->target_apn);
+        }
+    } else if (!strcmp(key, "on_pdn_type_mismatch")) {
+        if (!strcasecmp(val, "correct"))
+            r->correct_pdn_type = 1;
+        else if (!strcasecmp(val, "reject"))
+            r->correct_pdn_type = 0;
+        else
+            LOGW("config", "[apn_correction] on_pdn_type_mismatch=%s "
+                 "(use: correct, reject)", val);
+    } else if (!strcmp(key, "pdn_type")) {
+        if (!strcasecmp(val, "ipv4"))
+            r->pdn_type = GTPV1_PDP_TYPE_IPV4;
+        else if (!strcasecmp(val, "ipv6"))
+            r->pdn_type = GTPV1_PDP_TYPE_IPV6;
+        else if (!strcasecmp(val, "ipv4v6"))
+            r->pdn_type = GTPV1_PDP_TYPE_IPV4V6;
+        else
+            LOGW("config", "[apn_correction] pdn_type=%s "
+                 "(use: ipv4, ipv6, ipv4v6)", val);
+    } else if (!strcmp(key, "reject_cause")) {
+        r->reject_cause = apn_pol_map_reject_cause(atoi(val));
+    } else
+        LOGW("config", "unknown key [apn_correction].%s", key);
+}
+
 int iwf_config_load(const char *path, iwf_config_t *out)
 {
     defaults(out);
@@ -645,6 +805,7 @@ int iwf_config_load(const char *path, iwf_config_t *out)
     char  section[64] = "";
     int   lineno = 0;
     int   err = 0;
+    int   apn_pol_idx = -1;
 
     while (fgets(line, sizeof(line), fp)) {
         lineno++;
@@ -660,6 +821,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             }
             *end = '\0';
             copy_str(section, sizeof(section), p + 1);
+            if (!strcmp(section, "apn_correction"))
+                apn_pol_idx = -1;
             continue;
         }
 
@@ -1054,6 +1217,8 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "timeout_ms"))
                 out->in_timeout_ms = atoi(val) > 0 ? atoi(val) : 5000;
             else LOGW("config", "unknown key [in].%s", key);
+        } else if (!strcmp(section, "apn_correction")) {
+            apn_correction_key(out, &apn_pol_idx, key, val);
 #ifdef SMS_IWF_ENABLED
         } else if (!strcmp(section, "sms_iwf")) {
             if      (!strcmp(key, "enabled"))           out->sms_iwf_enabled = (atoi(val) != 0);
@@ -1277,6 +1442,21 @@ void iwf_config_dump(const iwf_config_t *c)
             off += (size_t)n;
         }
         LOGI("config", "roaming_hlr mnc%s apn_acl=%s", r->mnc, list);
+    }
+    for (int i = 0; i < c->n_apn_policy; i++) {
+        const typeof(c->apn_policy[0]) *r = &c->apn_policy[i];
+        LOGI("config",
+             "apn_correction[%s]: imsi_prefix=%d apn=%d mismatch=%s "
+             "correct_to=%s pdn_type_mismatch=%s pdn_type=0x%02x reject=%u",
+             r->name[0] ? r->name : "-",
+             r->n_imsi_prefix, r->n_apn,
+             r->on_mismatch == IWF_APN_POL_CORRECT ? "correct" : "reject",
+             r->target == IWF_APN_POL_TO_NAMED ? r->target_apn :
+             (r->target == IWF_APN_POL_TO_FIRST ? "first" : "default"),
+             r->correct_pdn_type ? "correct" : "reject",
+             (unsigned)r->pdn_type,
+             (unsigned)(r->reject_cause ? r->reject_cause :
+                        GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN));
     }
     if (c->sip_iwf_enabled) {
         char prefs[128];
@@ -1686,6 +1866,142 @@ int iwf_config_apn_allowed(const iwf_config_t *cfg, const char *imsi,
         if (apn_matches_acl_entry(apn, r->apn_acl[i]))
             return 1;
     }
+    return 0;
+}
+
+int iwf_apn_policy_apply(const iwf_config_t *cfg, const char *imsi,
+                          const char *requested, char *out, size_t out_cap,
+                          uint8_t *gtp_cause)
+{
+    if (gtp_cause)
+        *gtp_cause = GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN;
+    if (!out || !out_cap)
+        return 1;
+    out[0] = '\0';
+
+    char req_ni[IWF_APN_POLICY_APN_MAX];
+    req_ni[0] = '\0';
+    if (requested && requested[0]) {
+        copy_str(req_ni, sizeof(req_ni), requested);
+        apn_ni_inplace(req_ni);
+    }
+
+    if (req_ni[0] && subscr_cache_apn_subscribed(imsi, req_ni))
+        return 1;
+
+    const typeof(cfg->apn_policy[0]) *rule = NULL;
+    if (cfg) {
+        for (int i = 0; i < cfg->n_apn_policy; i++) {
+            const typeof(cfg->apn_policy[0]) *r = &cfg->apn_policy[i];
+            if (r->n_imsi_prefix > 0) {
+                int ok = 0;
+                if (!imsi || !*imsi)
+                    continue;
+                for (int p = 0; p < r->n_imsi_prefix; p++) {
+                    if (r->imsi_prefix[p][0] &&
+                        !strncmp(imsi, r->imsi_prefix[p],
+                                 strlen(r->imsi_prefix[p]))) {
+                        ok = 1;
+                        break;
+                    }
+                }
+                if (!ok)
+                    continue;
+            }
+            if (r->n_apn > 0) {
+                if (!req_ni[0])
+                    continue;
+                int ok = 0;
+                for (int a = 0; a < r->n_apn; a++) {
+                    if (!r->apn[a][0])
+                        continue;
+                    if (!strcmp(r->apn[a], "*") ||
+                        !strcasecmp(r->apn[a], req_ni)) {
+                        ok = 1;
+                        break;
+                    }
+                }
+                if (!ok)
+                    continue;
+            }
+            rule = r;
+            break;
+        }
+    }
+
+    if (!rule) {
+        if (subscr_cache_has_apns(imsi))
+            return -1;
+        return 1;
+    }
+
+    if (rule->on_mismatch != IWF_APN_POL_CORRECT) {
+        if (gtp_cause)
+            *gtp_cause = rule->reject_cause ? rule->reject_cause :
+                         GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN;
+        LOGI("apn",
+             "[%s] APN correction rule[%s]: reject APN[%s] cause=%u",
+             imsi ? imsi : "-",
+             rule->name[0] ? rule->name : "-",
+             req_ni[0] ? req_ni : "(none)",
+             (unsigned)(gtp_cause ? *gtp_cause :
+                        GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN));
+        return -1;
+    }
+
+    char dest[IWF_APN_POLICY_APN_MAX] = {0};
+    switch (rule->target) {
+    case IWF_APN_POL_TO_NAMED:
+        if (rule->target_apn[0] &&
+            (!subscr_cache_has_apns(imsi) ||
+             subscr_cache_apn_subscribed(imsi, rule->target_apn))) {
+            copy_str(dest, sizeof(dest), rule->target_apn);
+            break;
+        }
+        LOGW("apn",
+             "[%s] APN correction rule[%s]: target APN[%s] not "
+             "subscribed; using subscription default",
+             imsi ? imsi : "-",
+             rule->name[0] ? rule->name : "-",
+             rule->target_apn);
+        /* fall through */
+    case IWF_APN_POL_TO_DEFAULT:
+        if (subscr_cache_get_default_apn(imsi, dest, sizeof(dest)) && dest[0])
+            break;
+        if (subscr_cache_get_first_apn(imsi, dest, sizeof(dest)) && dest[0])
+            break;
+        if (rule->target == IWF_APN_POL_TO_NAMED && rule->target_apn[0]) {
+            copy_str(dest, sizeof(dest), rule->target_apn);
+            break;
+        }
+        break;
+    case IWF_APN_POL_TO_FIRST:
+        if (subscr_cache_get_first_apn(imsi, dest, sizeof(dest)) && dest[0])
+            break;
+        (void)subscr_cache_get_default_apn(imsi, dest, sizeof(dest));
+        break;
+    default:
+        break;
+    }
+
+    apn_ni_inplace(dest);
+    if (!dest[0]) {
+        if (gtp_cause)
+            *gtp_cause = GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN;
+        LOGW("apn",
+             "[%s] APN correction rule[%s]: nothing to correct APN[%s] to",
+             imsi ? imsi : "-",
+             rule->name[0] ? rule->name : "-",
+             req_ni[0] ? req_ni : "(none)");
+        return -1;
+    }
+
+    copy_str(out, out_cap, dest);
+    LOGI("apn",
+         "[%s] APN correction rule[%s]: APN[%s] -> [%s]",
+         imsi ? imsi : "-",
+         rule->name[0] ? rule->name : "-",
+         req_ni[0] ? req_ni : "(none)", dest);
     return 0;
 }
 

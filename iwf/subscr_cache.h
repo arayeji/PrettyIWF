@@ -77,6 +77,13 @@ int  subscr_cache_get_pgw_fqdn(const char *imsi, const char *apn,
 int  subscr_cache_get_default_apn(const char *imsi, char *out_apn,
                                   size_t apn_cap);
 
+/* Exact subscribed APN-NI (no single-PGW fallback). */
+int  subscr_cache_apn_subscribed(const char *imsi, const char *apn);
+/* 1 if this IMSI has at least one cached APN from ULA. */
+int  subscr_cache_has_apns(const char *imsi);
+int  subscr_cache_get_first_apn(const char *imsi, char *out_apn,
+                                 size_t apn_cap);
+
 /* Evict entries not refreshed within ttl_s seconds. If ttl_s <= 0, uses the
  * TTL from subscr_cache_set_ttl(). */
 void subscr_cache_sweep(time_t now, int ttl_s);

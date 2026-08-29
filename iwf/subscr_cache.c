@@ -1,6 +1,7 @@
 #include "subscr_cache.h"
 #include "logging.h"
 #include "uthash.h"
+#include "iwf.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -280,6 +281,68 @@ int subscr_cache_get_default_apn(const char *imsi, char *out_apn,
         if (e->apns[i].is_default && e->apns[i].apn[0]) {
             strncpy(out_apn, e->apns[i].apn, apn_cap - 1);
             out_apn[apn_cap - 1] = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void subscr_apn_ni(char *apn)
+{
+    iwf_apn_normalize(apn);
+    char *cut = strstr(apn, ".mnc");
+    if (!cut)
+        cut = strstr(apn, ".apn.epc.");
+    if (!cut)
+        cut = strstr(apn, ".gprs");
+    if (!cut)
+        cut = strstr(apn, ".3gppnetwork.org");
+    if (cut)
+        *cut = '\0';
+}
+
+int subscr_cache_apn_subscribed(const char *imsi, const char *apn)
+{
+    if (!imsi || !*imsi || !apn || !*apn)
+        return 0;
+    char want[SUBSCR_APN_MAX];
+    strncpy(want, apn, sizeof(want) - 1);
+    want[sizeof(want) - 1] = '\0';
+    subscr_apn_ni(want);
+    if (!want[0])
+        return 0;
+    subscr_entry_t *e = find_imsi(imsi);
+    if (!e)
+        return 0;
+    for (uint8_t i = 0; i < e->n_apns; i++) {
+        char have[SUBSCR_APN_MAX];
+        strncpy(have, e->apns[i].apn, sizeof(have) - 1);
+        have[sizeof(have) - 1] = '\0';
+        subscr_apn_ni(have);
+        if (have[0] && !strcasecmp(have, want))
+            return 1;
+    }
+    return 0;
+}
+
+int subscr_cache_has_apns(const char *imsi)
+{
+    subscr_entry_t *e = find_imsi(imsi);
+    return e && e->n_apns > 0;
+}
+
+int subscr_cache_get_first_apn(const char *imsi, char *out_apn, size_t apn_cap)
+{
+    if (!imsi || !*imsi || !out_apn || apn_cap == 0)
+        return 0;
+    out_apn[0] = '\0';
+    subscr_entry_t *e = find_imsi(imsi);
+    if (!e || e->n_apns == 0)
+        return 0;
+    for (uint8_t i = 0; i < e->n_apns; i++) {
+        if (e->apns[i].apn[0]) {
+            strncpy(out_apn, e->apns[i].apn, apn_cap - 1);
+            out_apn[apn_cap - 1] = '\0';
             return 1;
         }
     }

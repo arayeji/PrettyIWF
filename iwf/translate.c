@@ -1666,16 +1666,68 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
                 return 0;
             }
         } else {
+            uint8_t pol_cause = GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN;
+            char corrected[IWF_APN_MAX] = {0};
+            int prc = iwf_apn_policy_apply(&rt->cfg, imsi, "",
+                                           corrected, sizeof(corrected),
+                                           &pol_cause);
+            if (prc == 0 && corrected[0]) {
+                strncpy(s->apn, corrected, sizeof(s->apn) - 1);
+                s->apn[sizeof(s->apn) - 1] = '\0';
+                LOGI("translate",
+                     "[%s] Create-PDP has no APN — [apn_correction] -> '%s'",
+                     imsi, s->apn);
+            } else {
+                LOGW("translate",
+                     "[%s] Create-PDP has no APN and no ULA default APN cached — rejecting (Missing or unknown APN)",
+                     imsi);
+                (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
+                                             (uint16_t)v1->seq,
+                                             prc < 0 ? pol_cause :
+                                             GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN);
+                sess_remove(s);
+                return 0;
+            }
+        }
+    }
+
+    {
+        uint8_t pol_cause = GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN;
+        char corrected[IWF_APN_MAX] = {0};
+        int prc = iwf_apn_policy_apply(&rt->cfg, imsi, s->apn,
+                                       corrected, sizeof(corrected),
+                                       &pol_cause);
+        if (prc < 0) {
             LOGW("translate",
-                 "[%s] Create-PDP has no APN and no ULA default APN cached — rejecting (Missing or unknown APN)",
-                 imsi);
+                 "[%s] Create-PDP APN '%s' rejected by [apn_correction] "
+                 "cause %u",
+                 imsi, s->apn[0] ? s->apn : "(none)", (unsigned)pol_cause);
             (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
-                                         (uint16_t)v1->seq,
-                                         GTPV1_CAUSE_MISSING_OR_UNKNOWN_APN);
+                                         (uint16_t)v1->seq, pol_cause);
             sess_remove(s);
             return 0;
         }
+        if (prc == 0 && corrected[0]) {
+            strncpy(s->apn, corrected, sizeof(s->apn) - 1);
+            s->apn[sizeof(s->apn) - 1] = '\0';
+            sess_t *dup = sess_find_active_by_imsi_apn_other_nsapi(
+                imsi, s->apn, nsapi);
+            if (dup) {
+                LOGW("translate",
+                     "[%s] corrected APN '%s' duplicates NSAPI %u (%s) — "
+                     "rejecting cause %u",
+                     imsi, s->apn, (unsigned)dup->key.nsapi,
+                     sess_state_str(dup->state),
+                     (unsigned)GTPV1_CAUSE_UNKNOWN_PDP_ADDR_TYPE);
+                (void)send_create_pdp_reject(rt, from, s->sgsn_ctrl_teid,
+                                             (uint16_t)v1->seq,
+                                             GTPV1_CAUSE_UNKNOWN_PDP_ADDR_TYPE);
+                sess_remove(s);
+                return 0;
+            }
+        }
     }
+
     if (!iwf_config_apn_allowed(&rt->cfg, imsi, s->apn)) {
         LOGW("translate",
              "[%s] Create-PDP APN '%s' denied by [roaming_hlr] mnc*_apn ACL",
