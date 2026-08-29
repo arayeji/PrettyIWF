@@ -1349,6 +1349,29 @@ static int try_handle_gtpu_context_response_reverse(iwf_runtime_t *rt,
 /* Northbound: GTPv1-C from osmo-sgsn -> GTPv2-C to SGW-C               */
 /* ------------------------------------------------------------------- */
 
+/* Cache a real Gn CGI/SAI and the matching S4 RAT. Dummy LAC 0xfffe is
+ * rejected so the EUTRAN TAI/ECGI fallback still applies for lab RAI. */
+static int sess_apply_real_gn_uli(sess_t *s, const iwf_ie_t *v1uli)
+{
+    uint8_t rat = 0;
+    if (!v1uli ||
+        gtpv2_v1_uli_real_cgi_sai(v1uli->value, v1uli->length, &rat) != 0)
+        return -1;
+    uint16_t cp = v1uli->length;
+    if (cp > sizeof(s->uli_v1))
+        cp = sizeof(s->uli_v1);
+    memcpy(s->uli_v1, v1uli->value, cp);
+    s->uli_v1_len = (uint8_t)cp;
+    s->uli_kind   = 3;
+    s->s4_rat     = rat;
+    return 0;
+}
+
+static uint8_t sess_s4_rat(const sess_t *s, const iwf_runtime_t *rt)
+{
+    return s->s4_rat ? s->s4_rat : rt->cfg.rat_type;
+}
+
 /* Fire-and-forget Delete Session Request for a stale session that we are
  * about to drop locally. Used to implement the implicit detach behaviour
  * described in TS 23.060 §9.2.2 / TS 23.401 §5.10.2 when a new attach
@@ -1747,27 +1770,27 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             uli_mnc = mnc_imsi;
         }
 
-        /* For UTRAN/GERAN the correct ULI is the real CGI/SAI the RNC put in
-         * the Gn User Location Information IE. The Routing Area Identity IE
-         * is not a substitute: OsmoSGSN always fills it with a placeholder
-         * LAC/RAC, which is what forced the EUTRAN TAI/ECGI workaround in the
-         * first place. Only fall back to RAI/synthetic when the SGSN sent no
-         * ULI IE or its Geographic Location Type is one we do not map. */
+        /* Prefer the real CGI/SAI from Gn ULI whenever it is usable, even
+         * if [iwf] rat_type is eutran. Configured TAI/ECGI is only for
+         * dummy/missing location (OsmoSGSN RAI LAC=0xfffe). RAT on S4
+         * follows the cell type so SAI is not sent as E-UTRAN. */
         const iwf_ie_t *v1uli = gtpv1_find_ie(v1, GTPV1_IE_ULI);
         int used_v1_uli = 0;
-        if (rt->cfg.rat_type != GTPV2_RAT_EUTRAN &&
-            rt->cfg.rat_type != GTPV2_RAT_WLAN &&
-            v1uli && v1uli->length >= 8 &&
+        uint8_t uli_rat = 0;
+        if (v1uli &&
+            gtpv2_v1_uli_real_cgi_sai(v1uli->value, v1uli->length, &uli_rat) == 0 &&
             gtpv2_enc_uli_from_v1_uli(&e, v1uli->value, v1uli->length) == 0) {
-            uint16_t cp = v1uli->length;
-            if (cp > sizeof(s->uli_v1)) cp = sizeof(s->uli_v1);
-            memcpy(s->uli_v1, v1uli->value, cp);
-            s->uli_v1_len = (uint8_t)cp;
-            s->uli_kind   = 3;
-            used_v1_uli   = 1;
+            (void)sess_apply_real_gn_uli(s, v1uli);
+            used_v1_uli = 1;
             LOGI("translate",
-                 "[%s] ULI from Gn ULI IE (geo_type=%u) for rat_type=%u",
-                 imsi, (unsigned)v1uli->value[0], (unsigned)rt->cfg.rat_type);
+                 "[%s] ULI from Gn ULI IE (geo_type=%u LAC=0x%04x) S4-RAT=%u (cfg=%u)",
+                 imsi,
+                 (unsigned)v1uli->value[0],
+                 (unsigned)(((uint16_t)v1uli->value[4] << 8) | v1uli->value[5]),
+                 (unsigned)s->s4_rat,
+                 (unsigned)rt->cfg.rat_type);
+        } else {
+            s->s4_rat = rt->cfg.rat_type;
         }
 
         if (used_v1_uli) {
@@ -1826,9 +1849,8 @@ static int translate_create_pdp_context(iwf_runtime_t *rt,
             gtpv2_enc_serving_network(&e, mcc_imsi, mnc_imsi);
     }
 
-    /* RAT Type is configurable: real UTRAN (1) but Open5GS SMF only accepts
-     * EUTRAN (6) / WLAN (3). Default of 6 is set in config defaults. */
-    gtpv2_enc_rat_type(&e, rt->cfg.rat_type);
+    /* RAT Type: real CGI/SAI above already set s4_rat; otherwise cfg. */
+    gtpv2_enc_rat_type(&e, sess_s4_rat(s, rt));
 
     /* Indication flags (TS 29.274 §8.12): octet1 bit7=DTF (Direct Tunnel).
      * Was wrongly placed on octet2 (UIMSI) which home PGWs dislike. */
@@ -2152,6 +2174,12 @@ static int translate_update_pdp_context(iwf_runtime_t *rt,
     }
     s->sgsn_data_teid   = rnc_teid;
     s->sgsn_addr_ipv4   = rnc_ipv4;
+    if ((ie = gtpv1_find_ie(v1, GTPV1_IE_ULI)) &&
+        sess_apply_real_gn_uli(s, ie) == 0) {
+        LOGI("translate",
+             "[%s] Update-PDP ULI from Gn (geo_type=%u) S4-RAT=%u",
+             s->key.imsi, (unsigned)ie->value[0], (unsigned)s->s4_rat);
+    }
     s->state            = SESS_MODIFYING;
 
     log_msg("RX-Gn", v1, imsi, s->apn);
@@ -2357,11 +2385,11 @@ static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
         if (gtpv2_enc_uli_from_v1_uli(&e, s->uli_v1, s->uli_v1_len) != 0)
             LOGW("translate", "replaying Gn ULI failed");
     } else if (s->uli_kind == 1) {
-        gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, s->uli_rai6,
+        gtpv2_enc_uli_for_rat(&e, sess_s4_rat(s, rt), s->uli_rai6,
                               s->uli_mcc, s->uli_mnc,
                               rt->cfg.uli_tac, rt->cfg.uli_eci);
     } else if (s->uli_kind == 2) {
-        gtpv2_enc_uli_for_rat(&e, rt->cfg.rat_type, NULL,
+        gtpv2_enc_uli_for_rat(&e, sess_s4_rat(s, rt), NULL,
                               s->uli_mcc, s->uli_mnc,
                               rt->cfg.uli_tac, rt->cfg.uli_eci);
     }
@@ -2370,7 +2398,7 @@ static int send_modify_bearer_req(iwf_runtime_t *rt, sess_t *s, uint8_t ebi)
     gtpv2_enc_fteid_ipv4(&e, /*instance*/ 0, FTEID_IFACE_S11_MME_GTPC,
                          s->iwf_s4_c_teid, ntohl(rt->local_ipv4_be));
 
-    gtpv2_enc_rat_type(&e, rt->cfg.rat_type);
+    gtpv2_enc_rat_type(&e, sess_s4_rat(s, rt));
     gtpv2_enc_indication(&e, 0x40, 0x00, 0x00, 0x00); /* DTF */
 
     /* Bearer Context (modified). Open5GS sgwc reads access F-TEID from

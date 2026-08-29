@@ -85,6 +85,10 @@ int gtpv2_enc_uli_from_v1_rai(gtpv2_enc_t *e, const uint8_t rai6[6]);
  * map, leaving the caller to fall back. */
 int gtpv2_enc_uli_from_v1_uli(gtpv2_enc_t *e, const uint8_t *v1uli,
                               uint16_t len);
+/* 0 if Gn ULI is a real CGI (RAT=GERAN) or SAI (RAT=UTRAN). LAC 0xfffe is
+ * OsmoSGSN's placeholder and is treated as unusable. */
+int gtpv2_v1_uli_real_cgi_sai(const uint8_t *v1uli, uint16_t len,
+                              uint8_t *rat_out);
 /* Same wire shape, PLMN from MCC/MNC and LAC=RAC=0 (lab fallback when Gn has no RAI). */
 int gtpv2_enc_uli_synthetic_plmn(gtpv2_enc_t *e, uint16_t mcc, uint16_t mnc);
 /* ULI for configured RAT: EUTRAN/WLAN → TAI+ECGI with gateway tac/eci;

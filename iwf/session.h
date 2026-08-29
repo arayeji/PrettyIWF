@@ -121,6 +121,7 @@ typedef struct sess_s {
      *               CGI/SAI the RNC reported - preferred for UTRAN/GERAN,
      *               where the Gn Routing Area Identity IE only ever carries
      *               OsmoSGSN's placeholder LAC/RAC). */
+    uint8_t     s4_rat;               /* RAT actually sent on S4 (may differ from cfg) */
     uint8_t     uli_kind;
     uint8_t     uli_rai6[6];
     uint8_t     uli_v1[16];

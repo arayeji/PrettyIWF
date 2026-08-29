@@ -444,6 +444,23 @@ int gtpv2_enc_uli_from_v1_uli(gtpv2_enc_t *e, const uint8_t *v1uli,
     return gtpv2_enc_tlv(e, GTPV2_IE_ULI, 0, v, sizeof(v));
 }
 
+int gtpv2_v1_uli_real_cgi_sai(const uint8_t *v1uli, uint16_t len,
+                              uint8_t *rat_out)
+{
+    if (!v1uli || len < 8)
+        return -1;
+    if (v1uli[0] > 1)
+        return -1;
+    /* Geographic Location Type, then PLMN(3), then LAC. 0xfffe is the
+     * OsmoSGSN dummy also used in the RAI IE — not a cell. */
+    uint16_t lac = (uint16_t)((v1uli[4] << 8) | v1uli[5]);
+    if (lac == 0xfffeu)
+        return -1;
+    if (rat_out)
+        *rat_out = (v1uli[0] == 0) ? GTPV2_RAT_GERAN : GTPV2_RAT_UTRAN;
+    return 0;
+}
+
 /* TAI (5) + ECGI (7) from PLMN + TAC + ECI. Flags: TAI=0x08, ECGI=0x10. */
 static int gtpv2_enc_uli_tai_ecgi(gtpv2_enc_t *e, const uint8_t plmn[3],
                                   uint16_t tac, uint32_t eci)
