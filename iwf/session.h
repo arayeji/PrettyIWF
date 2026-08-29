@@ -81,10 +81,12 @@ typedef struct sess_s {
 
     /* PDP Type Number requested by the UE in the original Create-PDP-Req's
      * End User Address IE (TS 29.060 §7.7.27). 0x21 = IPv4, 0x57 = IPv6,
-     * 0x8d = IPv4v6, 0 = unknown / not yet decoded. Used by the duplicate
-     * (IMSI, APN, different NSAPI) rejection logic to choose between cause
-     * 220 (Unknown PDP type → SM cause 28, UE keeps primary) and cause 199
-     * (SM cause 26, UE detaches) — see translate_create_pdp_context(). */
+     * 0x8d = IPv4v6, 0 = unknown / not yet decoded. Used to:
+     *  - answer Create-PDP with cause 129 (not 128) when the UE asked
+     *    IPv4v6 and we assigned IPv4, so the SGSN can put SM #50 in the
+     *    NAS accept and the UE must not start a second IPv6 PDP;
+     *  - pick cause 220 vs 199 on a later duplicate (IMSI, APN, other
+     *    NSAPI) Create-PDP — see translate_create_pdp_context(). */
     uint8_t     pdp_type;
 
     /* Charging ID returned by SMF (GTPv2 IE 94 in Bearer Context). 0 means SMF

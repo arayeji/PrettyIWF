@@ -193,6 +193,18 @@ on UDP/2123. The IWF mints fresh control-plane TEIDs and advertises its
 own IP in the GSN Address IE, so osmo-sgsn treats it as if it were a
 GGSN.
 
+When a UE requests PDP type **IPv4v6** and the SMF assigns **IPv4**, the
+IWF answers Create PDP with cause **129** (New PDP type due to network
+preference) and an IPv4 End User Address — not cause 128. Cause 128
+is a successful IPv4 assignment that still lets the UE start a second
+IPv6 PDP (TS 24.008 §6.1.3.1.5). Cause 129 is the 3GPP way to say
+“IPv4 only”; the SGSN must map it to SM **#50** in Activate PDP Context
+Accept (TS 29.060 Annex B). Stock osmo-sgsn does not do that yet — see
+the patch notes in the IWF change that introduced cause 129
+(`gtpv1_cause_pdp_created` in `translate.c`). **Patch osmo-sgsn before
+installing this IWF**, or 129 may be treated as a Create-PDP failure and
+the first PDP is rejected.
+
 ## Integration with Open5GS SGW-C
 
 Open5GS SGW-C expects S4 traffic from an SGSN on UDP/2123. The IWF acts
@@ -321,6 +333,8 @@ iwf/
 ## Notes / known limits
 
 - IPv6 PDP contexts are not yet plumbed (PAA decoder accepts IPv4 only).
+  An IPv4v6 request that is assigned IPv4 is answered with Gn cause **129**
+  (not 128) so the UE must not start a second IPv6 PDP (needs osmo-sgsn SM #50).
 - 3G QoS Profile → QCI mapping is a sensible best-effort default (see
   `translate.c::map_qos_to_qci_ambr`). Extend it with operator policy as
   needed.

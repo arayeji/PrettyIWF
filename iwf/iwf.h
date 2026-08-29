@@ -70,6 +70,11 @@
 
 /* GTPv1 cause values (TS 29.060 §7.7.1) */
 #define GTPV1_CAUSE_REQUEST_ACCEPTED       128
+/* Create-PDP success: UE asked IPv4v6, network assigned a single type.
+ * SGSN must map this to SM #50/#51 in Activate PDP Context Accept
+ * (TS 29.060 Annex B) — otherwise the UE starts a second IPv6 PDP. */
+#define GTPV1_CAUSE_NEW_PDP_TYPE_NETWORK_PREF 129
+#define GTPV1_CAUSE_NEW_PDP_TYPE_SINGLE_ADDR  130
 #define GTPV1_CAUSE_NON_EXISTENT           192
 #define GTPV1_CAUSE_INVALID_MESSAGE        193
 #define GTPV1_CAUSE_NO_RESOURCES           199

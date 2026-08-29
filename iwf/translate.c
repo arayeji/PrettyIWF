@@ -732,6 +732,14 @@ static uint8_t map_gtpu_v2_cause_to_v1_basic(uint8_t c)
     return GTPV1_CAUSE_SYSTEM_FAILURE;
 }
 
+/* TS 29.060 §7.3.2: a PDP context was created for causes 128, 129 and 130. */
+static int gtpv1_cause_pdp_created(uint8_t c)
+{
+    return c == GTPV1_CAUSE_REQUEST_ACCEPTED ||
+           c == GTPV1_CAUSE_NEW_PDP_TYPE_NETWORK_PREF ||
+           c == GTPV1_CAUSE_NEW_PDP_TYPE_SINGLE_ADDR;
+}
+
 /* Map a GTPv2 cause (TS 29.274 §8.4) to a GTPv1 cause (TS 29.060 §7.7.1)
  * for Create / Modify / Update / Delete PDP Context Responses.
  *
@@ -2620,6 +2628,17 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
                     s->sgsn_ctrl_teid, s->sgsn_seq);
 
     uint8_t v1_cause = map_gtpv2_cause_to_v1_pdp_resp(gtpv2_cause);
+    /* Cause 128 + IPv4 EUA is a successful downgrade, but TS 24.008
+     * §6.1.3.1.5 then lets the UE start a second IPv6 PDP. Cause 129
+     * is the 3GPP "IPv4 only allowed" accept (SGSN → SM #50). */
+    if (v1_cause == GTPV1_CAUSE_REQUEST_ACCEPTED &&
+        s->pdp_type == GTPV1_PDP_TYPE_IPV4V6 &&
+        s->ue_ipv4) {
+        v1_cause = GTPV1_CAUSE_NEW_PDP_TYPE_NETWORK_PREF;
+        LOGI("translate",
+             "[%s] UE requested IPv4v6, assigned IPv4 — Gn cause 129 (network preference)",
+             s->key.imsi);
+    }
 
     iwf_endpoint_t resp_ep    = s->sgsn_ep;
     uint16_t       resp_seq   = s->sgsn_seq;
@@ -2632,7 +2651,7 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
 
     gtpv1_enc_cause(&e, v1_cause);
 
-    if (v1_cause == GTPV1_CAUSE_REQUEST_ACCEPTED) {
+    if (gtpv1_cause_pdp_created(v1_cause)) {
         /* Reordering Required IE (type 8, TV 1) - 0xfe = not required.
          * Mandatory in Create PDP Context Response per TS 29.060 §7.3.2. */
         gtpv1_enc_tv_u8(&e, 8, 0xfe);
@@ -2710,7 +2729,7 @@ static int handle_create_session_response(iwf_runtime_t *rt, const iwf_msg_t *v2
      * In Direct Tunnel deployments with a real RNC, osmo-sgsn will later send
      * Update PDP Context with the RNC's F-TEID; that path issues another MBReq
      * and SGW-U is reprogrammed accordingly. */
-    if (v1_cause == GTPV1_CAUSE_REQUEST_ACCEPTED && s->sgsn_addr_ipv4) {
+    if (gtpv1_cause_pdp_created(v1_cause) && s->sgsn_addr_ipv4) {
         /* Flip state BEFORE the send so an MBResp processed in the same
          * event-loop iteration matches WAIT_MB_RESP_INIT, not ACTIVE.
          * iwf_send_v2 returns byte count on success (>= 0 means dispatched). */
