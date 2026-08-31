@@ -358,6 +358,26 @@ static const char *msc_gt_digits(void)
     return vlr_gt_digits();
 }
 
+/* A GSUP cause is handed to the MSC and reaches the handset as an MM/GMM
+ * reject cause. The permanent class - 2 "IMSI unknown in HLR" and the
+ * not-allowed causes - makes a UE mark the SIM invalid for the domain until
+ * it is rebooted or re-inserted; it does not retry. Reserve those for answers
+ * that genuinely came from the home HLR, and report anything transient - our
+ * own timeout, a dialogue abort, a transport error, an internal encode
+ * failure - as GMM 17 "network failure", which the UE does retry. */
+static uint8_t gsup_cause_from_diameter_rc(uint32_t rc)
+{
+    switch (rc) {
+    case DIAM_EXP_RC_USER_UNKNOWN:
+        return GSUP_CAUSE_IMSI_UNKNOWN;
+    case DIAM_EXP_RC_ROAMING_NOT_ALLOWED:
+    case DIAM_EXP_RC_RAT_NOT_ALLOWED:
+        return GSUP_CAUSE_ROAM_NOTALLOWED;
+    default:
+        return GSUP_CAUSE_NET_FAIL;
+    }
+}
+
 static void reply_gsup_err(int conn_id, const char *imsi,
                            uint8_t req_type, uint8_t cause)
 {
@@ -941,7 +961,7 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
         if (mp) {
             if (req.msg_type == GSUP_MSG_ISD_ERR) {
                 reply_gsup_err(mp->conn_id, mp->imsi, GSUP_MSG_UL_REQ,
-                               GSUP_CAUSE_IMSI_UNKNOWN);
+                               GSUP_CAUSE_NET_FAIL);
                 pending_remove(mp);
                 return;
             }
@@ -957,7 +977,7 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
             gsup_track_conn(req.imsi, conn_id, GSUP_CN_DOMAIN_CS);
             if (map_pending_ack_isd(mp) < 0) {
                 reply_gsup_err(mp->conn_id, mp->imsi, GSUP_MSG_UL_REQ,
-                               GSUP_CAUSE_IMSI_UNKNOWN);
+                               GSUP_CAUSE_NET_FAIL);
                 pending_remove(mp);
             }
             return;
@@ -985,7 +1005,7 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
         }
         if (req.msg_type == GSUP_MSG_ISD_ERR) {
             reply_gsup_err(s->gsup_conn_id, s->imsi_str, GSUP_MSG_UL_REQ,
-                           GSUP_CAUSE_IMSI_UNKNOWN);
+                           GSUP_CAUSE_NET_FAIL);
             s->gsup_originated = false;
             map_sess_remove(s);
             return;
@@ -1045,7 +1065,7 @@ void gsup_map_proxy_on_gsup(iwf_runtime_t *rt, int conn_id,
         return;
     }
     if (rc < 0)
-        reply_gsup_err(conn_id, req.imsi, req.msg_type, GSUP_CAUSE_IMSI_UNKNOWN);
+        reply_gsup_err(conn_id, req.imsi, req.msg_type, GSUP_CAUSE_NET_FAIL);
 }
 
 void gsup_map_proxy_finish_sai(iwf_runtime_t *rt, map_session_t *s)
@@ -1053,7 +1073,7 @@ void gsup_map_proxy_finish_sai(iwf_runtime_t *rt, map_session_t *s)
     if (!rt || !s || !s->gsup_originated) return;
     if (gsup_resolve_conn(s) < 0) {
         reply_gsup_err(s->gsup_conn_id, s->imsi_str, GSUP_MSG_SAI_REQ,
-                       GSUP_CAUSE_IMSI_UNKNOWN);
+                       GSUP_CAUSE_NET_FAIL);
         s->gsup_originated = false;
         map_sess_remove(s);
         return;
@@ -1062,7 +1082,7 @@ void gsup_map_proxy_finish_sai(iwf_runtime_t *rt, map_session_t *s)
     int n = gsup_build_sai_res(s->imsi_str, s->av, s->n_av, gsup, sizeof(gsup));
     if (n < 0 || s->n_av == 0) {
         reply_gsup_err(s->gsup_conn_id, s->imsi_str, GSUP_MSG_SAI_REQ,
-                       GSUP_CAUSE_IMSI_UNKNOWN);
+                       GSUP_CAUSE_NET_FAIL);
     } else {
         char hexbuf[512] = {0};
         int hlen = n < 150 ? n : 150;
@@ -1087,7 +1107,7 @@ void gsup_map_proxy_abort_ugl(iwf_runtime_t *rt, map_session_t *s)
 {
     if (!rt || !s || !s->gsup_originated) return;
     reply_gsup_err(s->gsup_conn_id, s->imsi_str, GSUP_MSG_UL_REQ,
-                   GSUP_CAUSE_IMSI_UNKNOWN);
+                   GSUP_CAUSE_NET_FAIL);
     s->gsup_originated = false;
     map_sess_remove(s);
 }
@@ -1125,7 +1145,7 @@ void gsup_map_proxy_finish_ugl(iwf_runtime_t *rt, map_session_t *s)
     if (n <= 0) {
         LOGW("gsup", "[%s] UL_RES build failed", s->imsi_str);
         reply_gsup_err(s->gsup_conn_id, s->imsi_str, GSUP_MSG_UL_REQ,
-                       GSUP_CAUSE_IMSI_UNKNOWN);
+                       GSUP_CAUSE_NET_FAIL);
     } else {
         char hexbuf[512] = {0};
         int hlen = n < 150 ? n : 150;
@@ -1160,7 +1180,7 @@ void gsup_map_proxy_on_timeout(iwf_runtime_t *rt, map_session_t *s)
 {
     if (!rt || !s || !s->gsup_originated) return;
     reply_gsup_err(s->gsup_conn_id, s->imsi_str, s->gsup_req_type,
-                   GSUP_CAUSE_IMSI_UNKNOWN);
+                   GSUP_CAUSE_NET_FAIL);
     s->gsup_originated = false;
 }
 
@@ -1173,7 +1193,7 @@ void gsup_map_proxy_diameter_error(iwf_runtime_t *rt, map_session_t *s,
          s->imsi_str,
          (unsigned)diameter_result_code);
     reply_gsup_err(s->gsup_conn_id, s->imsi_str, s->gsup_req_type,
-                   GSUP_CAUSE_IMSI_UNKNOWN);
+                   gsup_cause_from_diameter_rc(diameter_result_code));
     s->gsup_originated = false;
     map_sess_remove(s);
 }
@@ -1183,7 +1203,7 @@ static void map_to_gsup_sai(gsup_pending_t *p, const uint8_t *params, size_t ple
     map_auth_vector_t av[MAP_AUTH_VECTOR_MAX];
     size_t n = 0;
     if (map_decode_sai_res(params, plen, av, MAP_AUTH_VECTOR_MAX, &n) < 0 || n == 0) {
-        reply_gsup_err(p->conn_id, p->imsi, GSUP_MSG_SAI_REQ, GSUP_CAUSE_IMSI_UNKNOWN);
+        reply_gsup_err(p->conn_id, p->imsi, GSUP_MSG_SAI_REQ, GSUP_CAUSE_NET_FAIL);
         return;
     }
     uint8_t gsup[2048];
@@ -1419,7 +1439,7 @@ bool gsup_map_proxy_on_tcap(iwf_runtime_t *rt,
             c->opcode == MAP_OP_CODE_INSERT_SUBSCRIBER_DATA) {
             if (map_pending_on_isd_invoke(p, calling, tmsg, c) < 0) {
                 reply_gsup_err(p->conn_id, p->imsi, GSUP_MSG_UL_REQ,
-                               GSUP_CAUSE_IMSI_UNKNOWN);
+                               GSUP_CAUSE_NET_FAIL);
                 pending_remove(p);
                 return true;
             }
