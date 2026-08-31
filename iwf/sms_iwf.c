@@ -812,7 +812,7 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
         return;
     }
     uint8_t dlg[128];
-    int dn = map_encode_aarq(MAP_AC_SHORT_MSG_MO_RELAY_V2, dlg, sizeof(dlg));
+    int dn = map_encode_aarq(MAP_AC_SHORT_MSG_MO_RELAY_V3, dlg, sizeof(dlg));
     if (dn < 0) {
         sms_mo_reply_err(conn_id, m->imsi, mr, 41);
         return;
@@ -839,7 +839,7 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
         ss7_gt_from_digits(g_rt->cfg.map_local_gt, SS7_SSN_MSC, &calling);
     calling.ssn = SS7_SSN_MSC;
 
-    if (sms_send_map_begin(s->otid, MAP_OP_CODE_MT_FORWARD_SM /* forwardSM */,
+    if (sms_send_map_begin(s->otid, MAP_OP_CODE_MT_FORWARD_SM /* mo-ForwardSM */,
                            arg, (size_t)an, dlg, (size_t)dn,
                            &called, calling.have_gt ? &calling : NULL) < 0) {
         free(s);
@@ -850,7 +850,7 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
     sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
     LOGI("sms",
          "[%s] RX GSUP MO-FSM mr=%u smsc=%s ton=0x%02x oa=%s ton=0x%02x "
-         "ui_len=%u -> MAP fwdSM+imsi otid=0x%08x",
+         "ui_len=%u -> MAP mo-FwdSM-v3+imsi otid=0x%08x",
          m->imsi, (unsigned)mr, smsc, (unsigned)da_addr[0],
          oa_dig, (unsigned)oa_addr[0],
          (unsigned)m->sm_rp_ui_len, s->otid);

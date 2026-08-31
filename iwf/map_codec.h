@@ -189,9 +189,10 @@ int map_decode_mt_fsm_arg(const uint8_t *p, size_t n,
                           uint8_t *sc_addr, size_t sc_cap, size_t *sc_len,
                           const uint8_t **ui, size_t *ui_len,
                           int *more);
-/* MO submission relay: [MO-]ForwardSM-Arg.
+/* MO submission relay: MO-ForwardSM-Arg (MAP v3).
  * da_addr/oa_addr are MAP AddressString values (TON/NPI + TBCD), already
- * IMPLICIT-tag-ready. imsi_str is optional (roaming MO to home SMSC). */
+ * IMPLICIT-tag-ready. imsi_str is optional (roaming MO to home SMSC) and
+ * is v3-only — pair with shortMsgMO-RelayContext-v3. */
 int map_encode_mo_fwd_sm_arg(const uint8_t *da_addr, size_t da_len,
                              const uint8_t *oa_addr, size_t oa_len,
                              const uint8_t *tpdu, size_t tpdu_len,
@@ -311,6 +312,7 @@ typedef enum {
     MAP_AC_SHORT_MSG_MO_RELAY_V2    = 8, /* forwardSM (MO submit, v2)      */
     MAP_AC_NETWORK_UNSTRUCTURED_SS_V2 = 9, /* processUnstructuredSS (USSD) */
     MAP_AC_MWD_MNGT_V2              = 10, /* readyForSM (MW alerting)       */
+    MAP_AC_SHORT_MSG_MO_RELAY_V3    = 11, /* mo-ForwardSM (MO submit, v3)  */
 } map_app_ctx_t;
 
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap);

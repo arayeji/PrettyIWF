@@ -32,8 +32,9 @@ void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
 void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *msg);
 
 /* Outbound MO-SMS relay (our subscriber -> home SMSC): GSUP MO-ForwardSM
- * from osmo-msc (sms-over-gsup) -> MAP forwardSM BEGIN to the SMSC in
- * SM-RP-DA -> GSUP MO result/error back to the MSC. */
+ * from osmo-msc (sms-over-gsup) -> MAP mo-ForwardSM BEGIN
+ * (shortMsgMO-RelayContext-v3) to the SMSC in SM-RP-DA -> GSUP MO
+ * result/error back to the MSC. */
 void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *msg);
 /* READY-FOR-SM from osmo-msc (UE reachable / memory available again):
  * relay MAP readyForSM to the home HLR so its SMSC retries waiting SMs. */

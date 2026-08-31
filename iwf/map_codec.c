@@ -1277,8 +1277,10 @@ static const uint8_t AC_GPRS_LOC_UPDATE_V3[]     = { 0x04,0x00,0x00,0x01,0x00,0x
 static const uint8_t AC_SUBSCRIBER_DATA_MGMT_V3[]= { 0x04,0x00,0x00,0x01,0x00,0x10,0x03 };
 static const uint8_t AC_GPRS_LOC_CANCEL_V3[]     = { 0x04,0x00,0x00,0x01,0x00,0x07,0x03 };
 static const uint8_t AC_MS_PURGING_V3[]          = { 0x04,0x00,0x00,0x01,0x00,0x1b,0x03 };
-/* shortMsgMO-RelayContext-v2: 0.4.0.0.1.0.21.2 */
+/* shortMsgMO-RelayContext-v2: 0.4.0.0.1.0.21.2
+ * shortMsgMO-RelayContext-v3: 0.4.0.0.1.0.21.3 */
 static const uint8_t AC_SHORT_MSG_MO_RELAY_V2[]  = { 0x04,0x00,0x00,0x01,0x00,0x15,0x02 };
+static const uint8_t AC_SHORT_MSG_MO_RELAY_V3[]  = { 0x04,0x00,0x00,0x01,0x00,0x15,0x03 };
 /* networkUnstructuredSsContext-v2: 0.4.0.0.1.0.19.2 */
 static const uint8_t AC_NETWORK_USSD_V2[]        = { 0x04,0x00,0x00,0x01,0x00,0x13,0x02 };
 /* mwdMngtContext-v2 (readyForSM): 0.4.0.0.1.0.24.2 */
@@ -1303,6 +1305,8 @@ static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
         *out = AC_MS_PURGING_V3;           *out_len = sizeof(AC_MS_PURGING_V3);           break;
     case MAP_AC_SHORT_MSG_MO_RELAY_V2:
         *out = AC_SHORT_MSG_MO_RELAY_V2;   *out_len = sizeof(AC_SHORT_MSG_MO_RELAY_V2);   break;
+    case MAP_AC_SHORT_MSG_MO_RELAY_V3:
+        *out = AC_SHORT_MSG_MO_RELAY_V3;   *out_len = sizeof(AC_SHORT_MSG_MO_RELAY_V3);   break;
     case MAP_AC_NETWORK_UNSTRUCTURED_SS_V2:
         *out = AC_NETWORK_USSD_V2;         *out_len = sizeof(AC_NETWORK_USSD_V2);         break;
     case MAP_AC_MWD_MNGT_V2:
@@ -1641,7 +1645,8 @@ int map_encode_mo_fwd_sm_arg(const uint8_t *da_addr, size_t da_len,
         uint8_t imsi_bcd[8];
         int il = map_str_to_bcd(imsi_str, imsi_bcd, sizeof(imsi_bcd));
         if (il < 0) return -1;
-        /* Untagged IMSI after extension marker — OCTET STRING (TBCD). */
+        /* Untagged IMSI after extension marker — OCTET STRING (TBCD).
+         * MAP v3 only; dialogue must be shortMsgMO-RelayContext-v3. */
         if (ber_enc_tlv(body, sizeof(body), &bo, 0x04, imsi_bcd, (size_t)il) < 0)
             return -1;
     }
@@ -1819,6 +1824,14 @@ int map_decode_aarq_ac(const uint8_t *p, size_t n, map_app_ctx_t *out)
             if (oid_len == sizeof(AC_MS_PURGING_V3) &&
                 !memcmp(oid, AC_MS_PURGING_V3, oid_len)) {
                 *out = MAP_AC_MS_PURGING_V3; return 0;
+            }
+            if (oid_len == sizeof(AC_SHORT_MSG_MO_RELAY_V3) &&
+                !memcmp(oid, AC_SHORT_MSG_MO_RELAY_V3, oid_len)) {
+                *out = MAP_AC_SHORT_MSG_MO_RELAY_V3; return 0;
+            }
+            if (oid_len == sizeof(AC_SHORT_MSG_MO_RELAY_V2) &&
+                !memcmp(oid, AC_SHORT_MSG_MO_RELAY_V2, oid_len)) {
+                *out = MAP_AC_SHORT_MSG_MO_RELAY_V2; return 0;
             }
         }
     }
