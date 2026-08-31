@@ -744,15 +744,13 @@ static void sms_mo_reply_err(int conn_id, const char *imsi, uint8_t mr,
         gsup_server_send(conn_id, gsup, (size_t)n);
 }
 
-/* MSC GT for SRI-SM-Res networkNode-Number (mt-forwardSM destination). */
+/* Node GT for SRI-SM-Res: same as UL msc-Number (VLR GT partners already hit). */
 static const char *sms_msc_gt(void)
 {
-    if (g_rt->cfg.sms_local_msc_gt[0])
-        return g_rt->cfg.sms_local_msc_gt;
-    if (g_rt->cfg.local_msc_msc_gt[0])
-        return g_rt->cfg.local_msc_msc_gt;
     if (g_rt->cfg.map_local_gt[0])
         return g_rt->cfg.map_local_gt;
+    if (g_rt->cfg.sms_local_msc_gt[0])
+        return g_rt->cfg.sms_local_msc_gt;
     return "";
 }
 

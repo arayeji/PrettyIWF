@@ -349,13 +349,12 @@ static const char *vlr_gt_digits(void)
     return NULL;
 }
 
-/* CS updateLocation msc-Number: the MSC GT home SMSCs use for mt-forwardSM. */
+/* CS updateLocation toward the home HLR, for *their* subscriber on *our*
+ * network. msc-Number is our serving VMSC. Use the VLR GT: partners already
+ * address that GT (GTT covers both of ours; they may not have the distinct
+ * MSC GT provisioned). */
 static const char *msc_gt_digits(void)
 {
-    if (g_rt && g_rt->cfg.sms_local_msc_gt[0])
-        return g_rt->cfg.sms_local_msc_gt;
-    if (g_rt && g_rt->cfg.local_msc_msc_gt[0])
-        return g_rt->cfg.local_msc_msc_gt;
     return vlr_gt_digits();
 }
 
