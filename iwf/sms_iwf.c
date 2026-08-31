@@ -744,14 +744,15 @@ static void sms_mo_reply_err(int conn_id, const char *imsi, uint8_t mr,
         gsup_server_send(conn_id, gsup, (size_t)n);
 }
 
-/* GT advertised as MSC (SRI-SM-Res networkNode-Number). Home SMSCs in this
- * roaming setup MT-address the VLR GT, never a distinct MSC GT. */
+/* MSC GT for SRI-SM-Res networkNode-Number (mt-forwardSM destination). */
 static const char *sms_msc_gt(void)
 {
-    if (g_rt->cfg.map_local_gt[0])
-        return g_rt->cfg.map_local_gt;
     if (g_rt->cfg.sms_local_msc_gt[0])
         return g_rt->cfg.sms_local_msc_gt;
+    if (g_rt->cfg.local_msc_msc_gt[0])
+        return g_rt->cfg.local_msc_msc_gt;
+    if (g_rt->cfg.map_local_gt[0])
+        return g_rt->cfg.map_local_gt;
     return "";
 }
 

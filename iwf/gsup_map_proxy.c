@@ -349,10 +349,13 @@ static const char *vlr_gt_digits(void)
     return NULL;
 }
 
-/* CS updateLocation msc-Number. Home SMSCs often MT-address the VLR GT
- * (never a distinct MSC GT), so advertise msc-Number = vlr-Number. */
+/* CS updateLocation msc-Number: the MSC GT home SMSCs use for mt-forwardSM. */
 static const char *msc_gt_digits(void)
 {
+    if (g_rt && g_rt->cfg.sms_local_msc_gt[0])
+        return g_rt->cfg.sms_local_msc_gt;
+    if (g_rt && g_rt->cfg.local_msc_msc_gt[0])
+        return g_rt->cfg.local_msc_msc_gt;
     return vlr_gt_digits();
 }
 
