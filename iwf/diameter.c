@@ -1112,7 +1112,8 @@ int diameter_send_pur(struct iwf_runtime *rt, map_session_t *s)
                 DIAMETER_VENDOR_3GPP, 0);
 
     finalize_length(pkt, off);
-    LOGI("diameter", "[%s] TX PUR sid=%s", s->imsi_str, s->diameter_session_id);
+    LOGI("diameter", "[%s] TX PUR origin=%s sid=%s",
+         s->imsi_str, diam_origin_host_for_sess(rt, s), s->diameter_session_id);
     return diameter_tx_session(rt, s, pkt, off);
 }
 
@@ -1427,53 +1428,29 @@ static void dispatch_message(struct iwf_runtime *rt, int peer_idx,
     on_answer(rt, cmd_code, body, body_len);
 }
 
-void diameter_on_readable(struct iwf_runtime *rt, int peer_idx)
+/* Parse complete Diameter messages. Returns -1 if the peer was dropped. */
+static int diameter_consume_rx(struct iwf_runtime *rt, int peer_idx,
+                               diameter_peer_t *p)
 {
-    diameter_peer_t *p = diam_peer_at(diam_pool(rt), peer_idx);
-    if (!p || p->fd < 0) return;
-
-    for (;;) {
-        if (p->rx_used >= sizeof(p->rx)) {
-            LOGE("diameter", "rx buffer full peer[%d]; reset", peer_idx);
-            drop_peer(rt, peer_idx);
-            schedule_reconnect_peer(p);
-            return;
-        }
-        ssize_t r = recv(p->fd, p->rx + p->rx_used, sizeof(p->rx) - p->rx_used, 0);
-        if (r > 0) {
-            p->rx_used += (size_t)r;
-        } else if (r == 0) {
-            LOGW("diameter", "peer[%d] closed TCP", peer_idx);
-            drop_peer(rt, peer_idx);
-            schedule_reconnect_peer(p);
-            return;
-        } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            if (errno == EINTR) continue;
-            LOGE("diameter", "recv peer[%d]: %s", peer_idx, strerror(errno));
-            drop_peer(rt, peer_idx);
-            schedule_reconnect_peer(p);
-            return;
-        }
-    }
-
     size_t consumed = 0;
+
     while (p->rx_used - consumed >= 20) {
         const uint8_t *pkt = p->rx + consumed;
         if (pkt[0] != DIAMETER_VERSION) {
             LOGE("diameter", "bad version peer[%d]; reset", peer_idx);
             drop_peer(rt, peer_idx);
             schedule_reconnect_peer(p);
-            return;
+            return -1;
         }
         uint32_t mlen = get_be24(pkt + 1);
         if (mlen < 20 || mlen > sizeof(p->rx)) {
             LOGE("diameter", "bad msg length %u peer[%d]", (unsigned)mlen, peer_idx);
             drop_peer(rt, peer_idx);
             schedule_reconnect_peer(p);
-            return;
+            return -1;
         }
-        if (p->rx_used - consumed < mlen) break;
+        if (p->rx_used - consumed < mlen)
+            break;
         dispatch_message(rt, peer_idx, pkt, mlen);
         consumed += mlen;
     }
@@ -1481,6 +1458,49 @@ void diameter_on_readable(struct iwf_runtime *rt, int peer_idx)
         if (consumed < p->rx_used)
             memmove(p->rx, p->rx + consumed, p->rx_used - consumed);
         p->rx_used -= consumed;
+    }
+    return 0;
+}
+
+void diameter_on_readable(struct iwf_runtime *rt, int peer_idx)
+{
+    diameter_peer_t *p = diam_peer_at(diam_pool(rt), peer_idx);
+    if (!p || p->fd < 0) return;
+
+    /* Drain already-buffered messages first so a burst cannot fill the
+     * socket buffer and trip "rx buffer full" before we parse. */
+    if (diameter_consume_rx(rt, peer_idx, p) < 0)
+        return;
+
+    for (;;) {
+        size_t space = sizeof(p->rx) - p->rx_used;
+        if (space == 0) {
+            LOGE("diameter", "rx buffer full peer[%d]; reset", peer_idx);
+            drop_peer(rt, peer_idx);
+            schedule_reconnect_peer(p);
+            return;
+        }
+        ssize_t r = recv(p->fd, p->rx + p->rx_used, space, 0);
+        if (r > 0) {
+            p->rx_used += (size_t)r;
+            if (diameter_consume_rx(rt, peer_idx, p) < 0)
+                return;
+            continue;
+        }
+        if (r == 0) {
+            LOGW("diameter", "peer[%d] closed TCP", peer_idx);
+            drop_peer(rt, peer_idx);
+            schedule_reconnect_peer(p);
+            return;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;
+        if (errno == EINTR)
+            continue;
+        LOGE("diameter", "recv peer[%d]: %s", peer_idx, strerror(errno));
+        drop_peer(rt, peer_idx);
+        schedule_reconnect_peer(p);
+        return;
     }
 
     try_flush_tx(p);

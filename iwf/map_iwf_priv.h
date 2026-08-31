@@ -31,7 +31,8 @@ typedef enum {
     DIAM_CONN_DPR_SENT      = 4,    /* shutting down             */
 } diameter_conn_state_t;
 
-#define DIAM_RX_BUF_CAP         8192
+/* 64 KiB: a ULA/IDA can exceed 8 KiB. Must also drain before this fills. */
+#define DIAM_RX_BUF_CAP         65536
 #define DIAM_TX_BUF_CAP         8192
 #define DIAM_MAX_PEERS          8
 
