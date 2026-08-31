@@ -98,6 +98,8 @@ static void sms_sess_remove(sms_session_t *s)
     free(s);
 }
 
+static const char *sms_msc_gt(void);
+
 static void sms_arm_timer(sms_session_t *s, int timeout_ms)
 {
     if (s->timer_fd < 0) {
@@ -445,7 +447,7 @@ static void sms_sri_sm_answer(sms_session_t *s, const char *imsi)
 {
     strncpy(s->imsi, imsi, sizeof(s->imsi) - 1);
     uint8_t params[64];
-    int plen = map_encode_sri_sm_res(imsi, g_rt->cfg.sms_local_msc_gt,
+    int plen = map_encode_sri_sm_res(imsi, sms_msc_gt(),
                                      params, sizeof(params));
     if (plen < 0) {
         sms_fail_inbound(s);
@@ -742,12 +744,36 @@ static void sms_mo_reply_err(int conn_id, const char *imsi, uint8_t mr,
         gsup_server_send(conn_id, gsup, (size_t)n);
 }
 
+/* GT advertised as MSC (SRI-SM-Res networkNode-Number). Home SMSCs in this
+ * roaming setup MT-address the VLR GT, never a distinct MSC GT. */
+static const char *sms_msc_gt(void)
+{
+    if (g_rt->cfg.map_local_gt[0])
+        return g_rt->cfg.map_local_gt;
+    if (g_rt->cfg.sms_local_msc_gt[0])
+        return g_rt->cfg.sms_local_msc_gt;
+    return "";
+}
+
+static int sms_rebuild_intl_addr(const char *digits, uint8_t *addr, size_t cap,
+                                 size_t *alen)
+{
+    if (!digits || !digits[0] || !addr || cap < 2 || !alen)
+        return -1;
+    addr[0] = 0x91;
+    int n = map_str_to_bcd(digits, addr + 1, cap - 1);
+    if (n < 1)
+        return -1;
+    *alen = 1 + (size_t)n;
+    return 0;
+}
+
 void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
 {
     if (!g_rt || !m) return;
     uint8_t mr = m->have_sm_rp_mr ? m->sm_rp_mr : 0;
 
-    char smsc[20], oa_dig[20];
+    char smsc[24], oa_dig[24];
     uint8_t da_type = 0, oa_type = 0;
     uint8_t da_addr[16], oa_addr[16];
     size_t da_alen = 0, oa_alen = 0;
@@ -800,6 +826,25 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
         sms_mo_reply_err(conn_id, m->imsi, mr, 96);
         return;
     }
+
+    char smsc_raw[24];
+    snprintf(smsc_raw, sizeof(smsc_raw), "%s", smsc);
+    map_normalize_msisdn_digits(smsc, smsc, sizeof(smsc));
+    if (strlen(smsc) < 8) {
+        LOGW("sms",
+             "[%s] MO-FSM reject RP-96: SMSC GT too short raw=%s norm=%s mr=%u",
+             m->imsi, smsc_raw, smsc, (unsigned)mr);
+        sms_mo_reply_err(conn_id, m->imsi, mr, 96);
+        return;
+    }
+    if (sms_rebuild_intl_addr(smsc, da_addr, sizeof(da_addr), &da_alen) < 0) {
+        LOGW("sms", "[%s] MO-FSM reject RP-96: SMSC GT encode failed gt=%s mr=%u",
+             m->imsi, smsc, (unsigned)mr);
+        sms_mo_reply_err(conn_id, m->imsi, mr, 96);
+        return;
+    }
+    if (strcmp(smsc_raw, smsc) != 0)
+        LOGI("sms", "[%s] MO-FSM SMSC GT %s -> %s", m->imsi, smsc_raw, smsc);
 
     uint8_t arg[400];
     int an = map_encode_mo_fwd_sm_arg(da_addr, da_alen, oa_addr, oa_alen,

@@ -313,6 +313,7 @@ typedef enum {
     MAP_AC_NETWORK_UNSTRUCTURED_SS_V2 = 9, /* processUnstructuredSS (USSD) */
     MAP_AC_MWD_MNGT_V2              = 10, /* readyForSM (MW alerting)       */
     MAP_AC_SHORT_MSG_MO_RELAY_V3    = 11, /* mo-ForwardSM (MO submit, v3)  */
+    MAP_AC_LOCATION_INFO_RETRIEVAL_V3 = 12, /* sendRoutingInformation (SRI) */
 } map_app_ctx_t;
 
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap);

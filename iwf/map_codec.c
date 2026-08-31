@@ -596,6 +596,16 @@ void map_normalize_msisdn_digits(const char *in, char *out, size_t cap)
         snprintf(out, cap, "%s", digits + 2);
         return;
     }
+    /* International prefix 00: drop it and re-run (00 98 … → 98 …). */
+    if (n > 2 && digits[0] == '0' && digits[1] == '0') {
+        map_normalize_msisdn_digits(digits + 2, out, cap);
+        return;
+    }
+    /* Iran national 0 + 10 digits (0 9xxxxxxxxx) → 98 9xxxxxxxxx. */
+    if (n == 11 && digits[0] == '0' && digits[1] == '9') {
+        snprintf(out, cap, "98%s", digits + 1);
+        return;
+    }
     /* Iran national 10 digits starting with 9 → prepend 98. */
     if (n == 10 && digits[0] == '9') {
         snprintf(out, cap, "98%s", digits);
@@ -1264,6 +1274,7 @@ int map_encode_systemfailure_diag(uint8_t network_resource,
  * Concrete OIDs we emit (version 3):
  *   networkLocUpContext-v3               0.4.0.0.1.0. 1.3 -> 04 00 00 01 00 01 03
  *   roamingNumberEnquiryContext-v3       0.4.0.0.1.0. 3.3 -> 04 00 00 01 00 03 03
+ *   locationInfoRetrievalContext-v3      0.4.0.0.1.0. 5.3 -> 04 00 00 01 00 05 03
  *   infoRetrievalContext-v3              0.4.0.0.1.0.14.3 -> 04 00 00 01 00 0e 03
  *   gprsLocationUpdateContext-v3         0.4.0.0.1.0.32.3 -> 04 00 00 01 00 20 03
  *   subscriberDataMngtContext-v3         0.4.0.0.1.0.16.3 -> 04 00 00 01 00 10 03
@@ -1272,6 +1283,7 @@ int map_encode_systemfailure_diag(uint8_t network_resource,
  */
 static const uint8_t AC_NETWORK_LOC_UP_V3[]      = { 0x04,0x00,0x00,0x01,0x00,0x01,0x03 };
 static const uint8_t AC_ROAMING_NUMBER_ENQ_V3[]  = { 0x04,0x00,0x00,0x01,0x00,0x03,0x03 };
+static const uint8_t AC_LOCATION_INFO_RETR_V3[]  = { 0x04,0x00,0x00,0x01,0x00,0x05,0x03 };
 static const uint8_t AC_INFO_RETRIEVAL_V3[]      = { 0x04,0x00,0x00,0x01,0x00,0x0e,0x03 };
 static const uint8_t AC_GPRS_LOC_UPDATE_V3[]     = { 0x04,0x00,0x00,0x01,0x00,0x20,0x03 };
 static const uint8_t AC_SUBSCRIBER_DATA_MGMT_V3[]= { 0x04,0x00,0x00,0x01,0x00,0x10,0x03 };
@@ -1293,6 +1305,8 @@ static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
         *out = AC_NETWORK_LOC_UP_V3;       *out_len = sizeof(AC_NETWORK_LOC_UP_V3);       break;
     case MAP_AC_ROAMING_NUMBER_ENQUIRY_V3:
         *out = AC_ROAMING_NUMBER_ENQ_V3;   *out_len = sizeof(AC_ROAMING_NUMBER_ENQ_V3);   break;
+    case MAP_AC_LOCATION_INFO_RETRIEVAL_V3:
+        *out = AC_LOCATION_INFO_RETR_V3;   *out_len = sizeof(AC_LOCATION_INFO_RETR_V3);   break;
     case MAP_AC_INFO_RETRIEVAL_V3:
         *out = AC_INFO_RETRIEVAL_V3;       *out_len = sizeof(AC_INFO_RETRIEVAL_V3);       break;
     case MAP_AC_GPRS_LOCATION_UPDATE_V3:
@@ -1804,6 +1818,10 @@ int map_decode_aarq_ac(const uint8_t *p, size_t n, map_app_ctx_t *out)
             if (oid_len == sizeof(AC_ROAMING_NUMBER_ENQ_V3) &&
                 !memcmp(oid, AC_ROAMING_NUMBER_ENQ_V3, oid_len)) {
                 *out = MAP_AC_ROAMING_NUMBER_ENQUIRY_V3; return 0;
+            }
+            if (oid_len == sizeof(AC_LOCATION_INFO_RETR_V3) &&
+                !memcmp(oid, AC_LOCATION_INFO_RETR_V3, oid_len)) {
+                *out = MAP_AC_LOCATION_INFO_RETRIEVAL_V3; return 0;
             }
             if (oid_len == sizeof(AC_INFO_RETRIEVAL_V3) &&
                 !memcmp(oid, AC_INFO_RETRIEVAL_V3, oid_len)) {

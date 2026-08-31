@@ -125,7 +125,7 @@ static map_app_ctx_t ac_for_op(map_op_t op)
     case MAP_OP_CL:       return MAP_AC_GPRS_LOCATION_CANCEL_V3;
     case MAP_OP_PURGE_MS: return MAP_AC_MS_PURGING_V3;
     case MAP_OP_PRN:      return MAP_AC_ROAMING_NUMBER_ENQUIRY_V3;
-    case MAP_OP_SRI:      return MAP_AC_ROAMING_NUMBER_ENQUIRY_V3;
+    case MAP_OP_SRI:      return MAP_AC_LOCATION_INFO_RETRIEVAL_V3;
     default: return MAP_AC_INFO_RETRIEVAL_V3;
     }
 }
@@ -664,10 +664,16 @@ static void sri_send_end(struct iwf_runtime *rt,
     int dn = 0;
     uint8_t oid[16];
     size_t ol = 0;
+    /* Q.773: first backward message of a structured dialogue must carry AARE.
+     * The SRI→PRN path answers on a reconstructed tmsg with no dialogue blob;
+     * echo the inbound AC when present, else locationInfoRetrievalContext-v3. */
     if (tmsg->dialogue && tmsg->dialogue_len &&
         map_decode_aarq_ac_raw(tmsg->dialogue, tmsg->dialogue_len,
                                oid, sizeof(oid), &ol) == 0)
         dn = map_encode_aare_oid(oid, ol, dlg, sizeof(dlg));
+    if (dn <= 0)
+        dn = map_encode_aare(MAP_AC_LOCATION_INFO_RETRIEVAL_V3,
+                             dlg, sizeof(dlg));
     if (dn < 0) dn = 0;
 
     uint8_t out[512];
