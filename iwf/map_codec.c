@@ -606,8 +606,11 @@ void map_normalize_msisdn_digits(const char *in, char *out, size_t cap)
         snprintf(out, cap, "98%s", digits + 1);
         return;
     }
-    /* Iran national 10 digits starting with 9 → prepend 98. */
-    if (n == 10 && digits[0] == '9') {
+    /* Iran national 10 digits starting with 9 → prepend 98. Exclude 98xxxxxxxx:
+     * no Iranian mobile prefix is 098x, so a 10-digit 98… is already an E.164
+     * international number (short node GTs such as MCI's SMSC 9891100500)
+     * and prepending a second country code would corrupt it. */
+    if (n == 10 && digits[0] == '9' && digits[1] != '8') {
         snprintf(out, cap, "98%s", digits);
         return;
     }

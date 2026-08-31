@@ -754,6 +754,16 @@ static const char *sms_msc_gt(void)
     return "";
 }
 
+/* Nature of number from a MAP AddressString / GSUP SM-RP-DA first octet.
+ * A leading '0' is never part of an E.164 international number, so an
+ * "international" claim over such digits is not believed. */
+static int sms_addr_is_international(const uint8_t *addr, size_t alen,
+                                     const char *digits)
+{
+    return alen >= 1 && (addr[0] & 0x70) == 0x10 &&
+           digits && digits[0] && digits[0] != '0';
+}
+
 static int sms_rebuild_intl_addr(const char *digits, uint8_t *addr, size_t cap,
                                  size_t *alen)
 {
@@ -826,24 +836,34 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
         return;
     }
 
+    /* The MS/MSC already states the nature of number. Only guess the format
+     * when it is not international: normalising a GT that is already E.164
+     * corrupts short international SMSC addresses (MCI's 9891100500 is ten
+     * digits starting with '9' and would gain a second country code). */
     char smsc_raw[24];
     snprintf(smsc_raw, sizeof(smsc_raw), "%s", smsc);
-    map_normalize_msisdn_digits(smsc, smsc, sizeof(smsc));
+    uint8_t da_ton = da_alen ? da_addr[0] : 0;
+    int da_intl = sms_addr_is_international(da_addr, da_alen, smsc);
+    if (!da_intl)
+        map_normalize_msisdn_digits(smsc, smsc, sizeof(smsc));
     if (strlen(smsc) < 8) {
         LOGW("sms",
-             "[%s] MO-FSM reject RP-96: SMSC GT too short raw=%s norm=%s mr=%u",
-             m->imsi, smsc_raw, smsc, (unsigned)mr);
+             "[%s] MO-FSM reject RP-96: SMSC GT too short raw=%s norm=%s "
+             "ton=0x%02x mr=%u",
+             m->imsi, smsc_raw, smsc, (unsigned)da_ton, (unsigned)mr);
         sms_mo_reply_err(conn_id, m->imsi, mr, 96);
         return;
     }
-    if (sms_rebuild_intl_addr(smsc, da_addr, sizeof(da_addr), &da_alen) < 0) {
+    if (!da_intl &&
+        sms_rebuild_intl_addr(smsc, da_addr, sizeof(da_addr), &da_alen) < 0) {
         LOGW("sms", "[%s] MO-FSM reject RP-96: SMSC GT encode failed gt=%s mr=%u",
              m->imsi, smsc, (unsigned)mr);
         sms_mo_reply_err(conn_id, m->imsi, mr, 96);
         return;
     }
     if (strcmp(smsc_raw, smsc) != 0)
-        LOGI("sms", "[%s] MO-FSM SMSC GT %s -> %s", m->imsi, smsc_raw, smsc);
+        LOGI("sms", "[%s] MO-FSM SMSC GT %s -> %s (ton=0x%02x)",
+             m->imsi, smsc_raw, smsc, (unsigned)da_ton);
 
     uint8_t arg[400];
     int an = map_encode_mo_fwd_sm_arg(da_addr, da_alen, oa_addr, oa_alen,
