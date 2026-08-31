@@ -994,9 +994,25 @@ void sms_iwf_on_gsup_ready_for_sm(int conn_id, const gsup_parsed_t *m)
 
     gsup_route_t route;
     if (gsup_router_lookup(&g_rt->cfg, m->imsi, &route) < 0 ||
-        (!route.hlr_gt[0] && !route.e214_prefix[0])) {
-        LOGI("sms", "[%s] readyForSM: no MAP HLR route -> error", m->imsi);
+        route.kind == GSUP_ROUTE_REJECT) {
+        LOGI("sms", "[%s] readyForSM: unroutable IMSI -> error", m->imsi);
         sms_rfsm_reply_err(conn_id, m->imsi, mr, 38 /* net out of order */);
+        return;
+    }
+    if (!route.hlr_gt[0] && !route.e214_prefix[0]) {
+        /* Partner reachable only over Diameter: there is no MAP readyForSM to
+         * send. RP-SMMA is advisory, so acknowledge it rather than telling the
+         * handset the network is out of order - cause 38 makes it repeat the
+         * notification in a tight loop. Give the PLMN an mnc<NNN>_hlr_gt or
+         * mnc<NNN>_e214_prefix in [roaming_hlr] to alert its HLR for real. */
+        uint8_t gsup[128];
+        int n = gsup_build_ready_for_sm_res(m->imsi, mr, gsup, sizeof(gsup));
+        LOGI("sms",
+             "[%s] readyForSM: no MAP HLR route for %u-%0*u -> ack locally",
+             m->imsi, (unsigned)route.mcc, route.mnc_digits,
+             (unsigned)route.mnc);
+        if (n > 0)
+            gsup_server_send(conn_id, gsup, (size_t)n);
         return;
     }
 
