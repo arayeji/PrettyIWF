@@ -99,6 +99,7 @@ static void sms_sess_remove(sms_session_t *s)
 }
 
 static const char *sms_msc_gt(void);
+static const char *sms_mo_cgpa_gt(void);
 
 static void sms_arm_timer(sms_session_t *s, int timeout_ms)
 {
@@ -754,6 +755,16 @@ static const char *sms_msc_gt(void)
     return "";
 }
 
+/* SCCP CgPA for outbound mo-ForwardSM: serving MSC GT (TS 23.040). */
+static const char *sms_mo_cgpa_gt(void)
+{
+    if (g_rt->cfg.sms_local_msc_gt[0])
+        return g_rt->cfg.sms_local_msc_gt;
+    if (g_rt->cfg.map_local_gt[0])
+        return g_rt->cfg.map_local_gt;
+    return "";
+}
+
 /* Nature of number from a MAP AddressString / GSUP SM-RP-DA first octet.
  * A leading '0' is never part of an E.164 international number, so an
  * "international" claim over such digits is not believed. */
@@ -895,12 +906,13 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
     s->sm_rp_mr = mr;
     strncpy(s->imsi, m->imsi, sizeof(s->imsi) - 1);
 
-    /* CdPA = SMSC GT from SM-RP-DA (route on GT); CgPA = our MSC GT. */
+    /* CdPA = SMSC GT from SM-RP-DA; CgPA = serving MSC GT (not VLR). */
+    const char *cgpa = sms_mo_cgpa_gt();
     ss7_sccp_addr_t called, calling;
     ss7_gt_from_digits(smsc, SS7_SSN_MSC, &called);
     memset(&calling, 0, sizeof(calling));
-    if (g_rt->cfg.map_local_gt[0])
-        ss7_gt_from_digits(g_rt->cfg.map_local_gt, SS7_SSN_MSC, &calling);
+    if (cgpa && cgpa[0])
+        ss7_gt_from_digits(cgpa, SS7_SSN_MSC, &calling);
     calling.ssn = SS7_SSN_MSC;
 
     if (sms_send_map_begin(s->otid, MAP_OP_CODE_MT_FORWARD_SM /* mo-ForwardSM */,
@@ -914,10 +926,10 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
     sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
     LOGI("sms",
          "[%s] RX GSUP MO-FSM mr=%u smsc=%s ton=0x%02x oa=%s ton=0x%02x "
-         "ui_len=%u -> MAP mo-FwdSM-v3+imsi otid=0x%08x",
+         "ui_len=%u -> MAP mo-FwdSM-v3+imsi otid=0x%08x cgpa=%s",
          m->imsi, (unsigned)mr, smsc, (unsigned)da_addr[0],
          oa_dig, (unsigned)oa_addr[0],
-         (unsigned)m->sm_rp_ui_len, s->otid);
+         (unsigned)m->sm_rp_ui_len, s->otid, cgpa[0] ? cgpa : "-");
 }
 
 bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
