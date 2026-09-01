@@ -30,6 +30,8 @@ void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
                        const tcap_msg_t *tmsg,
                        const tcap_component_t *c);
 void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *msg);
+/* A CS Location Update finished: release any MT-SMS parked for that IMSI. */
+void sms_iwf_on_cs_lu_done(const char *imsi);
 
 /* Outbound MO-SMS relay (our subscriber -> home SMSC): GSUP MO-ForwardSM
  * from osmo-msc (sms-over-gsup) -> MAP mo-ForwardSM BEGIN

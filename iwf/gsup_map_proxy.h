@@ -55,6 +55,10 @@ bool gsup_map_proxy_imsi_known(const char *imsi, uint8_t cn_domain);
 /* Tracked CS-domain GSUP conn for IMSI (MT-SMS delivery), or -1. */
 int gsup_map_proxy_cs_conn_for_imsi(const char *imsi);
 
+/* True while a CS-domain Location Update for IMSI is still in flight toward
+ * the home HLR/HSS, i.e. the MSC has no usable VLR record yet. */
+bool gsup_map_proxy_cs_lu_in_flight(const char *imsi);
+
 /* Remember the MSISDN learned for an attached IMSI (from ISD) so inbound
  * sendRoutingInformation can resolve called-MSISDN -> IMSI. */
 void gsup_map_proxy_note_msisdn(const char *imsi, const char *msisdn);

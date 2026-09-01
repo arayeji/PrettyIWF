@@ -56,6 +56,72 @@ typedef struct gsup_pending {
 static iwf_runtime_t *g_rt;
 static gsup_pending_t *g_pending;
 
+/* ---- CS Location Updates in flight ---------------------------------- *
+ * osmo-msc builds its VLR record only once it has our GSUP UpdateLocation
+ * Result, and answers an MT-ForwardSM that arrives before that with GMM 17
+ * (network failure).  Home HLRs routinely flush queued MT SMS as soon as
+ * they have ISD-acked - that is, before they answer our updateLocation - so
+ * the SM regularly beats the very LU that triggered it, and the SMSC gets a
+ * hard error for a subscriber that is about to be perfectly reachable.
+ * Track the window so sms_iwf can park the SM until the LU lands.        */
+#define CS_LU_MAX_AGE_SEC 30
+
+typedef struct cs_lu {
+    char           imsi[16];
+    time_t         started;
+    UT_hash_handle hh;
+} cs_lu_t;
+
+static cs_lu_t *g_cs_lu;
+
+static void cs_lu_drop(cs_lu_t *e)
+{
+    HASH_DEL(g_cs_lu, e);
+    free(e);
+}
+
+static void cs_lu_begin(const char *imsi)
+{
+    if (!imsi || !imsi[0]) return;
+    cs_lu_t *e = NULL;
+    HASH_FIND_STR(g_cs_lu, imsi, e);
+    if (!e) {
+        e = calloc(1, sizeof(*e));
+        if (!e) return;
+        snprintf(e->imsi, sizeof(e->imsi), "%s", imsi);
+        HASH_ADD_STR(g_cs_lu, imsi, e);
+    }
+    e->started = time(NULL);
+}
+
+/* The LU is answered (result or error already on the wire toward the MSC):
+ * release anything sms_iwf parked for this subscriber. */
+static void cs_lu_end(const char *imsi)
+{
+    if (!imsi || !imsi[0]) return;
+    cs_lu_t *e = NULL;
+    HASH_FIND_STR(g_cs_lu, imsi, e);
+    if (!e) return;
+    cs_lu_drop(e);
+#ifdef SMS_IWF_ENABLED
+    sms_iwf_on_cs_lu_done(imsi);
+#endif
+}
+
+bool gsup_map_proxy_cs_lu_in_flight(const char *imsi)
+{
+    if (!imsi || !imsi[0]) return false;
+    cs_lu_t *e = NULL;
+    HASH_FIND_STR(g_cs_lu, imsi, e);
+    if (!e) return false;
+    /* Never park behind an entry we somehow failed to clear. */
+    if (time(NULL) - e->started > CS_LU_MAX_AGE_SEC) {
+        cs_lu_drop(e);
+        return false;
+    }
+    return true;
+}
+
 /* Last GSUP TCP conn per IMSI, split by CN domain (SGSN=PS, MSC=CS). */
 typedef struct {
     char imsi[16];
@@ -399,6 +465,8 @@ static void reply_gsup_err(int conn_id, const char *imsi,
          n);
         (void)proxy_send_gsup(conn_id, gsup, (size_t)n);
     }
+    if (req_type == GSUP_MSG_UL_REQ)
+        cs_lu_end(imsi);
 }
 
 static int sgsn_number_bcd(iwf_runtime_t *rt, uint8_t *out, size_t cap)
@@ -838,6 +906,9 @@ static int handle_ul(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
         return 0;
     }
     uint8_t cn = (req && req->have_cn_domain) ? req->cn_domain : GSUP_CN_DOMAIN_PS;
+    /* Open the park window before the LU leaves for the home HLR/HSS. */
+    if (cn == GSUP_CN_DOMAIN_CS)
+        cs_lu_begin(route->imsi);
     int have_map_dest = route->hlr_gt[0] || route->e214_prefix[0];
     int want_map = (gsup_backend_for_cn(cn) == GSUP_BACKEND_MAP && have_map_dest);
 
@@ -1172,6 +1243,7 @@ void gsup_map_proxy_finish_ugl(iwf_runtime_t *rt, map_session_t *s)
          hexbuf);
         }
     }
+    cs_lu_end(s->imsi_str);
     s->gsup_originated = false;
     map_sess_remove(s);
 }
@@ -1247,6 +1319,7 @@ static void map_to_gsup_ul_res(gsup_pending_t *p, const uint8_t *params, size_t 
          hlr ? hlr : "(none)",
          p->conn_id);
     }
+    cs_lu_end(p->imsi);
 }
 
 static int map_pending_send_isd_gsup(gsup_pending_t *p)
@@ -1560,6 +1633,10 @@ void gsup_map_proxy_shutdown(void)
     HASH_ITER(hh, g_msisdn_map, m, mtmp) {
         HASH_DEL(g_msisdn_map, m);
         free(m);
+    }
+    cs_lu_t *lu, *lutmp;
+    HASH_ITER(hh, g_cs_lu, lu, lutmp) {
+        cs_lu_drop(lu);
     }
     msisdn_db_shutdown();
     g_rt = NULL;

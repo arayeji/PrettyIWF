@@ -38,6 +38,20 @@
 #define SMS_STATE_WAIT_GSUP_MT  4
 #define SMS_STATE_WAIT_MO_FSM   5
 #define SMS_STATE_WAIT_RFSM     6
+#define SMS_STATE_WAIT_LU       7   /* MT parked: CS LU still in flight     */
+#define SMS_STATE_WAIT_LU_GRACE 8   /* LU landed (or retry due): short hold */
+
+/* Longest we hold an MT-SMS for an in-flight CS Location Update before
+ * pushing it at the MSC anyway.  Well inside sms_fwdsm_timeout_ms and the
+ * SMSC's own MAP dialogue timer. */
+#define SMS_MT_LU_WAIT_MS     5000
+/* Grace after the LU lands, so osmo-msc finishes the VLR record and gets
+ * LU-ACCEPT out before the SM shows up. */
+#define SMS_MT_LU_GRACE_MS     150
+/* A GMM 17 that comes back this fast is "no VLR record yet"; a real paging
+ * or delivery failure only surfaces after the MSC's own timers (seconds). */
+#define SMS_MT_FAST_FAIL_MS   2000
+#define SMS_MT_RETRY_MS        700
 
 #define SMS_OTID_OUTBOUND_BIT   0x80000000u
 
@@ -68,6 +82,13 @@ typedef struct sms_session {
     uint8_t             sm_rp_mr;       /* GSUP correlation                  */
     uint8_t             aare_oid[16];   /* AC OID from AARQ, echoed in AARE  */
     uint8_t             aare_oid_len;
+    uint8_t             mt_sc_addr[12]; /* SM-RP-OA, kept for re-send        */
+    uint8_t             mt_sc_len;
+    uint8_t             mt_ui[255];     /* SM-RP-UI (the TPDU)               */
+    uint8_t             mt_ui_len;
+    uint8_t             mt_more;
+    uint8_t             mt_retried;     /* one retry per SM                  */
+    uint64_t            mt_req_ms;      /* when the GSUP MT req went out     */
     /* MO-out (subscriber -> home SMSC) */
     int                 gsup_conn;      /* MSC conn awaiting the MO result   */
 } sms_session_t;
@@ -115,6 +136,13 @@ static void sms_arm_timer(sms_session_t *s, int timeout_ms)
         .it_value.tv_nsec = (long)(timeout_ms % 1000) * 1000000L,
     };
     timerfd_settime(s->timer_fd, 0, &its, NULL);
+}
+
+static uint64_t sms_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
 static uint32_t sms_new_out_otid(void)
@@ -313,7 +341,48 @@ static int sms_mt_map_error(const sms_session_t *s, const gsup_parsed_t *m)
         if (rp == 27 || rp == 28 || rp == 30)
             return sms_mt_err_absent(s);
     }
+    /* GMM 17 is the MSC's catch-all transient.  Fast means it still had no
+     * VLR record (an LU raced the SM): subscriberBusyForMT-SMS asks the SMSC
+     * to retry in seconds.  Slow means paging or the RP-ACK actually failed:
+     * absentSubscriber sets MNRF at the home HLR, so it re-delivers when we
+     * relay the MSC's readyForSM instead of dropping the message. */
+    if (m->have_cause && m->cause == GSUP_CAUSE_NET_FAIL) {
+        /* Error 31 only exists from shortMsgMT-Relay v2 on; a bare v1
+         * dialogue (no AARQ, so no AC OID to echo) gets absent instead. */
+        if (s->aare_oid_len &&
+            sms_now_ms() - s->mt_req_ms < SMS_MT_FAST_FAIL_MS)
+            return MAP_ERR_SUBSCRIBER_BUSY_MT_SMS;
+        return sms_mt_err_absent(s);
+    }
     return MAP_ERR_SYSTEM_FAILURE;
+}
+
+/* Build and send the GSUP MT-ForwardSM toward the serving MSC.  Returns 0
+ * with the session left in WAIT_GSUP_MT, or -1 after ending the MAP dialogue
+ * (caller drops the session). */
+static int sms_mt_dispatch_gsup(sms_session_t *s)
+{
+    int conn = gsup_map_proxy_cs_conn_for_imsi(s->imsi);
+    if (conn < 0) {
+        LOGI("sms", "[%s] MT-FSM: no MSC GSUP conn -> absent", s->imsi);
+        sms_mt_send_end(s, 1, sms_mt_err_absent(s), NULL, 0);
+        return -1;
+    }
+    uint8_t gsup[512];
+    int n = gsup_build_mt_fsm_req(s->imsi, s->sm_rp_mr,
+                                  s->mt_sc_len ? s->mt_sc_addr : NULL,
+                                  s->mt_sc_len,
+                                  s->mt_ui, s->mt_ui_len, s->mt_more,
+                                  gsup, sizeof(gsup));
+    if (n < 0 || gsup_server_send(conn, gsup, (size_t)n) < 0) {
+        LOGW("sms", "[%s] MT-FSM: GSUP MT req failed conn=%d", s->imsi, conn);
+        sms_mt_send_end(s, 1, MAP_ERR_SYSTEM_FAILURE, NULL, 0);
+        return -1;
+    }
+    s->state = SMS_STATE_WAIT_GSUP_MT;
+    s->mt_req_ms = sms_now_ms();
+    sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
+    return 0;
 }
 
 void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
@@ -369,23 +438,53 @@ void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
     }
 
     s->sm_rp_mr = g_mt_mr++;
-    uint8_t gsup[512];
-    int n = gsup_build_mt_fsm_req(s->imsi, s->sm_rp_mr,
-                                  sc_len ? sc_addr : NULL, sc_len,
-                                  ui, ui_len, more, gsup, sizeof(gsup));
-    if (n < 0 || gsup_server_send(conn, gsup, (size_t)n) < 0) {
-        LOGW("sms", "[%s] MT-FSM: GSUP MT req failed conn=%d", s->imsi, conn);
-        sms_mt_send_end(s, 1, MAP_ERR_SYSTEM_FAILURE, NULL, 0);
-        free(s);
+    s->mt_sc_len = (uint8_t)(sc_len > sizeof(s->mt_sc_addr) ? 0 : sc_len);
+    if (s->mt_sc_len)
+        memcpy(s->mt_sc_addr, sc_addr, s->mt_sc_len);
+    s->mt_ui_len = (uint8_t)ui_len;
+    if (ui_len)
+        memcpy(s->mt_ui, ui, ui_len);
+    s->mt_more = (uint8_t)(more ? 1 : 0);
+
+    HASH_ADD(hh, g_sessions, otid, sizeof(s->otid), s);
+
+    /* The home HLR flushes queued MT SMS as soon as it has ISD-acked, which
+     * is before it answers our updateLocation - so the SM routinely arrives
+     * while the MSC is still mid-LU with no VLR record to deliver to.  Park
+     * it; sms_iwf_on_cs_lu_done() releases it when the LU lands. */
+    if (gsup_map_proxy_cs_lu_in_flight(s->imsi)) {
+        s->state = SMS_STATE_WAIT_LU;
+        sms_arm_timer(s, SMS_MT_LU_WAIT_MS);
+        LOGI("sms",
+             "[%s] RX MT-FSM op=%d otid=0x%08x ui_len=%zu more=%d -> parked, "
+             "CS LU in flight",
+             s->imsi, s->mt_op, s->peer_otid, ui_len, more);
         return;
     }
 
-    HASH_ADD(hh, g_sessions, otid, sizeof(s->otid), s);
-    sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
+    if (sms_mt_dispatch_gsup(s) < 0) {
+        sms_sess_remove(s);
+        return;
+    }
     LOGI("sms",
          "[%s] RX MT-FSM op=%d otid=0x%08x ui_len=%zu more=%d -> GSUP conn=%d mr=%u",
          s->imsi, s->mt_op, s->peer_otid, ui_len, more, conn,
          (unsigned)s->sm_rp_mr);
+}
+
+void sms_iwf_on_cs_lu_done(const char *imsi)
+{
+    if (!g_rt || !imsi || !imsi[0]) return;
+    sms_session_t *s, *tmp;
+    HASH_ITER(hh, g_sessions, s, tmp) {
+        if (s->direction != SMS_DIR_MT_IN) continue;
+        if (s->state != SMS_STATE_WAIT_LU) continue;
+        if (strcmp(s->imsi, imsi) != 0) continue;
+        s->state = SMS_STATE_WAIT_LU_GRACE;
+        sms_arm_timer(s, SMS_MT_LU_GRACE_MS);
+        LOGI("sms", "[%s] CS LU done -> release parked MT-FSM in %d ms",
+             s->imsi, SMS_MT_LU_GRACE_MS);
+    }
 }
 
 void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *m)
@@ -398,6 +497,8 @@ void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *m)
      * back to a unique IMSI match when the echoed MR does not line up. */
     HASH_ITER(hh, g_sessions, s, tmp) {
         if (s->direction != SMS_DIR_MT_IN) continue;
+        /* Parked sessions have nothing outstanding at the MSC. */
+        if (s->state != SMS_STATE_WAIT_GSUP_MT) continue;
         if (m->have_imsi && s->imsi[0] && strcmp(s->imsi, m->imsi) != 0)
             continue;
         if (!by_imsi)
@@ -427,6 +528,21 @@ void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *m)
              found->imsi, (unsigned)found->sm_rp_mr);
         sms_mt_send_end(found, 0, found->mt_op, NULL, 0);
     } else {
+        /* Fast GMM 17 = the MSC had no VLR record yet, not a delivery
+         * failure.  The LU it is racing lands within a few hundred ms, so
+         * try once more before telling the SMSC anything. */
+        if (m->msg_type == GSUP_MSG_MT_FSM_ERR &&
+            m->have_cause && m->cause == GSUP_CAUSE_NET_FAIL &&
+            !found->mt_retried &&
+            sms_now_ms() - found->mt_req_ms < SMS_MT_FAST_FAIL_MS) {
+            found->mt_retried = 1;
+            found->state = SMS_STATE_WAIT_LU_GRACE;
+            sms_arm_timer(found, SMS_MT_RETRY_MS);
+            LOGI("sms",
+                 "[%s] MT-FSM fast reject (gsup_cause=0x%02x) -> retry in %d ms",
+                 found->imsi, (unsigned)m->cause, SMS_MT_RETRY_MS);
+            return;
+        }
         int ec = sms_mt_map_error(found, m);
         if (m->have_cause)
             LOGI("sms",
@@ -1142,12 +1258,24 @@ void sms_iwf_on_timer(void)
         ssize_t r = read(s->timer_fd, &exp, sizeof(exp));
         if (r != (ssize_t)sizeof(exp))
             continue;
+        if (s->direction == SMS_DIR_MT_IN &&
+            (s->state == SMS_STATE_WAIT_LU ||
+             s->state == SMS_STATE_WAIT_LU_GRACE)) {
+            /* Not a timeout: the parked SM is due (LU landed, LU took too
+             * long, or the one retry is up). */
+            LOGI("sms", "[%s] releasing parked MT-FSM state=%u retry=%u",
+                 s->imsi, (unsigned)s->state, (unsigned)s->mt_retried);
+            if (sms_mt_dispatch_gsup(s) < 0)
+                sms_sess_remove(s);
+            return;
+        }
         LOGW("sms", "session timeout otid=0x%08x state=%u", s->otid, s->state);
         if (s->direction == SMS_DIR_INBOUND) {
             sms_fail_inbound(s);
         } else if (s->direction == SMS_DIR_MT_IN) {
-            /* MSC didn't answer (paging?): transient -> SMSC will retry. */
-            sms_mt_send_end(s, 1, MAP_ERR_SYSTEM_FAILURE, NULL, 0);
+            /* MSC never answered: paging failed.  absentSubscriber sets MNRF
+             * at the home HLR so it re-delivers on our readyForSM relay. */
+            sms_mt_send_end(s, 1, sms_mt_err_absent(s), NULL, 0);
             sms_sess_remove(s);
         } else if (s->direction == SMS_DIR_MO_OUT) {
             /* Home SMSC didn't answer: UE gets RP-ERROR and retries. */

@@ -60,6 +60,7 @@
 #define MAP_ERR_UNIDENTIFIED_SUBSCRIBER     5   /* MT-ForwardSM: not at this VLR */
 #define MAP_ERR_ABSENT_SUBSCRIBER_SM        6   /* MAP v3 SMS */
 #define MAP_ERR_ABSENT_SUBSCRIBER           27  /* MAP v1/v2 SMS */
+#define MAP_ERR_SUBSCRIBER_BUSY_MT_SMS      31  /* MT-FSM: retry shortly */
 #define MAP_ERR_ROAMING_NOT_ALLOWED         8
 #define MAP_ERR_FACILITY_NOT_SUPPORTED      21
 #define MAP_ERR_DELIVERY_FAILURE            32
