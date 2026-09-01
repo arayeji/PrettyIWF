@@ -876,10 +876,12 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
         LOGI("sms", "[%s] MO-FSM SMSC GT %s -> %s (ton=0x%02x)",
              m->imsi, smsc_raw, smsc, (unsigned)da_ton);
 
+    /* MAP v2 trial: no IMSI after sm-RP-UI; AC shortMsgMO-RelayContext-v2.
+     * Irancell answered v2 dialogues; v3 AARQ is unproven. */
     uint8_t arg[400];
     int an = map_encode_mo_fwd_sm_arg(da_addr, da_alen, oa_addr, oa_alen,
                                       m->sm_rp_ui, m->sm_rp_ui_len,
-                                      m->imsi, arg, sizeof(arg));
+                                      NULL, arg, sizeof(arg));
     if (an < 0) {
         LOGW("sms", "[%s] MO-FSM: MAP encode failed smsc=%s oa=%s",
              m->imsi, smsc, oa_dig);
@@ -887,7 +889,7 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
         return;
     }
     uint8_t dlg[128];
-    int dn = map_encode_aarq(MAP_AC_SHORT_MSG_MO_RELAY_V3, dlg, sizeof(dlg));
+    int dn = map_encode_aarq(MAP_AC_SHORT_MSG_MO_RELAY_V2, dlg, sizeof(dlg));
     if (dn < 0) {
         sms_mo_reply_err(conn_id, m->imsi, mr, 41);
         return;
@@ -926,7 +928,7 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
     sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
     LOGI("sms",
          "[%s] RX GSUP MO-FSM mr=%u smsc=%s ton=0x%02x oa=%s ton=0x%02x "
-         "ui_len=%u -> MAP mo-FwdSM-v3+imsi otid=0x%08x cgpa=%s",
+         "ui_len=%u -> MAP mo-FwdSM-v2 otid=0x%08x cgpa=%s",
          m->imsi, (unsigned)mr, smsc, (unsigned)da_addr[0],
          oa_dig, (unsigned)oa_addr[0],
          (unsigned)m->sm_rp_ui_len, s->otid, cgpa[0] ? cgpa : "-");
