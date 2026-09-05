@@ -278,6 +278,9 @@ typedef struct {
     int         sms_gsup_timeout_ms;
     int         sms_sri_sm_timeout_ms;
     int         sms_fwdsm_timeout_ms;
+    /* Rewrite MO SMS-SUBMIT sm-RP-UI to a plain FO (no TP-RD, no TP-VP).
+     * Default 0: relay the UE TPDU unchanged. */
+    int         sms_mo_plain_submit;
 
     /* [gsup_client] */
     char        gsup_remote_ip[64];

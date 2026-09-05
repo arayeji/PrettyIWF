@@ -904,6 +904,56 @@ static int sms_rebuild_intl_addr(const char *digits, uint8_t *addr, size_t cap,
     return 0;
 }
 
+/* GSM 03.40 SMS-SUBMIT bits kept when mo_plain_submit=1: TP-RP / UDHI /
+ * SRR / MTI. TP-RD and TP-VPF are cleared and TP-VP is dropped. */
+#define SMS_FO_MTI_MASK     0x03
+#define SMS_FO_MTI_SUBMIT   0x01
+#define SMS_FO_VPF_MASK    0x18
+#define SMS_FO_VPF_ENH     0x08
+#define SMS_FO_VPF_REL     0x10
+#define SMS_FO_VPF_ABS     0x18
+#define SMS_FO_KEEP        0xE3
+
+static size_t sms_mo_plain_submit(const uint8_t *in, size_t in_len,
+                                 uint8_t *out, size_t cap)
+{
+    size_t da_digits, da_bytes, hdr, vp_len, rest, rest_len, nlen;
+    uint8_t fo, vpf, new_fo;
+
+    if (!in || !out || in_len < 8 || in_len > cap)
+        return 0;
+    fo = in[0];
+    if ((fo & SMS_FO_MTI_MASK) != SMS_FO_MTI_SUBMIT)
+        return 0;
+
+    vpf = (uint8_t)(fo & SMS_FO_VPF_MASK);
+    if (vpf == 0)
+        vp_len = 0;
+    else if (vpf == SMS_FO_VPF_REL)
+        vp_len = 1;
+    else if (vpf == SMS_FO_VPF_ENH || vpf == SMS_FO_VPF_ABS)
+        vp_len = 7;
+    else
+        return 0;
+
+    da_digits = in[2];
+    da_bytes = (da_digits + 1) / 2;
+    hdr = 2 + 1 + 1 + da_bytes; /* FO, MR, DA-len, TOA, DA */
+    if (in_len < hdr + 2 + vp_len + 1)
+        return 0;
+    rest = hdr + 2 + vp_len;
+    rest_len = in_len - rest;
+    nlen = in_len - vp_len;
+    if (nlen > cap || rest_len < 1)
+        return 0;
+
+    new_fo = (uint8_t)((fo & SMS_FO_KEEP) | SMS_FO_MTI_SUBMIT);
+    out[0] = new_fo;
+    memcpy(out + 1, in + 1, hdr + 1); /* MR through DCS */
+    memcpy(out + hdr + 2, in + rest, rest_len);
+    return nlen;
+}
+
 void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
 {
     if (!g_rt || !m) return;
@@ -992,9 +1042,26 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
         LOGI("sms", "[%s] MO-FSM SMSC GT %s -> %s (ton=0x%02x)",
              m->imsi, smsc_raw, smsc, (unsigned)da_ton);
 
+    const uint8_t *ui = m->sm_rp_ui;
+    size_t ui_len = m->sm_rp_ui_len;
+    uint8_t ui_buf[256];
+    if (g_rt->cfg.sms_mo_plain_submit) {
+        size_t nlen = sms_mo_plain_submit(m->sm_rp_ui, m->sm_rp_ui_len,
+                                         ui_buf, sizeof(ui_buf));
+        if (nlen) {
+            if (nlen != m->sm_rp_ui_len || ui_buf[0] != m->sm_rp_ui[0])
+                LOGI("sms",
+                     "[%s] MO-FSM TPDU SUBMIT fo=0x%02x->0x%02x ui_len=%u->%u",
+                     m->imsi, (unsigned)m->sm_rp_ui[0], (unsigned)ui_buf[0],
+                     (unsigned)m->sm_rp_ui_len, (unsigned)nlen);
+            ui = ui_buf;
+            ui_len = nlen;
+        }
+    }
+
     uint8_t arg[400];
     int an = map_encode_mo_fwd_sm_arg(da_addr, da_alen, oa_addr, oa_alen,
-                                      m->sm_rp_ui, m->sm_rp_ui_len,
+                                      ui, ui_len,
                                       m->imsi, arg, sizeof(arg));
     if (an < 0) {
         LOGW("sms", "[%s] MO-FSM: MAP encode failed smsc=%s oa=%s",
@@ -1045,7 +1112,7 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
          "ui_len=%u -> MAP mo-FwdSM-v3+imsi otid=0x%08x cgpa=%s",
          m->imsi, (unsigned)mr, smsc, (unsigned)da_addr[0],
          oa_dig, (unsigned)oa_addr[0],
-         (unsigned)m->sm_rp_ui_len, s->otid, cgpa[0] ? cgpa : "-");
+         (unsigned)ui_len, s->otid, cgpa[0] ? cgpa : "-");
 }
 
 bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg)

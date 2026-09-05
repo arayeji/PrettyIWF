@@ -180,6 +180,9 @@ int iwf_config_reload(iwf_runtime_t *rt)
                       nc.sms_sri_sm_timeout_ms);
     log_timeout_delta("sms_fwdsm_timeout_ms", old->sms_fwdsm_timeout_ms,
                       nc.sms_fwdsm_timeout_ms);
+    if (old->sms_mo_plain_submit != nc.sms_mo_plain_submit)
+        LOGI("config", "sms_mo_plain_submit %d -> %d",
+             old->sms_mo_plain_submit, nc.sms_mo_plain_submit);
 #endif
 
     char restart_why[256];

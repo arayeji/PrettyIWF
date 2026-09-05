@@ -92,6 +92,7 @@ static void defaults(iwf_config_t *c)
     c->sms_gsup_timeout_ms   = 3000;
     c->sms_sri_sm_timeout_ms = 5000;
     c->sms_fwdsm_timeout_ms  = 30000;
+    c->sms_mo_plain_submit    = 0;
     strncpy(c->gsup_remote_ip, "127.0.0.1", sizeof(c->gsup_remote_ip) - 1);
     c->gsup_remote_port      = 4222;
     strncpy(c->gsup_client_name, "IWF-SMS", sizeof(c->gsup_client_name) - 1);
@@ -1228,6 +1229,7 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "gsup_timeout_ms"))  out->sms_gsup_timeout_ms = atoi(val);
             else if (!strcmp(key, "sri_sm_timeout_ms")) out->sms_sri_sm_timeout_ms = atoi(val);
             else if (!strcmp(key, "fwdsm_timeout_ms")) out->sms_fwdsm_timeout_ms = atoi(val);
+            else if (!strcmp(key, "mo_plain_submit")) out->sms_mo_plain_submit = (atoi(val) != 0);
             else LOGW("config", "unknown key [sms_iwf].%s", key);
         } else if (!strcmp(section, "gsup_client")) {
             if      (!strcmp(key, "remote_ip"))    copy_str(out->gsup_remote_ip, sizeof(out->gsup_remote_ip), val);
@@ -1525,9 +1527,11 @@ void iwf_config_dump(const iwf_config_t *c)
     }
 #ifdef SMS_IWF_ENABLED
     if (c->sms_iwf_enabled) {
-        LOGI("config", "sms_iwf: msc_gt=%s smsc_gt=%s hlr_ssn=%u gsup_timeout=%dms",
+        LOGI("config", "sms_iwf: msc_gt=%s smsc_gt=%s hlr_ssn=%u gsup_timeout=%dms "
+             "mo_plain_submit=%d",
              c->sms_local_msc_gt, c->sms_local_smsc_gt,
-             (unsigned)c->sms_hlr_ssn, c->sms_gsup_timeout_ms);
+             (unsigned)c->sms_hlr_ssn, c->sms_gsup_timeout_ms,
+             c->sms_mo_plain_submit);
         LOGI("config", "sms_iwf: gsup=%s:%u smpp=%s:%u partners=%d",
              c->gsup_remote_ip, (unsigned)c->gsup_remote_port,
              c->smpp_bind_ip, (unsigned)c->smpp_port, c->sms_n_partners);
