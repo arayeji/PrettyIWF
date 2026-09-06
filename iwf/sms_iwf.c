@@ -1115,6 +1115,87 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
          (unsigned)ui_len, s->otid, cgpa[0] ? cgpa : "-");
 }
 
+/* GSM 04.11 RP-Cause (network→MS). Permanent values must not be 41 or the
+ * UE retries the same SMS until its own counter expires. */
+#define RP_UNALLOCATED            1
+#define RP_SM_TRANSFER_REJECTED 21
+#define RP_MEMORY_EXCEEDED      22
+#define RP_DEST_OUT_OF_ORDER    27
+#define RP_UNIDENTIFIED         28
+#define RP_TEMP_FAILURE          41
+#define RP_CONGESTION           42
+#define RP_FACILITY_NOT_IMPL    69
+#define RP_INVALID_MAND_INFO    96
+
+/* TS 29.002 SM-EnumeratedDeliveryFailureCause */
+#define SM_DF_MEMORY            0
+#define SM_DF_SC_CONGESTION     4
+
+static int sms_sm_df_enum(const uint8_t *p, size_t n, int *out)
+{
+    uint8_t tag;
+    const uint8_t *v;
+    size_t l, off = 0;
+
+    if (!p || !n || !out)
+        return -1;
+    if (ber_dec_tlv(p, n, &off, &tag, &v, &l) < 0)
+        return -1;
+    if (tag == 0x30) {
+        size_t ioff = 0;
+        if (ber_dec_tlv(v, l, &ioff, &tag, &v, &l) < 0)
+            return -1;
+    }
+    if ((tag == 0x0A || tag == 0x02) && l >= 1) {
+        *out = (int)v[l - 1];
+        return 0;
+    }
+    return -1;
+}
+
+static uint8_t sms_rp_from_sm_df(int df)
+{
+    switch (df) {
+    case SM_DF_MEMORY:
+        return RP_MEMORY_EXCEEDED;
+    case SM_DF_SC_CONGESTION:
+        return RP_CONGESTION;
+    default:
+        /* unknownServiceCentre / invalidSME-Address /
+         * subscriberNotSC-Subscriber: permanent. */
+        return RP_SM_TRANSFER_REJECTED;
+    }
+}
+
+/* Map a home-SMSC/HLR ReturnError onto GSUP SM-RP-Cause. Timeouts and
+ * unnamed failures stay RP-41 so the UE may retry those. */
+static uint8_t sms_map_err_to_rp(int map_err, const uint8_t *par, size_t plen)
+{
+    int df = -1;
+
+    switch (map_err) {
+    case MAP_ERR_UNKNOWN_SUBSCRIBER:
+        return RP_UNALLOCATED;
+    case MAP_ERR_UNIDENTIFIED_SUBSCRIBER:
+        return RP_UNIDENTIFIED;
+    case MAP_ERR_FACILITY_NOT_SUPPORTED:
+        return RP_FACILITY_NOT_IMPL;
+    case MAP_ERR_DELIVERY_FAILURE:
+        if (sms_sm_df_enum(par, plen, &df) == 0)
+            return sms_rp_from_sm_df(df);
+        return RP_SM_TRANSFER_REJECTED;
+    case MAP_ERR_DATA_MISSING:
+    case MAP_ERR_UNEXPECTED_DATA_VALUE:
+        return RP_INVALID_MAND_INFO;
+    case MAP_ERR_ABSENT_SUBSCRIBER_SM:
+    case MAP_ERR_ABSENT_SUBSCRIBER:
+        return RP_DEST_OUT_OF_ORDER;
+    case MAP_ERR_SYSTEM_FAILURE:
+    default:
+        return RP_TEMP_FAILURE;
+    }
+}
+
 bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
 {
     (void)rt;
@@ -1141,24 +1222,31 @@ bool sms_iwf_on_mo_tcap(struct iwf_runtime *rt, const tcap_msg_t *tmsg)
                                         gsup, sizeof(gsup));
             done = true;
         } else if (c->kind == TCAP_CMP_KIND_ERR) {
-            LOGI("sms", "[%s] %s rejected map_err=%d mr=%u",
-                 s->imsi, what, c->error_code, (unsigned)s->sm_rp_mr);
+            int df = -1;
+            uint8_t rp = sms_map_err_to_rp(c->error_code,
+                                           c->parameters, c->parameters_len);
+            if (c->error_code == MAP_ERR_DELIVERY_FAILURE)
+                (void)sms_sm_df_enum(c->parameters, c->parameters_len, &df);
+            LOGI("sms",
+                 "[%s] %s rejected map_err=%d df=%d -> RP-%u mr=%u",
+                 s->imsi, what, c->error_code, df, (unsigned)rp,
+                 (unsigned)s->sm_rp_mr);
             n = alert
-                ? gsup_build_ready_for_sm_err(s->imsi, s->sm_rp_mr,
-                                              41 /* temporary failure */,
+                ? gsup_build_ready_for_sm_err(s->imsi, s->sm_rp_mr, rp,
                                               gsup, sizeof(gsup))
-                : gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr, 41,
+                : gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr, rp,
                                         gsup, sizeof(gsup));
             done = true;
         }
     }
-    /* END without any component: dialogue closed without result. */
+    /* END without a result/error: no named MAP cause. RP-41 is correct. */
     if (!done && tmsg->type == TCAP_MSG_END) {
-        LOGW("sms", "[%s] %s: END without result", s->imsi, what);
+        LOGW("sms", "[%s] %s: END without result -> RP-%u",
+             s->imsi, what, (unsigned)RP_TEMP_FAILURE);
         n = alert
-            ? gsup_build_ready_for_sm_err(s->imsi, s->sm_rp_mr, 41,
+            ? gsup_build_ready_for_sm_err(s->imsi, s->sm_rp_mr, RP_TEMP_FAILURE,
                                           gsup, sizeof(gsup))
-            : gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr, 41,
+            : gsup_build_mo_fsm_err(s->imsi, s->sm_rp_mr, RP_TEMP_FAILURE,
                                     gsup, sizeof(gsup));
         done = true;
     }
