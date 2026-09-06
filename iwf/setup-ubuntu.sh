@@ -150,9 +150,10 @@ if need_cmd apt-get; then
   fi
   $SUDO_APT apt-get update -qq
   $SUDO_APT apt-get install -y -qq build-essential pkg-config \
-    libosmocore-dev libosmo-sccp-dev libosmo-sigtran-dev
+    autoconf automake libtool libsctp-dev \
+    libosmocore-dev libosmo-netif-dev
 else
-  echo "apt-get not found; install gcc, make, and libosmo-* dev packages manually." >&2
+  echo "apt-get not found; install gcc, make, libosmocore-dev, libosmo-netif-dev, libsctp." >&2
   exit 1
 fi
 

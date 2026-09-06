@@ -84,7 +84,8 @@ make MAP_IWF_ENABLED=1 SMS_IWF_ENABLED=1
 | Path | Purpose |
 |------|---------|
 | `iwf/` | Source, `iwf.conf` example, `README.md`, `setup-ubuntu.sh` |
-| `LICENSE` | MIT-style permissive license (same as prior “bring your own” intent, now explicit) |
+| `third_party/libosmo-sigtran/` | Custom libosmo-sigtran (Huawei M3UA Network Appearance ignore). GPL-2.0. See `third_party/ORIGIN.md`. |
+| `LICENSE` | MIT-style permissive license for PrettyIWF itself (vendored Osmocom stays GPL-2.0) |
 
 ## Branches (feature history)
 

@@ -1,3 +1,7 @@
+PrettyIWF itself is MIT (below). `third_party/libosmo-sigtran` is GNU GPL
+v2; see `third_party/libosmo-sigtran/COPYING` and `third_party/ORIGIN.md`.
+A binary linked against that library is subject to GPL-2.0 terms.
+
 Copyright (c) 2025-2026 PrettyIWF contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

@@ -1,2 +1,5 @@
 # Shell scripts must use LF so Linux shebangs work (avoid bash\r errors).
 *.sh text eol=lf
+Makefile text eol=lf
+*.am text eol=lf
+*.ac text eol=lf

@@ -21,6 +21,15 @@
 #define GTP_PORT                2123
 #define IWF_MAX_PKT             4096
 #define IWF_MAX_EVENTS          64
+
+/* epoll_wait() timeout while MAP-IWF is up.  libosmo-sigtran keeps the M3UA
+ * SCTP socket on its own osmo_fd list, so inbound MAP never wakes epoll: it is
+ * only picked up by the osmo_select_main_ctx() pump at the bottom of the main
+ * loop.  This value is therefore the worst-case latency added to every inbound
+ * MAP message, and half of it is the average.  At 1000 ms a six-ISD
+ * updateLocation took ~6 s end to end, nearly all of it wake-up latency. */
+#define IWF_SS7_POLL_MS         20
+
 #define IWF_T3_RESPONSE_MS      3000   /* GTPv2-C T3 timer */
 #define IWF_N3_RETRIES          4
 #define IWF_SESSION_TIMEOUT_S   3600

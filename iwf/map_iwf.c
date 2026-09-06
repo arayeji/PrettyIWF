@@ -454,7 +454,12 @@ static void handle_begin_purge(struct iwf_runtime *rt,
 }
 
 /* CancelLocation can be SGSN-initiated too (rare; mostly HSS-initiated via
- * Diameter CLR). For inbound BEGIN CL we acknowledge promptly. */
+ * Diameter CLR). For inbound BEGIN CL we acknowledge promptly, then relay it
+ * to the serving VLR/SGSN so our state matches what we just told the HLR.
+ * TS 29.002 8.1.3 requires the VLR to delete the subscriber record; osmo-msc
+ * does that on OSMO_GSUP_MSGT_LOCATION_CANCEL_REQUEST (vlr.c
+ * vlr_subscr_handle_cancel_req -> vlr_subscr_detach).  Same relay the
+ * Diameter CLR path already uses. */
 static void handle_begin_cl(struct iwf_runtime *rt,
                             const ss7_sccp_addr_t *calling,
                             const tcap_msg_t *tmsg,
@@ -478,10 +483,38 @@ static void handle_begin_cl(struct iwf_runtime *rt,
          "[%s] RX BEGIN CL ct=%u (immediate ack)",
          s->imsi_str,
          req.cancellation_type);
-    /* No Diameter side - just acknowledge. */
+
+    /* send_tcap_end_with_result() ends the dialogue and free()s *s, so keep
+     * anything we still need on the stack. */
+    char imsi[MAP_IMSI_STR_MAX];
+    snprintf(imsi, sizeof(imsi), "%s", s->imsi_str);
+
+    /* cancelLocation over Gr (MAP_AC_GPRS_LOCATION_CANCEL_V3) targets the
+     * SGSN; locationCancellationContext over C targets the VLR. */
+    map_app_ctx_t cl_ac = MAP_AC_NETWORK_LOC_UP_V3;
+    if (tmsg->dialogue && tmsg->dialogue_len)
+        (void)map_decode_aarq_ac(tmsg->dialogue, tmsg->dialogue_len, &cl_ac);
+    uint8_t cl_cn = (cl_ac == MAP_AC_GPRS_LOCATION_CANCEL_V3)
+                        ? GSUP_CN_DOMAIN_PS : GSUP_CN_DOMAIN_CS;
+    /* MAP CancellationType is updateProcedure(0) / subscriptionWithdraw(1);
+     * GSUP is 1-based (OSMO_GSUP_CANCEL_TYPE_UPDATE=1, _WITHDRAW=2). */
+    uint8_t cl_gsup_ct = (req.cancellation_type == 1) ? 2 : 1;
+
     send_tcap_end_with_result(rt, s, s->peer_invoke_id,
                               MAP_OP_CODE_CANCEL_LOCATION, NULL, 0);
-    iwf_imsi_trace_flush_rx(s->imsi_str);
+    s = NULL;
+
+#ifdef GSUP_PROXY_ENABLED
+    if (!gsup_map_proxy_hss_clr(rt, imsi, cl_gsup_ct, cl_cn))
+        LOGW("map",
+             "[%s] CL: no GSUP LOC-CANCEL sent for cn=%s "
+             "(IMSI unknown to the proxy)",
+             imsi,
+             cl_cn == GSUP_CN_DOMAIN_CS ? "CS" : "PS");
+#else
+    (void)cl_gsup_ct; (void)cl_cn;
+#endif
+    iwf_imsi_trace_flush_rx(imsi);
 }
 
 /* ProvideRoamingNumber: allocate MSRN, bind IMSI, TCAP-End with result.

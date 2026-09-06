@@ -479,13 +479,19 @@ int main(int argc, char **argv)
              map_s, gsup_s, sms_s, sip_s);
     }
 
+    /* Inbound M3UA has no fd in our epoll set (see the pump at the bottom of
+     * this loop), so the epoll timeout is what bounds inbound MAP latency.
+     * Poll fast while MAP-IWF is up; osmo_select_main_ctx(1) is non-blocking,
+     * so an idle tick costs a single select(). */
+    const int epoll_timeout_ms = map_iwf_enabled(&rt) ? IWF_SS7_POLL_MS : 1000;
+
     while (!g_stop) {
         if (g_sighup_reload) {
             g_sighup_reload = 0;
             iwf_config_reload(&rt);
         }
         struct epoll_event events[IWF_MAX_EVENTS];
-        int n = epoll_wait(epfd, events, IWF_MAX_EVENTS, 1000);
+        int n = epoll_wait(epfd, events, IWF_MAX_EVENTS, epoll_timeout_ms);
         if (n < 0) {
             if (errno == EINTR) continue;
             LOGE("iwf", "epoll_wait: %s", strerror(errno));
