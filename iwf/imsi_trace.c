@@ -4,6 +4,9 @@
 
 #include "imsi_trace.h"
 #include "logging.h"
+#ifdef GSUP_PROXY_ENABLED
+#include "gsup_map_proxy.h"
+#endif
 
 #include <pthread.h>
 #include <stdio.h>
@@ -21,10 +24,39 @@ static struct {
 } g_filter;
 
 static struct {
-    const uint8_t *data;
-    size_t         len;
-    char           proto[32];
+    uint8_t data[IWF_IMSI_TRACE_PACKET_MAX];
+    size_t  dump_len;
+    size_t  orig_len;
+    char    proto[32];
+    int     used;
 } g_rx_bind;
+
+#define TRACE_KIND_TCAP  1
+#define TRACE_KIND_HBH   2
+#define TRACE_CORR_MAX   256
+#define TRACE_CORR_TTL   120
+#define TRACE_HOLD_MAX   32
+
+typedef struct {
+    uint8_t kind;
+    uint32_t id;
+    char    imsi[IWF_IMSI_TRACE_LEN];
+    time_t  ts;
+} trace_corr_t;
+
+typedef struct {
+    int     used;
+    uint32_t tid;
+    char    proto[32];
+    char    dir[8];
+    uint8_t pdu[IWF_IMSI_TRACE_PACKET_MAX];
+    uint16_t dump_len;
+    uint16_t orig_len;
+    time_t  ts;
+} trace_hold_t;
+
+static trace_corr_t g_corr[TRACE_CORR_MAX];
+static trace_hold_t g_hold[TRACE_HOLD_MAX];
 
 static uint32_t g_pkt_sec;
 static uint32_t g_pkt_count;
@@ -121,15 +153,140 @@ static size_t admin_fmt(char *body, size_t cap, bool ok, const char *detail)
     return off;
 }
 
+static void corr_expire(time_t now)
+{
+    int i;
+
+    for (i = 0; i < TRACE_CORR_MAX; i++) {
+        if (!g_corr[i].kind)
+            continue;
+        if (now - g_corr[i].ts > TRACE_CORR_TTL)
+            g_corr[i].kind = 0;
+    }
+}
+
+static void hold_expire(time_t now)
+{
+    int i;
+
+    for (i = 0; i < TRACE_HOLD_MAX; i++) {
+        if (!g_hold[i].used)
+            continue;
+        if (now - g_hold[i].ts > TRACE_CORR_TTL)
+            g_hold[i].used = 0;
+    }
+}
+
+static void corr_put(uint8_t kind, uint32_t id, const char *imsi)
+{
+    time_t now;
+    int i, free_i = -1, oldest = 0;
+
+    if (!id || !imsi || !imsi[0] || g_filter.count == 0)
+        return;
+    if (!iwf_imsi_trace_match(imsi))
+        return;
+
+    now = time(NULL);
+    corr_expire(now);
+    for (i = 0; i < TRACE_CORR_MAX; i++) {
+        if (g_corr[i].kind == kind && g_corr[i].id == id) {
+            snprintf(g_corr[i].imsi, sizeof(g_corr[i].imsi), "%s", imsi);
+            g_corr[i].ts = now;
+            return;
+        }
+        if (!g_corr[i].kind && free_i < 0)
+            free_i = i;
+        if (g_corr[i].kind && g_corr[i].ts < g_corr[oldest].ts)
+            oldest = i;
+    }
+    if (free_i < 0)
+        free_i = oldest;
+    g_corr[free_i].kind = kind;
+    g_corr[free_i].id = id;
+    snprintf(g_corr[free_i].imsi, sizeof(g_corr[free_i].imsi), "%s", imsi);
+    g_corr[free_i].ts = now;
+}
+
+static int corr_get(uint8_t kind, uint32_t id, char *imsi_out, size_t cap)
+{
+    int i;
+
+    if (!id || !imsi_out || cap == 0)
+        return -1;
+    imsi_out[0] = '\0';
+    corr_expire(time(NULL));
+    for (i = 0; i < TRACE_CORR_MAX; i++) {
+        if (g_corr[i].kind == kind && g_corr[i].id == id && g_corr[i].imsi[0]) {
+            snprintf(imsi_out, cap, "%s", g_corr[i].imsi);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void hold_put(uint32_t tid, const char *proto, const char *dir,
+                      const void *data, size_t len)
+{
+    time_t now;
+    int i, free_i = -1, oldest = 0;
+    size_t dump_len;
+
+    if (!tid || !data || !len || g_filter.count == 0)
+        return;
+
+    now = time(NULL);
+    hold_expire(now);
+    dump_len = len > IWF_IMSI_TRACE_PACKET_MAX ? IWF_IMSI_TRACE_PACKET_MAX : len;
+
+    for (i = 0; i < TRACE_HOLD_MAX; i++) {
+        if (g_hold[i].used && g_hold[i].tid == tid &&
+            dir && strcmp(g_hold[i].dir, dir) == 0) {
+            memcpy(g_hold[i].pdu, data, dump_len);
+            g_hold[i].dump_len = (uint16_t)dump_len;
+            g_hold[i].orig_len = (uint16_t)(len > 65535 ? 65535 : len);
+            g_hold[i].ts = now;
+            if (proto && proto[0])
+                snprintf(g_hold[i].proto, sizeof(g_hold[i].proto), "%s", proto);
+            return;
+        }
+        if (!g_hold[i].used && free_i < 0)
+            free_i = i;
+        if (g_hold[i].used && g_hold[i].ts < g_hold[oldest].ts)
+            oldest = i;
+    }
+    if (free_i < 0)
+        free_i = oldest;
+    memset(&g_hold[free_i], 0, sizeof(g_hold[free_i]));
+    g_hold[free_i].used = 1;
+    g_hold[free_i].tid = tid;
+    g_hold[free_i].dump_len = (uint16_t)dump_len;
+    g_hold[free_i].orig_len = (uint16_t)(len > 65535 ? 65535 : len);
+    g_hold[free_i].ts = now;
+    memcpy(g_hold[free_i].pdu, data, dump_len);
+    snprintf(g_hold[free_i].proto, sizeof(g_hold[free_i].proto), "%s",
+             proto && proto[0] ? proto : "-");
+    snprintf(g_hold[free_i].dir, sizeof(g_hold[free_i].dir), "%s",
+             dir && dir[0] ? dir : "-");
+}
+
+static void bind_clear(void)
+{
+    g_rx_bind.used = 0;
+    g_rx_bind.dump_len = 0;
+    g_rx_bind.orig_len = 0;
+    g_rx_bind.proto[0] = '\0';
+}
+
 void iwf_imsi_trace_init(void)
 {
     filter_lock();
     g_filter.count = 0;
     memset(g_filter.imsi, 0, sizeof(g_filter.imsi));
     filter_unlock();
-    g_rx_bind.data = NULL;
-    g_rx_bind.len = 0;
-    g_rx_bind.proto[0] = '\0';
+    bind_clear();
+    memset(g_corr, 0, sizeof(g_corr));
+    memset(g_hold, 0, sizeof(g_hold));
 }
 
 void iwf_imsi_trace_shutdown(void)
@@ -396,17 +553,18 @@ void iwf_imsi_trace_packet(const char *imsi, const char *proto, const char *dir,
 
 void iwf_imsi_trace_bind_rx(const char *proto, const void *data, size_t len)
 {
-    g_rx_bind.data = NULL;
-    g_rx_bind.len = 0;
-    g_rx_bind.proto[0] = '\0';
+    bind_clear();
 
     if (g_filter.count == 0)
         return;
     if (!data || !len)
         return;
 
-    g_rx_bind.data = (const uint8_t *)data;
-    g_rx_bind.len = len;
+    g_rx_bind.orig_len = len;
+    g_rx_bind.dump_len = len > IWF_IMSI_TRACE_PACKET_MAX
+                         ? IWF_IMSI_TRACE_PACKET_MAX : len;
+    memcpy(g_rx_bind.data, data, g_rx_bind.dump_len);
+    g_rx_bind.used = 1;
     if (proto && proto[0])
         snprintf(g_rx_bind.proto, sizeof(g_rx_bind.proto), "%s", proto);
     else
@@ -415,11 +573,124 @@ void iwf_imsi_trace_bind_rx(const char *proto, const void *data, size_t len)
 
 void iwf_imsi_trace_flush_rx(const char *imsi)
 {
-    if (!g_rx_bind.data || !g_rx_bind.len)
+    if (!g_rx_bind.used || !g_rx_bind.dump_len)
         return;
     iwf_imsi_trace_packet(imsi, g_rx_bind.proto, "rx",
-                          g_rx_bind.data, g_rx_bind.len);
-    g_rx_bind.data = NULL;
-    g_rx_bind.len = 0;
-    g_rx_bind.proto[0] = '\0';
+                          g_rx_bind.data, g_rx_bind.orig_len);
+    bind_clear();
+}
+
+void iwf_imsi_trace_drop_rx(void)
+{
+    bind_clear();
+}
+
+void iwf_imsi_trace_remember_tcap(uint32_t tid, const char *imsi)
+{
+    corr_put(TRACE_KIND_TCAP, tid, imsi);
+}
+
+void iwf_imsi_trace_remember_diam_hbh(uint32_t hbh, const char *imsi)
+{
+    corr_put(TRACE_KIND_HBH, hbh, imsi);
+}
+
+int iwf_imsi_trace_imsi_for_tcap(uint32_t tid, char *imsi_out, size_t cap)
+{
+    return corr_get(TRACE_KIND_TCAP, tid, imsi_out, cap);
+}
+
+int iwf_imsi_trace_imsi_for_diam_hbh(uint32_t hbh, char *imsi_out, size_t cap)
+{
+    return corr_get(TRACE_KIND_HBH, hbh, imsi_out, cap);
+}
+
+void iwf_imsi_trace_park_rx(uint32_t tid)
+{
+    if (!g_rx_bind.used || !g_rx_bind.dump_len)
+        return;
+    hold_put(tid, g_rx_bind.proto, "rx", g_rx_bind.data, g_rx_bind.orig_len);
+    bind_clear();
+}
+
+void iwf_imsi_trace_park_pdu(uint32_t tid, const char *proto, const char *dir,
+                             const void *data, size_t len)
+{
+    hold_put(tid, proto, dir, data, len);
+}
+
+void iwf_imsi_trace_flush_parked(uint32_t tid, const char *imsi)
+{
+    int i;
+
+    if (!tid || !imsi || !imsi[0])
+        return;
+    hold_expire(time(NULL));
+    for (i = 0; i < TRACE_HOLD_MAX; i++) {
+        if (!g_hold[i].used || g_hold[i].tid != tid)
+            continue;
+        iwf_imsi_trace_packet(imsi, g_hold[i].proto, g_hold[i].dir,
+                              g_hold[i].pdu, g_hold[i].orig_len);
+        g_hold[i].used = 0;
+    }
+    iwf_imsi_trace_remember_tcap(tid, imsi);
+}
+
+void iwf_imsi_trace_finish_rx(uint32_t dtid, bool have_dtid,
+                               uint32_t otid, bool have_otid,
+                               const char *imsi)
+{
+    char buf[IWF_IMSI_TRACE_LEN];
+    const char *use = imsi;
+
+    buf[0] = '\0';
+    if ((!use || !use[0]) && have_dtid &&
+        iwf_imsi_trace_imsi_for_tcap(dtid, buf, sizeof(buf)) == 0)
+        use = buf;
+    if ((!use || !use[0]) && have_otid &&
+        iwf_imsi_trace_imsi_for_tcap(otid, buf, sizeof(buf)) == 0)
+        use = buf;
+
+    if (use && use[0]) {
+        iwf_imsi_trace_flush_rx(use);
+        if (have_dtid)
+            iwf_imsi_trace_flush_parked(dtid, use);
+        if (have_otid)
+            iwf_imsi_trace_flush_parked(otid, use);
+        iwf_imsi_trace_drop_rx();
+        return;
+    }
+
+    if (have_dtid)
+        iwf_imsi_trace_park_rx(dtid);
+    else if (have_otid)
+        iwf_imsi_trace_park_rx(otid);
+    else
+        iwf_imsi_trace_drop_rx();
+}
+
+int iwf_imsi_trace_imsi_for_msisdn(const char *msisdn,
+                                    char *imsi_out, size_t cap)
+{
+    if (!imsi_out || cap == 0)
+        return -1;
+    imsi_out[0] = '\0';
+#ifdef GSUP_PROXY_ENABLED
+    if (gsup_map_proxy_imsi_for_msisdn(msisdn, imsi_out, cap) == 0 &&
+        imsi_out[0])
+        return 0;
+#else
+    (void)msisdn;
+#endif
+    return -1;
+}
+
+void iwf_imsi_trace_packet_msisdn(const char *msisdn, const char *proto,
+                                  const char *dir, const void *data, size_t len)
+{
+    char imsi[IWF_IMSI_TRACE_LEN];
+
+    if (iwf_imsi_trace_imsi_for_msisdn(msisdn, imsi, sizeof(imsi)) != 0)
+        return;
+    iwf_imsi_trace_packet(imsi, proto, dir, data, len);
 }

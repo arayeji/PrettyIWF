@@ -10,6 +10,7 @@
 #include "config.h"
 #include "runtime.h"
 #include "logging.h"
+#include "imsi_trace.h"
 
 #include <string.h>
 #include <time.h>
@@ -39,6 +40,7 @@ typedef struct {
     ic_state_t  st;
     time_t      t0;
     int         rel_sent;
+    char        imsi[16];
 } isup_leg_t;
 
 static isup_leg_t g_leg[ISUP_CALL_MAX];
@@ -107,6 +109,20 @@ static void log_msg(const char *dir, uint32_t sip_id, uint16_t cic,
         LOGI("isup", "%s %s cic=%u id=%u opc=0x%x dpc=0x%x",
              dir, isup_msg_name(type), (unsigned)cic, sip_id,
              (unsigned)opc, (unsigned)dpc);
+}
+
+static void isup_note_msisdn(isup_leg_t *l, const char *digits)
+{
+    if (!l || l->imsi[0] || !digits || !digits[0])
+        return;
+    (void)iwf_imsi_trace_imsi_for_msisdn(digits, l->imsi, sizeof(l->imsi));
+}
+
+static void isup_trace(const isup_leg_t *l, const char *dir,
+                       const void *msu, size_t len)
+{
+    if (l && l->imsi[0])
+        iwf_imsi_trace_packet(l->imsi, "isup", dir, msu, len);
 }
 
 int isup_call_init(struct iwf_runtime *rt)
@@ -184,6 +200,9 @@ int isup_call_originate(struct iwf_runtime *rt, uint32_t sip_id,
         leg_free(l);
         return -1;
     }
+    isup_note_msisdn(l, called);
+    isup_note_msisdn(l, calling);
+    isup_trace(l, "tx", msu, (size_t)n);
     log_msg("TX", sip_id, (uint16_t)cic, ISUP_MT_IAM, 0, 0, 0);
     if (!rtp_ip[0])
         LOGW("isup", "id=%u cic=%d IAM without RTP map "
@@ -200,6 +219,7 @@ void isup_call_release(uint32_t sip_id, uint8_t cause)
     int n = isup_enc_rel(msu, sizeof(msu), l->cic, cause ? cause : 16);
     if (n > 0) {
         tx_msu(g_rt, msu, (size_t)n);
+        isup_trace(l, "tx", msu, (size_t)n);
         log_msg("TX", sip_id, l->cic, ISUP_MT_REL, 0, 0, cause);
     }
     l->rel_sent = 1;
@@ -239,7 +259,10 @@ static void on_rel_far(struct iwf_runtime *rt, isup_leg_t *l, uint8_t cause)
 {
     uint8_t msu[8];
     int n = isup_enc_rlc(msu, sizeof(msu), l->cic);
-    if (n > 0) tx_msu(rt, msu, (size_t)n);
+    if (n > 0) {
+        tx_msu(rt, msu, (size_t)n);
+        isup_trace(l, "tx", msu, (size_t)n);
+    }
     log_msg("TX", l->sip_id, l->cic, ISUP_MT_RLC, 0, 0, 0);
     int sip = isup_cause_to_sip(cause);
     uint32_t sid = l->sip_id;
@@ -262,6 +285,15 @@ void isup_call_rx(struct iwf_runtime *rt, uint32_t opc, uint32_t dpc,
     uint32_t sid = l ? l->sip_id : isup_cic_sip_id(m.cic);
     log_msg("RX", sid, m.cic, m.type, opc, dpc,
             m.have_cause ? m.cause : 0);
+    isup_trace(l, "rx", msu, len);
+    if (!l || !l->imsi[0]) {
+        if (m.have_called && m.called.digits[0])
+            iwf_imsi_trace_packet_msisdn(m.called.digits, "isup", "rx",
+                                         msu, len);
+        if (m.have_calling && m.calling.digits[0])
+            iwf_imsi_trace_packet_msisdn(m.calling.digits, "isup", "rx",
+                                         msu, len);
+    }
     (void)dpc;
 
     switch (m.type) {

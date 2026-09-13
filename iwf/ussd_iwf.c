@@ -10,10 +10,12 @@
 #include "runtime.h"
 #include "config.h"
 #include "logging.h"
+#include "imsi_trace.h"
 #include "uthash.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <time.h>
 
 #define USSD_DIR_MO      1   /* our MSC -> partner HLR  */
@@ -48,6 +50,27 @@ static ussd_session_t *ussd_find(uint32_t otid)
     ussd_session_t *s = NULL;
     HASH_FIND(hh, g_sessions, &otid, sizeof(otid), s);
     return s;
+}
+
+int ussd_iwf_imsi_for_tcap(uint32_t tid, char *imsi_out, size_t cap)
+{
+    ussd_session_t *s, *tmp;
+
+    if (!tid || !imsi_out || cap == 0)
+        return -1;
+    imsi_out[0] = '\0';
+    s = ussd_find(tid);
+    if (s && s->imsi[0]) {
+        snprintf(imsi_out, cap, "%s", s->imsi);
+        return 0;
+    }
+    HASH_ITER(hh, g_sessions, s, tmp) {
+        if (s->have_peer_otid && s->peer_otid == tid && s->imsi[0]) {
+            snprintf(imsi_out, cap, "%s", s->imsi);
+            return 0;
+        }
+    }
+    return -1;
 }
 
 static ussd_session_t *ussd_find_gsup(uint32_t session_id, const char *imsi)
@@ -98,9 +121,17 @@ static int ussd_tx_tcap(struct iwf_runtime *rt, ussd_session_t *s,
     if (n < 0) return -1;
     ss7_sccp_addr_t calling;
     ussd_local_calling(rt, NULL, &calling);
-    return ss7_link_send_tcap_ex(rt, &s->peer_addr,
-                                 calling.have_gt ? &calling : NULL,
-                                 out, (size_t)n);
+    if (ss7_link_send_tcap_ex(rt, &s->peer_addr,
+                              calling.have_gt ? &calling : NULL,
+                              out, (size_t)n) < 0)
+        return -1;
+    if (s->imsi[0]) {
+        iwf_imsi_trace_packet(s->imsi, "map", "tx", out, (size_t)n);
+        iwf_imsi_trace_remember_tcap(s->otid, s->imsi);
+        if (s->have_peer_otid)
+            iwf_imsi_trace_remember_tcap(s->peer_otid, s->imsi);
+    }
+    return 0;
 }
 
 /* TCAP END with returnError toward the partner (NI failure paths). */

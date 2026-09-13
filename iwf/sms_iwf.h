@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "ss7_link.h"
 #include "tcap.h"
@@ -51,5 +52,7 @@ void sms_iwf_on_smpp_conn_readable(void);
 void sms_iwf_on_gsup_readable(void);
 void sms_iwf_on_gsup_keepalive(void);
 void sms_iwf_on_timer(void);
+
+int  sms_iwf_imsi_for_tcap(uint32_t tid, char *imsi_out, size_t cap);
 
 #endif /* IWF_SMS_IWF_H */

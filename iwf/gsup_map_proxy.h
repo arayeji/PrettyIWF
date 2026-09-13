@@ -68,6 +68,9 @@ void gsup_map_proxy_note_msisdn(const char *imsi, const char *msisdn);
 int gsup_map_proxy_imsi_for_msisdn(const char *msisdn,
                                    char *imsi_out, size_t cap);
 
+/* Reverse lookup: TCAP transaction id of a GSUP-originated MAP dialogue. */
+int gsup_map_proxy_imsi_for_tcap(uint32_t tid, char *imsi_out, size_t cap);
+
 /* HSS IDR(URRP-MME): report UE reachability via S6a NOR. */
 void gsup_map_proxy_on_urrp(struct iwf_runtime *rt, const char *imsi,
                             const char *diam_origin_host);

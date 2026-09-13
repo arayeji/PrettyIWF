@@ -53,8 +53,38 @@ int iwf_imsi_trace_admin(const iwf_imsi_trace_query_t *q,
 void iwf_imsi_trace_packet(const char *imsi, const char *proto, const char *dir,
                            const void *data, size_t len);
 
-/* Defer RX trace until IMSI is known (BEGIN decode or session lookup). */
+/* Defer RX trace until IMSI is known (BEGIN decode, MSISDN lookup, or
+ * TCAP/Diameter correlation of an answer that carries no IMSI). The bind
+ * copies the PDU so it still works if the handler returns before flush. */
 void iwf_imsi_trace_bind_rx(const char *proto, const void *data, size_t len);
 void iwf_imsi_trace_flush_rx(const char *imsi);
+void iwf_imsi_trace_drop_rx(void);
+
+/* Remember a TCAP transaction id or Diameter hop-by-hop id for a traced
+ * IMSI so later answers (result/error, AIA, …) still attach to the filter. */
+void iwf_imsi_trace_remember_tcap(uint32_t tid, const char *imsi);
+void iwf_imsi_trace_remember_diam_hbh(uint32_t hbh, const char *imsi);
+int  iwf_imsi_trace_imsi_for_tcap(uint32_t tid, char *imsi_out, size_t cap);
+int  iwf_imsi_trace_imsi_for_diam_hbh(uint32_t hbh, char *imsi_out, size_t cap);
+
+/* Park the current RX bind (or an outbound PDU) under a TCAP tid when IMSI
+ * is not known yet (SRI-SM waiting on GSUP, outbound SRI-SM, …). */
+void iwf_imsi_trace_park_rx(uint32_t tid);
+void iwf_imsi_trace_park_pdu(uint32_t tid, const char *proto, const char *dir,
+                             const void *data, size_t len);
+void iwf_imsi_trace_flush_parked(uint32_t tid, const char *imsi);
+
+/* Finish an RX: emit bind/parked PDUs if imsi is known or correlated,
+ * otherwise park under dtid/otid. */
+void iwf_imsi_trace_finish_rx(uint32_t dtid, bool have_dtid,
+                               uint32_t otid, bool have_otid,
+                               const char *imsi);
+
+/* MSISDN-only packets (SIP INVITE, ISUP IAM, CAP IDP, SMPP). Resolves
+ * through the same map/HSS lookup as SRI. No-op when unknown. */
+int  iwf_imsi_trace_imsi_for_msisdn(const char *msisdn,
+                                    char *imsi_out, size_t cap);
+void iwf_imsi_trace_packet_msisdn(const char *msisdn, const char *proto,
+                                  const char *dir, const void *data, size_t len);
 
 #endif /* IWF_IMSI_TRACE_H */

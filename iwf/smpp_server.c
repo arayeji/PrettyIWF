@@ -4,7 +4,9 @@
 
 #include "smpp_server.h"
 #include "logging.h"
+#include "imsi_trace.h"
 
+#include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +40,50 @@ static char g_password[64];
 static uint8_t g_rx[SMPP_RX_CAP];
 static size_t g_rx_used = 0;
 static bool g_bound = false;
+
+#define SMPP_SEQ_MAX 16
+static struct {
+    uint32_t seq;
+    char     imsi[16];
+    int      used;
+} g_smpp_seq[SMPP_SEQ_MAX];
+
+static void smpp_note_seq(uint32_t seq, const char *imsi)
+{
+    int i, slot = 0;
+    if (!seq || !imsi || !imsi[0])
+        return;
+    for (i = 0; i < SMPP_SEQ_MAX; i++) {
+        if (g_smpp_seq[i].used && g_smpp_seq[i].seq == seq) {
+            snprintf(g_smpp_seq[i].imsi, sizeof(g_smpp_seq[i].imsi), "%s",
+                     imsi);
+            return;
+        }
+        if (!g_smpp_seq[i].used)
+            slot = i;
+    }
+    g_smpp_seq[slot].used = 1;
+    g_smpp_seq[slot].seq = seq;
+    snprintf(g_smpp_seq[slot].imsi, sizeof(g_smpp_seq[slot].imsi), "%s", imsi);
+}
+
+static const char *smpp_imsi_for_seq(uint32_t seq)
+{
+    int i;
+    for (i = 0; i < SMPP_SEQ_MAX; i++)
+        if (g_smpp_seq[i].used && g_smpp_seq[i].seq == seq)
+            return g_smpp_seq[i].imsi;
+    return NULL;
+}
+
+static void smpp_trace_msisdn(const char *msisdn, const char *dir,
+                               const uint8_t *pdu, size_t len)
+{
+    char imsi[16];
+    if (iwf_imsi_trace_imsi_for_msisdn(msisdn, imsi, sizeof(imsi)) != 0)
+        return;
+    iwf_imsi_trace_packet(imsi, "smpp", dir, pdu, len);
+}
 
 static void (*g_disconnect_cb)(void) = NULL;
 static void (*g_submit_cb)(uint32_t, const char *, uint8_t, uint8_t,
@@ -81,7 +127,22 @@ static int smpp_send_pdu(uint32_t cmd_id, uint32_t status, uint32_t seq,
     iov[1].iov_base = (void *)body;
     iov[1].iov_len = body_len;
     ssize_t w = writev(g_conn_fd, iov, body ? 2 : 1);
-    return (w >= 0) ? 0 : -1;
+    if (w < 0)
+        return -1;
+    if (cmd_id == SMPP_CMD_SUBMIT_SM_RESP) {
+        const char *imsi = smpp_imsi_for_seq(seq);
+        if (imsi && imsi[0]) {
+            uint8_t pkt[SMPP_HDR_LEN + 8];
+            size_t n = SMPP_HDR_LEN + body_len;
+            if (n <= sizeof(pkt)) {
+                memcpy(pkt, hdr, SMPP_HDR_LEN);
+                if (body && body_len)
+                    memcpy(pkt + SMPP_HDR_LEN, body, body_len);
+                iwf_imsi_trace_packet(imsi, "smpp", "tx", pkt, n);
+            }
+        }
+    }
+    return 0;
 }
 
 int smpp_server_send_submit_resp(uint32_t seq, uint32_t status)
@@ -176,8 +237,28 @@ static void dispatch_pdu(const uint8_t *pdu, size_t pdu_len)
     case SMPP_CMD_SUBMIT_SM:
         if (!g_bound)
             smpp_server_send_submit_resp(seq, SMPP_ESME_RSUBMITFAIL);
-        else
+        else {
+            size_t off = 0;
+            char imsi[16];
+            (void)read_cstr(body, blen, &off);
+            if (off + 6 <= blen) {
+                off += 2;
+                const char *src = read_cstr(body, blen, &off);
+                if (src && off + 2 <= blen) {
+                    off += 2;
+                    const char *dst = read_cstr(body, blen, &off);
+                    smpp_trace_msisdn(dst, "rx", pdu, pdu_len);
+                    smpp_trace_msisdn(src, "rx", pdu, pdu_len);
+                    if (iwf_imsi_trace_imsi_for_msisdn(dst, imsi,
+                                                       sizeof(imsi)) == 0)
+                        smpp_note_seq(seq, imsi);
+                    else if (iwf_imsi_trace_imsi_for_msisdn(src, imsi,
+                                                            sizeof(imsi)) == 0)
+                        smpp_note_seq(seq, imsi);
+                }
+            }
             handle_submit_sm(seq, body, blen);
+        }
         break;
     case SMPP_CMD_ENQUIRE_LINK:
         smpp_send_pdu(SMPP_CMD_ENQUIRE_LINK_RESP, SMPP_ESME_ROK, seq, NULL, 0);

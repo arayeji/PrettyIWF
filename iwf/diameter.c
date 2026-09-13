@@ -642,8 +642,12 @@ static int diameter_tx_session(struct iwf_runtime *rt, map_session_t *s,
     int rc = diameter_tx(p, pkt, off);
     if (rc == 0) {
         rt->map->stat_diam_tx++;
-        if (s && s->imsi_str[0])
+        if (s && s->imsi_str[0]) {
             iwf_imsi_trace_packet(s->imsi_str, "diameter", "tx", pkt, off);
+            if (s->diameter_hop_by_hop)
+                iwf_imsi_trace_remember_diam_hbh(s->diameter_hop_by_hop,
+                                                 s->imsi_str);
+        }
     }
     return rc;
 }
@@ -1419,11 +1423,21 @@ static void dispatch_message(struct iwf_runtime *rt, int peer_idx,
     }
     {
         char sid[DIAMETER_SESSION_ID_MAX];
+        char imsi[MAP_IMSI_STR_MAX];
+        map_session_t *ts;
+
         sid[0] = '\0';
+        imsi[0] = '\0';
         diameter_get_session_id(body, body_len, sid, sizeof(sid));
-        map_session_t *ts = map_sess_find_by_diameter_sid(sid);
+        ts = map_sess_find_by_diameter_sid(sid);
+        if (!ts)
+            ts = map_sess_find_by_diam_hbh(hbh);
         if (ts && ts->imsi_str[0])
-            iwf_imsi_trace_packet(ts->imsi_str, "diameter", "rx", pkt, len);
+            snprintf(imsi, sizeof(imsi), "%s", ts->imsi_str);
+        else
+            (void)iwf_imsi_trace_imsi_for_diam_hbh(hbh, imsi, sizeof(imsi));
+        if (imsi[0])
+            iwf_imsi_trace_packet(imsi, "diameter", "rx", pkt, len);
     }
     on_answer(rt, cmd_code, body, body_len);
 }

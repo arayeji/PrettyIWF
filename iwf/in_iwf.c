@@ -10,6 +10,7 @@
 #include "logging.h"
 #include "tcap.h"
 #include "map_codec.h"
+#include "imsi_trace.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -210,6 +211,14 @@ static int send_idp(struct iwf_runtime *rt, in_pend_t *p,
     if (ss7_link_send_tcap_ex(rt, &called_a, &calling_a,
                                tcap, (size_t)n) < 0)
         return -1;
+    {
+        char imsi[IWF_IMSI_TRACE_LEN];
+        iwf_imsi_trace_packet_msisdn(called, "map", "tx", tcap, (size_t)n);
+        iwf_imsi_trace_packet_msisdn(calling, "map", "tx", tcap, (size_t)n);
+        if (iwf_imsi_trace_imsi_for_msisdn(called, imsi, sizeof(imsi)) == 0 ||
+            iwf_imsi_trace_imsi_for_msisdn(calling, imsi, sizeof(imsi)) == 0)
+            iwf_imsi_trace_remember_tcap(p->otid, imsi);
+    }
     LOGI("in", "id=%u TX InitialDP mode=%s scp=%s ssn=%u otid=%u called=%s",
          p->sip_id, in_iwf_mode_name(p->mode), rt->cfg.in_scp_gt,
          (unsigned)ssn, p->otid, called ? called : "-");
@@ -251,6 +260,7 @@ static int send_sip_as(struct iwf_runtime *rt, in_pend_t *p,
         p->sip_callid);
     if (n < 0 || sip_iwf_send_raw(&to, msg, (size_t)n) < 0)
         return -1;
+    iwf_imsi_trace_packet_msisdn(called, "sip", "tx", msg, (size_t)n);
     LOGI("in", "id=%u TX INVITE sip_as=%s callid=%s",
          p->sip_id, rt->cfg.in_sip_as, p->sip_callid);
     return 0;

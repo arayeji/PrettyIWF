@@ -212,7 +212,173 @@ struct ss7_impl_ctx {
     uint32_t               stp_dpc;               /* packed [stp] remote_pc (MTP routes) */
     uint8_t                network_indicator;    /* [stp] network_indicator for MTP SIO */
     int                    sccp_ri;               /* IWF_SCCP_RI_GT or IWF_SCCP_RI_SSN */
+    osmo_prim_cb           sccp_mtp_orig_cb;     /* libosmo SCCP MTP user, before wrap */
 };
+
+/* libosmo-sigtran struct osmo_ss7_user (ss7_user.h): inst, name, prim_cb, priv.
+ * Used only to save the SCCP MTP callback; name/priv are sanity-checked. */
+struct iwf_osmo_ss7_user_layout {
+    struct osmo_ss7_instance *inst;
+    const char *name;
+    osmo_prim_cb prim_cb;
+    void *priv;
+};
+
+static struct ss7_impl_ctx *g_sccp_mtp_wrap_ctx;
+
+/* Q.713 pointer: first octet of the parameter is at ptr_field + *ptr_field. */
+static uint8_t *iwf_sccp_ptr_target(uint8_t *sccp, size_t len, uint8_t *ptr_field)
+{
+    size_t off;
+
+    if (!sccp || !ptr_field || ptr_field < sccp)
+        return NULL;
+    off = (size_t)(ptr_field - sccp);
+    if (off >= len || *ptr_field == 0)
+        return NULL;
+    off += *ptr_field;
+    if (off >= len)
+        return NULL;
+    return sccp + off;
+}
+
+/* Partners (MCI) put their PC in CdPA alongside our GT.  MTP DPC is already
+ * local, but libosmo SCRC treats a foreign CdPA PC as the GTT result and
+ * MTP-TRANSFERs the same UDT back toward that PC (bit-identical bounce).
+ * Strip the PC and force RI=SSN so the bound SSN user gets N-UNITDATA.ind. */
+static int iwf_sccp_cl_strip_foreign_cdpa_pc(uint8_t *sccp, size_t *len,
+                                            uint8_t *ptr_called,
+                                            uint8_t **other_ptrs, int n_other,
+                                            struct osmo_ss7_instance *ss7)
+{
+    uint8_t *lenp, *addr, *after_pc;
+    uint8_t alen, ai;
+    uint32_t pc;
+    size_t removed_at, tail_n;
+    int i;
+
+    if (!sccp || !len || !ptr_called || !ss7)
+        return 0;
+    lenp = iwf_sccp_ptr_target(sccp, *len, ptr_called);
+    if (!lenp)
+        return 0;
+    alen = *lenp;
+    if ((size_t)(lenp - sccp) + 1u + alen > *len || alen < 3)
+        return 0;
+    addr = lenp + 1;
+    ai = addr[0];
+    if (!(ai & 0x01))
+        return 0; /* PCI=0 already */
+    pc = (uint32_t)addr[1] | ((uint32_t)(addr[2] & 0x3f) << 8);
+    if (osmo_ss7_pc_is_local(ss7, pc))
+        return 0;
+
+    after_pc = addr + 3;
+    tail_n = (sccp + *len) - after_pc;
+    memmove(addr + 1, after_pc, tail_n);
+    *lenp = (uint8_t)(alen - 2);
+    /* RI=SSN, PCI=0; keep SSN/GTI so node_6 can bind the user. */
+    addr[0] = (uint8_t)((ai | 0x40) & (uint8_t)~0x01);
+
+    removed_at = (size_t)((addr + 1) - sccp);
+    for (i = 0; i < n_other; i++) {
+        size_t tgt;
+
+        if (!other_ptrs[i] || *other_ptrs[i] == 0)
+            continue;
+        tgt = (size_t)(other_ptrs[i] - sccp) + *other_ptrs[i];
+        if (tgt > removed_at && *other_ptrs[i] >= 2)
+            *other_ptrs[i] -= 2;
+    }
+    *len -= 2;
+    LOGI("ss7",
+         "inbound SCCP CdPA dropped foreign PC=%s; RI=SSN (MTP DPC is local)",
+         osmo_ss7_pointcode_print(ss7, pc));
+    return 1;
+}
+
+static void iwf_sccp_msg_strip_foreign_cdpa_pc(struct msgb *msg,
+                                              struct osmo_ss7_instance *ss7)
+{
+    uint8_t *sccp;
+    size_t len, orig;
+    uint8_t *others[3];
+    int n;
+
+    if (!msg || !ss7)
+        return;
+    sccp = msgb_l2(msg);
+    len = msgb_l2len(msg);
+    if (!sccp) {
+        sccp = msgb_data(msg);
+        len = msgb_length(msg);
+    }
+    if (!sccp || len < 5)
+        return;
+    orig = len;
+    n = 0;
+    switch (sccp[0]) {
+    case SCCP_MSG_TYPE_UDT:
+    case SCCP_MSG_TYPE_UDTS:
+        others[n++] = sccp + 3;
+        others[n++] = sccp + 4;
+        iwf_sccp_cl_strip_foreign_cdpa_pc(sccp, &len, sccp + 2, others, n, ss7);
+        break;
+    case SCCP_MSG_TYPE_XUDT:
+    case SCCP_MSG_TYPE_XUDTS:
+        if (len < 7)
+            return;
+        others[n++] = sccp + 4;
+        others[n++] = sccp + 5;
+        others[n++] = sccp + 6;
+        iwf_sccp_cl_strip_foreign_cdpa_pc(sccp, &len, sccp + 3, others, n, ss7);
+        break;
+    default:
+        return;
+    }
+    if (len < orig && msg->tail >= msg->data + (orig - len))
+        msg->tail -= (orig - len);
+}
+
+static int iwf_sccp_mtp_wrap(struct osmo_prim_hdr *oph, void *priv)
+{
+    struct ss7_impl_ctx *ctx = g_sccp_mtp_wrap_ctx;
+
+    if (ctx && ctx->ss7 && oph &&
+        oph->primitive == OSMO_MTP_PRIM_TRANSFER &&
+        oph->operation == PRIM_OP_INDICATION && oph->msg) {
+        struct osmo_mtp_prim *omp = (struct osmo_mtp_prim *)oph;
+        if (osmo_ss7_pc_is_local(ctx->ss7, omp->u.transfer.dpc))
+            iwf_sccp_msg_strip_foreign_cdpa_pc(oph->msg, ctx->ss7);
+    }
+    if (!ctx || !ctx->sccp_mtp_orig_cb)
+        return 0;
+    return ctx->sccp_mtp_orig_cb(oph, priv);
+}
+
+static void iwf_ss7_wrap_sccp_mtp(struct ss7_impl_ctx *ctx)
+{
+    struct osmo_ss7_user *mtp_user;
+    struct iwf_osmo_ss7_user_layout *u;
+
+    if (!ctx || !ctx->ss7 || !ctx->sccp)
+        return;
+    mtp_user = osmo_ss7_user_find_by_si(ctx->ss7, MTP_SI_SCCP);
+    if (!mtp_user) {
+        LOGW("ss7", "no MTP user for SI=SCCP; cannot wrap inbound CdPA rewrite");
+        return;
+    }
+    u = (struct iwf_osmo_ss7_user_layout *)mtp_user;
+    if (u->priv != (void *)ctx->sccp || !u->prim_cb ||
+        !u->name || strcmp(u->name, "SCCP") != 0) {
+        LOGW("ss7", "SCCP MTP user layout unexpected — inbound CdPA rewrite disabled");
+        return;
+    }
+    ctx->sccp_mtp_orig_cb = u->prim_cb;
+    g_sccp_mtp_wrap_ctx = ctx;
+    osmo_ss7_user_set_prim_cb(mtp_user, iwf_sccp_mtp_wrap);
+    LOGI("ss7", "wrapped SCCP MTP user: inbound UDT/XUDT with foreign CdPA PC is delivered locally");
+}
 
 static int isup_mtp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
 {
@@ -680,6 +846,8 @@ int ss7_link_init(struct iwf_runtime *rt)
     /* osmo_sccp_user has its own priv pointer for the prim cb. */
     osmo_sccp_user_set_priv(ctx->user, rt);
 
+    iwf_ss7_wrap_sccp_mtp(ctx);
+
     ctx->isup_user = osmo_ss7_user_create(ctx->ss7, "iwf-bicc");
     if (ctx->isup_user) {
         osmo_ss7_user_set_prim_cb(ctx->isup_user, isup_mtp_prim_cb);
@@ -925,9 +1093,10 @@ static int ss7_tx_unitdata(struct ss7_impl_ctx *ctx,
      *   - Forcing RI=SSN (allstp1248): a roaming partner HLR never answered our
      *     outbound UL — with route-on-SSN and PCI=0 their STP has no route
      *     back to us; inter-operator replies need GTT on our GT (RI=GT).
-     *   - Inbound replies whose CdPA is our GT with RI=GT ARE delivered to
-     *     the bound SSN user (allstp1247: ISD ack RI=GT → UL End sent), so
-     *     no RI trickery is needed on the calling side. */
+     *   - Inbound replies whose CdPA is our GT with RI=GT and PCI=0 are
+     *     delivered to the bound SSN user (ISD ack → UL End).  Replies that
+     *     also embed a foreign PC in CdPA are rewritten in iwf_sccp_mtp_wrap
+     *     (otherwise libosmo SCRC MTP-transfers them back to that PC). */
     calling_addr.pc = 0;
     calling_addr.presence &= ~OSMO_SCCP_ADDR_T_PC;
     if (calling && calling->have_gt)
@@ -969,6 +1138,8 @@ void ss7_link_shutdown(struct iwf_runtime *rt)
     if (!rt || !rt->map) return;
     struct ss7_impl_ctx *ctx = (struct ss7_impl_ctx *)rt->map->ss7.opaque;
     if (!ctx) return;
+    if (g_sccp_mtp_wrap_ctx == ctx)
+        g_sccp_mtp_wrap_ctx = NULL;
     if (ctx->user)  osmo_sccp_user_unbind(ctx->user);
     for (int i = 0; i < ctx->n_user_extra; i++) {
         if (ctx->user_extra[i])

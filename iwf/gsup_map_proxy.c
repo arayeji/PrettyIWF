@@ -377,6 +377,7 @@ static gsup_pending_t *pending_add(uint32_t tid, int conn_id, map_op_t op,
     if (src_gt && src_gt[0])
         strncpy(p->src_gt, src_gt, sizeof(p->src_gt) - 1);
     HASH_ADD(hh, g_pending, tcap_tid, sizeof(p->tcap_tid), p);
+    iwf_imsi_trace_remember_tcap(tid, imsi);
     return p;
 }
 
@@ -569,6 +570,7 @@ static int send_map_to_hlr(gsup_route_t *route, map_op_t op,
         return -1;
 
     iwf_imsi_trace_packet(route->imsi, "map", "tx", out, (size_t)n);
+    iwf_imsi_trace_remember_tcap(tid, route->imsi);
 
     if (!pending_add(tid, conn_id, op, route->imsi, route->src_gt, cn_domain))
         return -1;
@@ -1371,9 +1373,38 @@ static int map_pending_send_isd_rr(gsup_pending_t *p, uint8_t inv_id)
         ss7_link_make_local_addr(g_rt, &calling);
     calling.ssn = ssn;
 
-    return ss7_link_send_tcap_ex(g_rt, &p->peer_addr,
-                                 calling.have_gt ? &calling : NULL,
-                                 out, (size_t)n);
+    if (ss7_link_send_tcap_ex(g_rt, &p->peer_addr,
+                              calling.have_gt ? &calling : NULL,
+                              out, (size_t)n) < 0)
+        return -1;
+    if (p->imsi[0]) {
+        iwf_imsi_trace_packet(p->imsi, "map", "tx", out, (size_t)n);
+        iwf_imsi_trace_remember_tcap(p->tcap_tid, p->imsi);
+        if (p->have_peer_otid)
+            iwf_imsi_trace_remember_tcap(p->peer_otid, p->imsi);
+    }
+    return 0;
+}
+
+int gsup_map_proxy_imsi_for_tcap(uint32_t tid, char *imsi_out, size_t cap)
+{
+    gsup_pending_t *p, *tmp;
+
+    if (!tid || !imsi_out || cap == 0)
+        return -1;
+    imsi_out[0] = '\0';
+    p = pending_find(tid);
+    if (p && p->imsi[0]) {
+        snprintf(imsi_out, cap, "%s", p->imsi);
+        return 0;
+    }
+    HASH_ITER(hh, g_pending, p, tmp) {
+        if (p->have_peer_otid && p->peer_otid == tid && p->imsi[0]) {
+            snprintf(imsi_out, cap, "%s", p->imsi);
+            return 0;
+        }
+    }
+    return -1;
 }
 
 /* After MSC ISD_RES: ReturnResult ISD toward HLR, keep dialogue open for UL Res. */

@@ -10,6 +10,7 @@
 #include "map_iwf.h"
 #include "isup_call.h"
 #include "in_iwf.h"
+#include "imsi_trace.h"
 #ifdef GSUP_PROXY_ENABLED
 #  include "msisdn_db.h"
 #  include "gsup_map_proxy.h"
@@ -444,6 +445,15 @@ static int sip_send_bytes(int fd, const struct sockaddr_in *to,
     return 0;
 }
 
+static void sip_trace(const sip_call_t *c, const char *dir,
+                      const void *data, size_t len)
+{
+    if (c && c->imsi[0])
+        iwf_imsi_trace_packet(c->imsi, "sip", dir, data, len);
+    else if (c && c->msisdn[0])
+        iwf_imsi_trace_packet_msisdn(c->msisdn, "sip", dir, data, len);
+}
+
 static int sip_north_fd(const sip_call_t *c)
 {
     if (c->north_tcp >= 0 && c->north_tcp < SIP_EPOLL_TCP_MAX &&
@@ -455,15 +465,24 @@ static int sip_north_fd(const sip_call_t *c)
 static int sip_send_north(const sip_call_t *c, const char *buf, size_t len)
 {
     int fd = sip_north_fd(c);
+    int rc;
     if (c->north_tcp >= 0)
-        return sip_send_bytes(fd, NULL, buf, len);
-    return sip_send_bytes(fd, &c->north_addr, buf, len);
+        rc = sip_send_bytes(fd, NULL, buf, len);
+    else
+        rc = sip_send_bytes(fd, &c->north_addr, buf, len);
+    if (rc == 0)
+        sip_trace(c, "tx", buf, len);
+    return rc;
 }
 
 static int sip_send_south(const sip_call_t *c, const char *buf, size_t len)
 {
+    int rc;
     if (g_sip.udp_fd < 0) return -1;
-    return sip_send_bytes(g_sip.udp_fd, &c->south_addr, buf, len);
+    rc = sip_send_bytes(g_sip.udp_fd, &c->south_addr, buf, len);
+    if (rc == 0)
+        sip_trace(c, "tx", buf, len);
+    return rc;
 }
 
 static void sip_reply_ex(const sip_call_t *c, int code, const char *body,
@@ -1180,6 +1199,23 @@ static void sip_dispatch(struct iwf_runtime *rt, const char *raw, size_t len,
          from ? inet_ntoa(from->sin_addr) : "-",
          from ? ntohs(from->sin_port) : 0,
          m.callid);
+
+    {
+        sip_call_t *tc = sip_find_north(m.callid);
+        if (!tc)
+            tc = sip_find_south(m.callid);
+        if (tc)
+            sip_trace(tc, "rx", raw, len);
+        else if (m.is_req && !strcasecmp(m.method, "INVITE")) {
+            char msisdn[24];
+            sip_msisdn_from_uri(m.ruri, msisdn, sizeof(msisdn));
+            if (msisdn[0])
+                iwf_imsi_trace_packet_msisdn(msisdn, "sip", "rx", raw, len);
+            sip_msisdn_from_uri(m.from, msisdn, sizeof(msisdn));
+            if (msisdn[0])
+                iwf_imsi_trace_packet_msisdn(msisdn, "sip", "rx", raw, len);
+        }
+    }
 
     if (!m.is_req) {
         sip_call_t *c = sip_find_south(m.callid);

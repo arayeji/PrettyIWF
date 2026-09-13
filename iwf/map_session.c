@@ -93,6 +93,19 @@ map_session_t *map_sess_find_by_tid(uint32_t tid)
     return s;
 }
 
+map_session_t *map_sess_find_by_peer_tid(uint32_t peer_tid)
+{
+    map_session_t *s, *tmp;
+
+    if (!peer_tid)
+        return NULL;
+    HASH_ITER(hh_tid, g_by_tid, s, tmp) {
+        if (s->have_peer_tid && s->peer_tcap_dialogue_id == peer_tid)
+            return s;
+    }
+    return NULL;
+}
+
 map_session_t *map_sess_find_by_diameter_sid(const char *sid)
 {
     if (!sid || !*sid) return NULL;
@@ -106,6 +119,19 @@ map_session_t *map_sess_find_by_diameter_sid(const char *sid)
     HASH_ITER(hh_tid, g_by_tid, s, tmp) {
         if (s->diameter_session_id[0] &&
             strcmp(s->diameter_session_id, sid) == 0)
+            return s;
+    }
+    return NULL;
+}
+
+map_session_t *map_sess_find_by_diam_hbh(uint32_t hbh)
+{
+    map_session_t *s, *tmp;
+
+    if (!hbh)
+        return NULL;
+    HASH_ITER(hh_tid, g_by_tid, s, tmp) {
+        if (s->diameter_hop_by_hop == hbh)
             return s;
     }
     return NULL;

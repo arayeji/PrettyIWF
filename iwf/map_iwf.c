@@ -264,9 +264,61 @@ static int map_send_tcap_to_peer(struct iwf_runtime *rt, map_session_t *s,
         calling.ssn = SS7_SSN_HLR;
 
     int rc = ss7_link_send_tcap_ex(rt, &called, &calling, out, n);
-    if (rc >= 0 && s->imsi_str[0])
+    if (rc >= 0 && s->imsi_str[0]) {
         iwf_imsi_trace_packet(s->imsi_str, "map", "tx", out, n);
+        iwf_imsi_trace_remember_tcap(s->tcap_dialogue_id, s->imsi_str);
+        if (s->have_peer_tid)
+            iwf_imsi_trace_remember_tcap(s->peer_tcap_dialogue_id, s->imsi_str);
+    }
     return rc;
+}
+
+static int map_trace_imsi_for_tid(uint32_t tid, char *imsi, size_t cap)
+{
+    map_session_t *s;
+
+    if (!tid || !imsi || cap == 0)
+        return -1;
+    imsi[0] = '\0';
+
+    s = map_sess_find_by_tid(tid);
+    if (!s)
+        s = map_sess_find_by_peer_tid(tid);
+    if (s && s->imsi_str[0]) {
+        snprintf(imsi, cap, "%s", s->imsi_str);
+        return 0;
+    }
+#ifdef SMS_IWF_ENABLED
+    if (sms_iwf_imsi_for_tcap(tid, imsi, cap) == 0)
+        return 0;
+#endif
+#ifdef GSUP_PROXY_ENABLED
+    if (gsup_map_proxy_imsi_for_tcap(tid, imsi, cap) == 0)
+        return 0;
+    if (ussd_iwf_imsi_for_tcap(tid, imsi, cap) == 0)
+        return 0;
+#endif
+    return iwf_imsi_trace_imsi_for_tcap(tid, imsi, cap);
+}
+
+static void map_trace_rx_done(const tcap_msg_t *tmsg)
+{
+    char imsi[IWF_IMSI_TRACE_LEN];
+
+    imsi[0] = '\0';
+    if (tmsg) {
+        if (tmsg->have_dtid)
+            (void)map_trace_imsi_for_tid(tmsg->dtid, imsi, sizeof(imsi));
+        if (!imsi[0] && tmsg->have_otid)
+            (void)map_trace_imsi_for_tid(tmsg->otid, imsi, sizeof(imsi));
+        iwf_imsi_trace_finish_rx(tmsg->have_dtid ? tmsg->dtid : 0,
+                                 tmsg->have_dtid,
+                                 tmsg->have_otid ? tmsg->otid : 0,
+                                 tmsg->have_otid,
+                                 imsi[0] ? imsi : NULL);
+        return;
+    }
+    iwf_imsi_trace_drop_rx();
 }
 
 static void handle_begin_sai(struct iwf_runtime *rt,
@@ -721,8 +773,18 @@ static void sri_send_end(struct iwf_runtime *rt,
     if (rt->cfg.map_local_gt[0])
         ss7_gt_from_digits(rt->cfg.map_local_gt, SS7_SSN_HLR, &src);
     src.ssn = SS7_SSN_HLR;
-    ss7_link_send_tcap_ex(rt, calling, src.have_gt ? &src : NULL,
-                          out, (size_t)n);
+    if (ss7_link_send_tcap_ex(rt, calling, src.have_gt ? &src : NULL,
+                              out, (size_t)n) >= 0) {
+        char imsi[IWF_IMSI_TRACE_LEN];
+
+        imsi[0] = '\0';
+        if (tmsg->have_otid)
+            (void)iwf_imsi_trace_imsi_for_tcap(tmsg->otid, imsi, sizeof(imsi));
+        if (!imsi[0] && tmsg->have_dtid)
+            (void)iwf_imsi_trace_imsi_for_tcap(tmsg->dtid, imsi, sizeof(imsi));
+        if (imsi[0])
+            iwf_imsi_trace_packet(imsi, "map", "tx", out, (size_t)n);
+    }
 }
 
 static void sri_send_error(struct iwf_runtime *rt,
@@ -966,8 +1028,13 @@ static void handle_begin_sri(struct iwf_runtime *rt,
         LOGI("map", "[?] SRI msisdn=%s -> unknownSubscriber", msisdn);
         sri_send_error(rt, calling, tmsg, c->invoke_id,
                        MAP_ERR_UNKNOWN_SUBSCRIBER);
+        iwf_imsi_trace_drop_rx();
         return;
     }
+
+    iwf_imsi_trace_flush_rx(imsi);
+    if (tmsg->have_otid)
+        iwf_imsi_trace_remember_tcap(tmsg->otid, imsi);
 
     LOGI("map",
          "[%s] RX BEGIN SRI otid=0x%08x invoke=%u msisdn=%s hss_cs=%d vlr=%s local_msc=%d",
@@ -1332,6 +1399,7 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
     if (tcap_decode(tcap, tcap_len, &tmsg) < 0) {
         LOGW("map", "RX malformed TCAP len=%zu from pc=%u",
              tcap_len, calling->point_code);
+        iwf_imsi_trace_drop_rx();
         return;
     }
 
@@ -1346,7 +1414,7 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
             /* Dialogue establishment: AARQ only, invoke follows in a
              * CONTINUE after we confirm (partner SMSC/USSD pattern). */
             handle_empty_begin(rt, calling, &tmsg);
-            return;
+            goto done;
         }
         const tcap_component_t *c = &tmsg.components[0];
         switch (c->opcode) {
@@ -1387,39 +1455,54 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
                  c->opcode, ac);
             break;
         }
-        return;
+        goto done;
     }
 
     if (tmsg.type == TCAP_MSG_CONTINUE || tmsg.type == TCAP_MSG_END) {
         if (dlg_est_on_tcap(rt, calling, &tmsg))
-            return;
+            goto done;
 #ifdef SMS_IWF_ENABLED
         if (sms_iwf_enabled(rt) && sms_iwf_on_mo_tcap(rt, &tmsg))
-            return;
+            goto done;
+        if (sms_iwf_enabled(rt)) {
+            for (size_t i = 0; i < tmsg.n_components; i++) {
+                const tcap_component_t *c = &tmsg.components[i];
+                if ((c->kind == TCAP_CMP_KIND_RES || c->kind == TCAP_CMP_KIND_ERR) &&
+                    (c->opcode == MAP_OP_CODE_MT_FORWARD_SM ||
+                     c->opcode == MAP_OP_CODE_MT_FORWARD_SM_V3)) {
+                    LOGW("sms",
+                         "MAP %s op=%d dtid=0x%08x: no MO/alert SMS session — not converting to GSUP",
+                         c->kind == TCAP_CMP_KIND_RES ? "result" : "error",
+                         c->opcode, tmsg.have_dtid ? tmsg.dtid : 0);
+                    break;
+                }
+            }
+        }
 #endif
 #ifdef GSUP_PROXY_ENABLED
         if (ussd_iwf_on_tcap(rt, calling, &tmsg))
-            return;
+            goto done;
         if (gsup_map_proxy_on_tcap(rt, calling, &tmsg))
-            return;
+            goto done;
 #endif
         if (in_iwf_on_tcap(rt, calling, &tmsg))
-            return;
+            goto done;
         handle_continue_or_end(rt, &tmsg);
-        return;
+        goto done;
     }
     if (tmsg.type == TCAP_MSG_ABORT) {
 #ifdef GSUP_PROXY_ENABLED
         if (ussd_iwf_on_tcap(rt, calling, &tmsg))
-            return;
+            goto done;
         if (gsup_map_proxy_on_tcap(rt, calling, &tmsg))
-            return;
+            goto done;
 #endif
         if (in_iwf_on_tcap(rt, calling, &tmsg))
-            return;
+            goto done;
         handle_abort(rt, &tmsg);
-        return;
     }
+done:
+    map_trace_rx_done(&tmsg);
 }
 
 void map_iwf_on_sccp_unitdata(struct iwf_runtime *rt,
@@ -2436,6 +2519,7 @@ static int send_map_cl_begin(struct iwf_runtime *rt, const char *imsi,
     if (ss7_link_send_tcap(rt, &called, out, (size_t)n) < 0)
         return -1;
     iwf_imsi_trace_packet(imsi, "map", "tx", out, (size_t)n);
+    iwf_imsi_trace_remember_tcap(tid, imsi);
 
     rt->map->stat_map_tx++;
     LOGI("map",

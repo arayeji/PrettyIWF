@@ -19,6 +19,7 @@
 #define IWF_USSD_IWF_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include "gsup_proto.h"
 #include "ss7_link.h"
 #include "tcap.h"
@@ -52,5 +53,7 @@ void ussd_iwf_reject_begin(struct iwf_runtime *rt,
                            const ss7_sccp_addr_t *calling,
                            const tcap_msg_t *tmsg,
                            const tcap_component_t *c, int map_err);
+
+int  ussd_iwf_imsi_for_tcap(uint32_t tid, char *imsi_out, size_t cap);
 
 #endif /* IWF_USSD_IWF_H */

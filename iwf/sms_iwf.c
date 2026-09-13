@@ -12,6 +12,7 @@
 #include "runtime.h"
 #include "config.h"
 #include "logging.h"
+#include "imsi_trace.h"
 #include "ss7_link.h"
 #include "map_codec.h"
 #include "tcap.h"
@@ -19,6 +20,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
@@ -153,6 +155,49 @@ static uint32_t sms_new_out_otid(void)
     return t;
 }
 
+int sms_iwf_imsi_for_tcap(uint32_t tid, char *imsi_out, size_t cap)
+{
+    sms_session_t *s, *tmp;
+
+    if (!tid || !imsi_out || cap == 0)
+        return -1;
+    imsi_out[0] = '\0';
+
+    s = sms_sess_find(tid);
+    if (!s)
+        s = sms_sess_find(tid & ~SMS_OTID_OUTBOUND_BIT);
+    if (s && s->imsi[0]) {
+        snprintf(imsi_out, cap, "%s", s->imsi);
+        return 0;
+    }
+
+    HASH_ITER(hh, g_sessions, s, tmp) {
+        if (s->have_peer_otid && s->peer_otid == tid && s->imsi[0]) {
+            snprintf(imsi_out, cap, "%s", s->imsi);
+            return 0;
+        }
+        if ((s->otid == tid || (s->have_peer_otid && s->peer_otid == tid)) &&
+            !s->imsi[0] && s->msisdn[0] &&
+            gsup_map_proxy_imsi_for_msisdn(s->msisdn, imsi_out, cap) == 0)
+            return 0;
+    }
+    return -1;
+}
+
+static void sms_trace_map_tx(sms_session_t *s, const uint8_t *out, size_t n, int rc)
+{
+    if (rc < 0 || !s || !out || !n)
+        return;
+    if (s->imsi[0]) {
+        iwf_imsi_trace_packet(s->imsi, "map", "tx", out, n);
+        iwf_imsi_trace_remember_tcap(s->otid, s->imsi);
+        if (s->have_peer_otid)
+            iwf_imsi_trace_remember_tcap(s->peer_otid, s->imsi);
+        return;
+    }
+    iwf_imsi_trace_park_pdu(s->otid, "map", "tx", out, n);
+}
+
 static int partner_for_msisdn(const char *dst)
 {
     if (!dst || !g_rt) return -1;
@@ -237,7 +282,9 @@ static int sms_send_tcap_end_result(sms_session_t *s, int opcode,
                                 s->peer_otid, s->have_peer_otid,
                                 NULL, 0, cmp, co, out, sizeof(out));
     if (n < 0) return -1;
-    return ss7_link_send_tcap_ex(g_rt, &s->ret_addr, NULL, out, (size_t)n);
+    int rc = ss7_link_send_tcap_ex(g_rt, &s->ret_addr, NULL, out, (size_t)n);
+    sms_trace_map_tx(s, out, (size_t)n, rc);
+    return rc;
 }
 
 static int sms_send_tcap_end_error(sms_session_t *s, int err_code)
@@ -252,7 +299,9 @@ static int sms_send_tcap_end_error(sms_session_t *s, int err_code)
                                 s->peer_otid, s->have_peer_otid,
                                 NULL, 0, cmp, co, out, sizeof(out));
     if (n < 0) return -1;
-    return ss7_link_send_tcap_ex(g_rt, &s->ret_addr, NULL, out, (size_t)n);
+    int rc = ss7_link_send_tcap_ex(g_rt, &s->ret_addr, NULL, out, (size_t)n);
+    sms_trace_map_tx(s, out, (size_t)n, rc);
+    return rc;
 }
 
 static void sms_fail_inbound(sms_session_t *s)
@@ -307,9 +356,13 @@ static int sms_mt_send_end(sms_session_t *s, int is_error, int code,
     if (g_rt->cfg.map_local_gt[0])
         ss7_gt_from_digits(g_rt->cfg.map_local_gt, SS7_SSN_MSC, &calling);
     calling.ssn = SS7_SSN_MSC;
-    return ss7_link_send_tcap_ex(g_rt, &s->ret_addr,
-                                 calling.have_gt ? &calling : NULL,
-                                 out, (size_t)n);
+    rc = ss7_link_send_tcap_ex(g_rt, &s->ret_addr,
+                                calling.have_gt ? &calling : NULL,
+                                out, (size_t)n);
+    sms_trace_map_tx(s, out, (size_t)n, rc);
+    if (rc < 0)
+        LOGW("sms", "[%s] MT-FSM MAP END send failed rc=%d", s->imsi, rc);
+    return rc;
 }
 
 static int sms_mt_err_absent(const sms_session_t *s)
@@ -428,6 +481,9 @@ void sms_iwf_on_mt_fsm(struct iwf_runtime *rt,
         free(s);
         return;
     }
+
+    iwf_imsi_trace_flush_rx(s->imsi);
+    iwf_imsi_trace_remember_tcap(s->peer_otid, s->imsi);
 
     int conn = gsup_map_proxy_cs_conn_for_imsi(s->imsi);
     if (conn < 0) {
@@ -563,6 +619,10 @@ void sms_iwf_on_gsup_mt_resp(const gsup_parsed_t *m)
 static void sms_sri_sm_answer(sms_session_t *s, const char *imsi)
 {
     strncpy(s->imsi, imsi, sizeof(s->imsi) - 1);
+    iwf_imsi_trace_flush_rx(imsi);
+    iwf_imsi_trace_flush_parked(s->otid, imsi);
+    if (s->have_peer_otid)
+        iwf_imsi_trace_flush_parked(s->peer_otid, imsi);
     uint8_t params[64];
     int plen = map_encode_sri_sm_res(imsi, sms_msc_gt(),
                                      params, sizeof(params));
@@ -640,7 +700,8 @@ static int sms_send_map_begin(uint32_t otid, int opcode,
                               const uint8_t *params, size_t plen,
                               const uint8_t *dlg, size_t dlen,
                               const ss7_sccp_addr_t *called,
-                              const ss7_sccp_addr_t *calling)
+                              const ss7_sccp_addr_t *calling,
+                              const char *imsi)
 {
     uint8_t cmp[512];
     size_t co = 0;
@@ -650,7 +711,14 @@ static int sms_send_map_begin(uint32_t otid, int opcode,
     int n = tcap_encode_message(TCAP_MSG_BEGIN, otid, true,
                                 0, false, dlg, dlen, cmp, co, out, sizeof(out));
     if (n < 0) return -1;
-    return ss7_link_send_tcap_ex(g_rt, called, calling, out, (size_t)n);
+    int rc = ss7_link_send_tcap_ex(g_rt, called, calling, out, (size_t)n);
+    if (rc >= 0 && imsi && imsi[0]) {
+        iwf_imsi_trace_packet(imsi, "map", "tx", out, (size_t)n);
+        iwf_imsi_trace_remember_tcap(otid, imsi);
+    } else if (rc >= 0) {
+        iwf_imsi_trace_park_pdu(otid, "map", "tx", out, (size_t)n);
+    }
+    return rc;
 }
 
 static void start_outbound_sri_sm(sms_session_t *s)
@@ -666,8 +734,11 @@ static void start_outbound_sri_sm(sms_session_t *s)
 
     s->state = SMS_STATE_WAIT_SRI_SM;
     sms_arm_timer(s, g_rt->cfg.sms_sri_sm_timeout_ms);
+    if (!s->imsi[0] && s->msisdn[0])
+        (void)gsup_map_proxy_imsi_for_msisdn(s->msisdn, s->imsi, sizeof(s->imsi));
     if (sms_send_map_begin(s->otid, MAP_OP_CODE_SEND_ROUTING_INFO_SM,
-                           arg, (size_t)alen, NULL, 0, &called, &calling) < 0)
+                           arg, (size_t)alen, NULL, 0, &called, &calling,
+                           s->imsi[0] ? s->imsi : NULL) < 0)
         sms_fail_outbound(s);
 }
 
@@ -696,7 +767,8 @@ static void start_outbound_fwdsm(sms_session_t *s)
     s->state = SMS_STATE_WAIT_FWDSM;
     sms_arm_timer(s, g_rt->cfg.sms_fwdsm_timeout_ms);
     if (sms_send_map_begin(fwd_otid, MAP_OP_CODE_MT_FORWARD_SM,
-                           arg, (size_t)alen, NULL, 0, &called, &calling) < 0) {
+                           arg, (size_t)alen, NULL, 0, &called, &calling,
+                           s->imsi[0] ? s->imsi : NULL) < 0) {
         sms_fail_outbound(s);
         return;
     }
@@ -779,6 +851,8 @@ static void handle_outbound_tcap(const tcap_msg_t *tmsg)
             }
             map_bcd_to_str(imsi_bcd, ilen, s->imsi, sizeof(s->imsi));
             snprintf(s->partner_vmsc_gt, sizeof(s->partner_vmsc_gt), "%s", vmsc);
+            iwf_imsi_trace_flush_rx(s->imsi);
+            iwf_imsi_trace_flush_parked(s->otid, s->imsi);
             start_outbound_fwdsm(s);
             return;
         }
@@ -1100,7 +1174,8 @@ void sms_iwf_on_gsup_mo_req(int conn_id, const gsup_parsed_t *m)
 
     if (sms_send_map_begin(s->otid, MAP_OP_CODE_MT_FORWARD_SM /* mo-ForwardSM */,
                            arg, (size_t)an, dlg, (size_t)dn,
-                           &called, calling.have_gt ? &calling : NULL) < 0) {
+                           &called, calling.have_gt ? &calling : NULL,
+                           s->imsi) < 0) {
         free(s);
         sms_mo_reply_err(conn_id, m->imsi, mr, 41);
         return;
@@ -1352,7 +1427,8 @@ void sms_iwf_on_gsup_ready_for_sm(int conn_id, const gsup_parsed_t *m)
 
     if (sms_send_map_begin(s->otid, MAP_OP_CODE_READY_FOR_SM,
                            arg, (size_t)an, dlg, (size_t)dn,
-                           &called, calling.have_gt ? &calling : NULL) < 0) {
+                           &called, calling.have_gt ? &calling : NULL,
+                           s->imsi) < 0) {
         free(s);
         sms_rfsm_reply_err(conn_id, m->imsi, mr, 41);
         return;
@@ -1372,9 +1448,14 @@ static void on_hlr_sccp(struct iwf_runtime *rt,
 {
     if (!rt) return;
     const ss7_sccp_addr_t *cp = calling;
+    char imsi[16];
 
     tcap_msg_t tmsg;
-    if (tcap_decode(tcap, len, &tmsg) < 0) return;
+    iwf_imsi_trace_bind_rx("map", tcap, len);
+    if (tcap_decode(tcap, len, &tmsg) < 0) {
+        iwf_imsi_trace_drop_rx();
+        return;
+    }
 
     /* SRI-SM is SMS-IWF only; everything else on HLR SSN goes to MAP-IWF
      * (SAI, purgeMS, UGL, …). Without this demux those ops were dropped
@@ -1383,6 +1464,14 @@ static void on_hlr_sccp(struct iwf_runtime *rt,
         tmsg.components[0].kind == TCAP_CMP_KIND_INVOKE &&
         tmsg.components[0].opcode == MAP_OP_CODE_SEND_ROUTING_INFO_SM) {
         handle_inbound_begin(cp, &tmsg, &tmsg.components[0]);
+        imsi[0] = '\0';
+        if (tmsg.have_otid)
+            (void)sms_iwf_imsi_for_tcap(tmsg.otid, imsi, sizeof(imsi));
+        iwf_imsi_trace_finish_rx(tmsg.have_dtid ? tmsg.dtid : 0,
+                                 tmsg.have_dtid,
+                                 tmsg.have_otid ? tmsg.otid : 0,
+                                 tmsg.have_otid,
+                                 imsi[0] ? imsi : NULL);
         return;
     }
     if ((tmsg.type == TCAP_MSG_END || tmsg.type == TCAP_MSG_CONTINUE) &&
@@ -1390,10 +1479,17 @@ static void on_hlr_sccp(struct iwf_runtime *rt,
         sms_session_t *s = sms_sess_find(tmsg.dtid);
         if (s && s->direction == SMS_DIR_OUTBOUND) {
             handle_outbound_tcap(&tmsg);
+            imsi[0] = '\0';
+            (void)sms_iwf_imsi_for_tcap(tmsg.dtid, imsi, sizeof(imsi));
+            iwf_imsi_trace_finish_rx(tmsg.dtid, true,
+                                     tmsg.have_otid ? tmsg.otid : 0,
+                                     tmsg.have_otid,
+                                     imsi[0] ? imsi : NULL);
             return;
         }
     }
 
+    iwf_imsi_trace_drop_rx();
     map_iwf_on_sccp_unitdata(rt, cp, tcap, len);
 }
 

@@ -199,7 +199,9 @@ map_session_t  *map_sess_create(uint32_t tid);
 void            map_sess_remove(map_session_t *s);
 
 map_session_t  *map_sess_find_by_tid(uint32_t tid);
+map_session_t  *map_sess_find_by_peer_tid(uint32_t peer_tid);
 map_session_t  *map_sess_find_by_diameter_sid(const char *sid);
+map_session_t  *map_sess_find_by_diam_hbh(uint32_t hbh);
 
 /* GSUP proxy: pending UL/SAI session awaiting SGSN ISD ack (by IMSI). */
 map_session_t  *map_sess_find_gsup_pending(const char *imsi, map_op_t op);
