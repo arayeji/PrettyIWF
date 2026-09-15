@@ -274,7 +274,11 @@ static int iwf_sccp_cl_strip_foreign_cdpa_pc(uint8_t *sccp, size_t *len,
         return 0;
 
     after_pc = addr + 3;
-    tail_n = (sccp + *len) - after_pc;
+    if (after_pc < sccp || after_pc > sccp + *len)
+        return 0;
+    tail_n = (size_t)((sccp + *len) - after_pc);
+    if (tail_n > *len)
+        return 0;
     memmove(addr + 1, after_pc, tail_n);
     *lenp = (uint8_t)(alen - 2);
     /* RI=SSN, PCI=0; keep SSN/GTI so node_6 can bind the user. */
@@ -313,7 +317,7 @@ static void iwf_sccp_msg_strip_foreign_cdpa_pc(struct msgb *msg,
         sccp = msgb_data(msg);
         len = msgb_length(msg);
     }
-    if (!sccp || len < 5)
+    if (!sccp || len < 5 || len > SS7_MAX_PDU)
         return;
     orig = len;
     n = 0;
@@ -336,8 +340,13 @@ static void iwf_sccp_msg_strip_foreign_cdpa_pc(struct msgb *msg,
     default:
         return;
     }
-    if (len < orig && msg->tail >= msg->data + (orig - len))
-        msg->tail -= (orig - len);
+    if (len < orig) {
+        size_t cut = orig - len;
+        if (msg->l2h && msg->tail < msg->l2h + cut)
+            return;
+        if (msg->tail >= msg->data + cut)
+            msg->tail -= cut;
+    }
 }
 
 static int iwf_sccp_mtp_wrap(struct osmo_prim_hdr *oph, void *priv)
@@ -589,8 +598,21 @@ static void deliver_unitdata(struct iwf_runtime *rt, ss7_recv_cb_t cb,
         return;
     }
     ss7_sccp_addr_t calling;
+    const uint8_t *tcap;
+    size_t tcap_len;
+
     osmo_addr_to_ss7(calling_osmo, &calling);
-    cb(rt, &calling, msgb_l2(msg), msgb_l2len(msg));
+    tcap = msgb_l2(msg);
+    tcap_len = msgb_l2len(msg);
+    if (!tcap) {
+        tcap = msgb_data(msg);
+        tcap_len = msgb_length(msg);
+    }
+    if (!tcap || tcap_len == 0 || tcap_len > SS7_MAX_PDU) {
+        msgb_free(msg);
+        return;
+    }
+    cb(rt, &calling, tcap, tcap_len);
     msgb_free(msg);
 }
 

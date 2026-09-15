@@ -243,6 +243,24 @@ static void map_sess_store_peer(map_session_t *s, const ss7_sccp_addr_t *calling
     s->have_peer_sccp = true;
 }
 
+/* Copy IMSI TBCD without memcpy() into a struct member. Fortified memcpy
+ * uses __builtin_object_size type 0, which is "bytes to end of the parent
+ * object" (~4KB of map_session_t), so a bad length overruns the session. */
+static void map_copy_imsi_bcd(uint8_t *dst, uint8_t *dst_len_out,
+                               const uint8_t *src, uint8_t len)
+{
+    uint8_t n = len;
+    unsigned i;
+
+    if (!dst || !dst_len_out)
+        return;
+    if (n > MAP_IMSI_BCD_MAX)
+        n = MAP_IMSI_BCD_MAX;
+    for (i = 0; i < MAP_IMSI_BCD_MAX; i++)
+        dst[i] = (src && i < n) ? src[i] : 0;
+    *dst_len_out = n;
+}
+
 /* Reply CdPA = inbound CgPA; CgPA = local GT, HLR SSN when peer is VLR/MSC/SGSN. */
 static int map_send_tcap_to_peer(struct iwf_runtime *rt, map_session_t *s,
                                  const uint8_t *out, size_t n)
@@ -344,8 +362,8 @@ static void handle_begin_sai(struct iwf_runtime *rt,
     s->t_dialogue_ms         = rt->cfg.map_t_dialogue_ms > 0
                                  ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
     map_sess_store_peer(s, calling);
-    memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
-    s->imsi_bcd_len = req.imsi_bcd_len;
+    map_copy_imsi_bcd(s->imsi_bcd, &s->imsi_bcd_len,
+                      req.imsi_bcd, req.imsi_bcd_len);
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
     s->gsup_num_vectors = req.num_vectors;
     if (req.have_resync) {
@@ -399,8 +417,8 @@ static void handle_begin_ugl(struct iwf_runtime *rt,
     s->t_dialogue_ms         = rt->cfg.map_t_dialogue_ms > 0
                                  ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
     map_sess_store_peer(s, calling);
-    memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
-    s->imsi_bcd_len = req.imsi_bcd_len;
+    map_copy_imsi_bcd(s->imsi_bcd, &s->imsi_bcd_len,
+                      req.imsi_bcd, req.imsi_bcd_len);
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
     if (map_plmn_pack_home(rt->cfg.gsup_local_mcc, rt->cfg.gsup_local_mnc,
                            s->visited_plmn_bcd) == 0)
@@ -438,8 +456,8 @@ static void handle_begin_ul(struct iwf_runtime *rt,
     s->t_dialogue_ms         = rt->cfg.map_t_dialogue_ms > 0
                                  ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
     map_sess_store_peer(s, calling);
-    memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
-    s->imsi_bcd_len = req.imsi_bcd_len;
+    map_copy_imsi_bcd(s->imsi_bcd, &s->imsi_bcd_len,
+                      req.imsi_bcd, req.imsi_bcd_len);
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
     if (map_plmn_pack_home(rt->cfg.gsup_local_mcc, rt->cfg.gsup_local_mnc,
                            s->visited_plmn_bcd) == 0)
@@ -488,8 +506,8 @@ static void handle_begin_purge(struct iwf_runtime *rt,
     s->t_dialogue_ms         = rt->cfg.map_t_dialogue_ms > 0
                                  ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
     map_sess_store_peer(s, calling);
-    memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
-    s->imsi_bcd_len = req.imsi_bcd_len;
+    map_copy_imsi_bcd(s->imsi_bcd, &s->imsi_bcd_len,
+                      req.imsi_bcd, req.imsi_bcd_len);
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
     if (map_plmn_pack_home(rt->cfg.gsup_local_mcc, rt->cfg.gsup_local_mnc,
                            s->visited_plmn_bcd) == 0)
@@ -603,10 +621,9 @@ static void handle_begin_prn(struct iwf_runtime *rt,
         return;
     }
 
-    if (req.imsi_bcd_len) {
-        memcpy(s->imsi_bcd, req.imsi_bcd, req.imsi_bcd_len);
-        s->imsi_bcd_len = req.imsi_bcd_len;
-    }
+    if (req.imsi_bcd_len)
+        map_copy_imsi_bcd(s->imsi_bcd, &s->imsi_bcd_len,
+                          req.imsi_bcd, req.imsi_bcd_len);
     if (req.imsi_str[0])
         memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
 
@@ -1318,8 +1335,13 @@ static void handle_empty_begin(struct iwf_runtime *rt,
     e->our_otid = our;
     e->peer_otid = tmsg->otid;
     e->peer = *calling;
-    memcpy(e->dialogue, tmsg->dialogue, tmsg->dialogue_len);
-    e->dlen = (uint16_t)tmsg->dialogue_len;
+    if (tmsg->dialogue && tmsg->dialogue_len &&
+        tmsg->dialogue_len <= sizeof(e->dialogue)) {
+        memcpy(e->dialogue, tmsg->dialogue, tmsg->dialogue_len);
+        e->dlen = (uint16_t)tmsg->dialogue_len;
+    } else {
+        e->dlen = 0;
+    }
     e->ts = time(NULL);
     LOGI("map",
          "empty BEGIN peer_otid=0x%08x -> TX CONTINUE AARE (our_otid=0x%08x)",
@@ -1392,6 +1414,9 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
                         const ss7_sccp_addr_t *calling,
                         const uint8_t *tcap, size_t tcap_len)
 {
+    if (!rt || !rt->map || !calling || !tcap || !tcap_len ||
+        tcap_len > SS7_MAX_PDU)
+        return;
     rt->map->stat_map_rx++;
     iwf_imsi_trace_bind_rx("map", tcap, tcap_len);
 
