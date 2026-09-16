@@ -575,6 +575,21 @@ static void handle_begin_cl(struct iwf_runtime *rt,
     s = NULL;
 
 #ifdef GSUP_PROXY_ENABLED
+    /* updateProcedure while our own CS updateLocation for this IMSI is still
+     * in flight: the HLR is cancelling the *previous* registration, which on
+     * a single-VLR-number IWF is the one being refreshed right now.  Relaying
+     * it makes osmo-msc drop the VLR record mid-LU (LOC-CANCEL, then
+     * PurgeMS), so the UL result lands on nothing and the MME never gets an
+     * SGs LU answer.  The HLR has its ack; keep the subscriber.
+     * subscriptionWithdraw still goes through. */
+    if (cl_cn == GSUP_CN_DOMAIN_CS && req.cancellation_type == 0 &&
+        gsup_map_proxy_cs_lu_in_flight(imsi)) {
+        LOGI("map",
+             "[%s] CL updateProcedure during own CS LU: acked, not relayed",
+             imsi);
+        iwf_imsi_trace_flush_rx(imsi);
+        return;
+    }
     if (!gsup_map_proxy_hss_clr(rt, imsi, cl_gsup_ct, cl_cn))
         LOGW("map",
              "[%s] CL: no GSUP LOC-CANCEL sent for cn=%s "
