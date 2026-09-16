@@ -109,7 +109,7 @@ int ber_dec_length(const uint8_t *buf, size_t len, size_t *off, size_t *out_len)
     if (*off >= len) return -1;
     uint8_t b = buf[(*off)++];
     if ((b & 0x80) == 0) { *out_len = b; return 0; }
-    if (b == 0x80)       return -1;     /* indefinite length: rejected */
+    if (b == 0x80)       return -1;     /* indefinite: handled in ber_dec_tlv */
     size_t nbytes = b & 0x7f;
     if (nbytes > 4 || *off + nbytes > len) return -1;
     size_t l = 0;
@@ -118,11 +118,55 @@ int ber_dec_length(const uint8_t *buf, size_t len, size_t *off, size_t *out_len)
     return 0;
 }
 
+/* Locate the end-of-contents octets (00 00) that terminate an
+ * indefinite-length constructed value whose contents start at buf[start].
+ * Nested indefinite-length values are skipped recursively. */
+#define BER_MAX_INDEF_DEPTH 16
+
+static int ber_find_eoc(const uint8_t *buf, size_t len, size_t start,
+                        int depth, size_t *eoc)
+{
+    if (depth > BER_MAX_INDEF_DEPTH) return -1;
+    size_t off = start;
+    while (off + 2 <= len) {
+        if (buf[off] == 0x00 && buf[off + 1] == 0x00) {
+            *eoc = off;
+            return 0;
+        }
+        uint8_t tag = buf[off++];
+        if (buf[off] == 0x80) {
+            if ((tag & 0x20) == 0) return -1;   /* primitive cannot be indefinite */
+            size_t inner;
+            if (ber_find_eoc(buf, len, off + 1, depth + 1, &inner) < 0) return -1;
+            off = inner + 2;
+        } else {
+            size_t l = 0;
+            if (ber_dec_length(buf, len, &off, &l) < 0) return -1;
+            if (off + l > len) return -1;
+            off += l;
+        }
+    }
+    return -1;
+}
+
 int ber_dec_tlv(const uint8_t *buf, size_t len, size_t *off,
                 uint8_t *out_tag, const uint8_t **out_val, size_t *out_val_len)
 {
     if (*off >= len) return -1;
     *out_tag = buf[(*off)++];
+    if (*off < len && buf[*off] == 0x80) {
+        /* Indefinite length (X.690 8.1.3.6), constructed encodings only.
+         * MCI's SMSC sends the forwardSM argument of long, dialogue-
+         * established MT SMS this way; rejecting it made the IWF answer
+         * unexpectedDataValue to every such message. */
+        if ((*out_tag & 0x20) == 0) return -1;
+        size_t start = *off + 1, eoc;
+        if (ber_find_eoc(buf, len, start, 0, &eoc) < 0) return -1;
+        *out_val = buf + start;
+        *out_val_len = eoc - start;
+        *off = eoc + 2;
+        return 0;
+    }
     size_t l = 0;
     if (ber_dec_length(buf, len, off, &l) < 0) return -1;
     if (*off + l > len) return -1;
