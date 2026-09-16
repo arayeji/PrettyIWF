@@ -330,7 +330,8 @@ typedef struct {
     int         hlr_mode;
     char        hlr_home_gt[24];
 
-    /* [local_msc] home VLR/MSC GTs — match ⇒ local 3G (no roam PRN). */
+    /* [local_msc] home VLR/MSC GTs. CS UL vlr-Number / msc-Number;
+     * SIP GMSC match ⇒ local 3G (no roam PRN). */
     char        local_msc_vlr_gt[24];
     char        local_msc_msc_gt[24];
 

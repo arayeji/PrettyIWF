@@ -409,19 +409,26 @@ static int gsup_backend_for_cn(uint8_t cn)
     return g_rt->cfg.gsup_ps_backend;
 }
 
+/* CS UpdateLocation toward the home HLR (their subscriber on us).
+ * vlr-Number = [local_msc] vlr_gt, else [map_iwf] local_gt (IWF, ISD/CL).
+ * msc-Number = [local_msc] msc_gt (serving MSC; SMSC SRI-SM / MT-FSM). */
 static const char *vlr_gt_digits(void)
 {
+    if (g_rt && g_rt->cfg.local_msc_vlr_gt[0])
+        return g_rt->cfg.local_msc_vlr_gt;
     if (g_rt && g_rt->cfg.map_local_gt[0])
         return g_rt->cfg.map_local_gt;
     return NULL;
 }
 
-/* CS updateLocation toward the home HLR, for *their* subscriber on *our*
- * network. msc-Number is our serving VMSC. Use the VLR GT: partners already
- * address that GT (GTT covers both of ours; they may not have the distinct
- * MSC GT provisioned). */
 static const char *msc_gt_digits(void)
 {
+    if (g_rt && g_rt->cfg.local_msc_msc_gt[0])
+        return g_rt->cfg.local_msc_msc_gt;
+#ifdef SMS_IWF_ENABLED
+    if (g_rt && g_rt->cfg.sms_local_msc_gt[0])
+        return g_rt->cfg.sms_local_msc_gt;
+#endif
     return vlr_gt_digits();
 }
 
@@ -936,7 +943,9 @@ static int handle_ul(gsup_route_t *route, gsup_parsed_t *req, int conn_id,
         const char *vlr = vlr_gt_digits();
         const char *msc = msc_gt_digits();
         if (!vlr || !msc) {
-            LOGW("gsup", "[%s] CS MAP-C UL: set [map_iwf].local_gt", route->imsi);
+            LOGW("gsup",
+                 "[%s] CS MAP-C UL: set [local_msc].msc_gt / [map_iwf].local_gt",
+                 route->imsi);
             return -1;
         }
         uint8_t arg[256];
