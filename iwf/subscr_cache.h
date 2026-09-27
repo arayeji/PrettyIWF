@@ -77,6 +77,14 @@ int  subscr_cache_get_pgw_fqdn(const char *imsi, const char *apn,
 int  subscr_cache_get_default_apn(const char *imsi, char *out_apn,
                                   size_t apn_cap);
 
+/* One subscribed GGSN/PGW IPv4 for SendRoutingInfoForGPRS. The MAP arg
+ * carries no APN, so this prefers the default APN's STATIC PGW, then the
+ * first other STATIC PGW. DYNAMIC allocations are skipped (they belong to
+ * one PDN lifetime). Returns 1 and a host-order IPv4. out_apn may be NULL.
+ * Never returns more than one address. */
+int  subscr_cache_get_sri_pgw(const char *imsi, uint32_t *out_pgw_ipv4,
+                              char *out_apn, size_t apn_cap);
+
 /* Exact subscribed APN-NI (no single-PGW fallback). */
 int  subscr_cache_apn_subscribed(const char *imsi, const char *apn);
 /* 1 if this IMSI has at least one cached APN from ULA. */

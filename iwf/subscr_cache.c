@@ -268,6 +268,68 @@ int subscr_cache_get_pgw_fqdn(const char *imsi, const char *apn,
     return 1;
 }
 
+static int apn_static_ipv4(subscr_apn_t *a, uint32_t *ip_out)
+{
+    uint32_t ip;
+
+    if (!a || a->alloc_dynamic)
+        return 0;
+    ip = a->pgw_ipv4;
+    if (!ip && a->pgw_fqdn[0]) {
+        ip = subscr_resolve_fqdn_ipv4(a->pgw_fqdn);
+        if (ip)
+            a->pgw_ipv4 = ip;
+    }
+    if (!ip)
+        return 0;
+    if (ip_out)
+        *ip_out = ip;
+    return 1;
+}
+
+int subscr_cache_get_sri_pgw(const char *imsi, uint32_t *out_pgw_ipv4,
+                             char *out_apn, size_t apn_cap)
+{
+    subscr_entry_t *e;
+    subscr_apn_t *chosen = NULL;
+    uint32_t ip = 0;
+    uint8_t i;
+
+    if (out_apn && apn_cap)
+        out_apn[0] = '\0';
+    if (!imsi || !*imsi)
+        return 0;
+    e = find_imsi(imsi);
+    if (!e || e->n_apns == 0)
+        return 0;
+
+    for (i = 0; i < e->n_apns; i++) {
+        if (!e->apns[i].is_default)
+            continue;
+        if (apn_static_ipv4(&e->apns[i], &ip)) {
+            chosen = &e->apns[i];
+            break;
+        }
+    }
+    if (!chosen) {
+        for (i = 0; i < e->n_apns; i++) {
+            if (apn_static_ipv4(&e->apns[i], &ip)) {
+                chosen = &e->apns[i];
+                break;
+            }
+        }
+    }
+    if (!chosen || !ip)
+        return 0;
+    if (out_pgw_ipv4)
+        *out_pgw_ipv4 = ip;
+    if (out_apn && apn_cap) {
+        strncpy(out_apn, chosen->apn, apn_cap - 1);
+        out_apn[apn_cap - 1] = '\0';
+    }
+    return 1;
+}
+
 int subscr_cache_get_default_apn(const char *imsi, char *out_apn,
                                  size_t apn_cap)
 {

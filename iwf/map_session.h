@@ -41,6 +41,7 @@ typedef enum {
     MAP_OP_UL               = 6,   /* updateLocation (MAP-C)  - op 2                 */
     MAP_OP_PRN              = 7,   /* provideRoamingNumber    - op 4                 */
     MAP_OP_SRI              = 8,   /* sendRoutingInformation  - op 22 (MT call)      */
+    MAP_OP_SRI_GPRS         = 9,   /* sendRoutingInfoForGPRS  - op 24               */
 } map_op_t;
 
 typedef enum {
@@ -205,6 +206,16 @@ map_session_t  *map_sess_find_by_diam_hbh(uint32_t hbh);
 
 /* GSUP proxy: pending UL/SAI session awaiting SGSN ISD ack (by IMSI). */
 map_session_t  *map_sess_find_gsup_pending(const char *imsi, map_op_t op);
+
+/* SGSN GSN-Address learned from UpdateGprsLocation. Survives dialogue
+ * teardown so a later SendRoutingInfoForGPRS can name that SGSN.
+ * gsn is a GSN-Address value (5-byte IPv4 or 17-byte IPv6), not a GT. */
+void            map_sess_note_sgsn_gsn(const char *imsi,
+                                       const uint8_t *gsn, uint8_t len);
+/* Copies the stored GSN-Address. Returns its length, or 0 if none. */
+int             map_sess_sgsn_gsn(const char *imsi, uint8_t *out, size_t cap);
+/* 1 if any live dialogue is for this IMSI. */
+int             map_sess_imsi_present(const char *imsi);
 
 /* Insert into the Session-Id index. Caller must populate
  * s->diameter_session_id (NUL-terminated) before invoking. */

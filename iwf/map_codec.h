@@ -5,6 +5,7 @@
  *
  *   SendAuthenticationInfo       opcode 56  (Authentication info retrieval)
  *   UpdateGprsLocation           opcode 23  (Mobility management)
+ *   SendRoutingInfoForGPRS       opcode 24  (GGSN/SGSN address retrieval)
  *   UpdateLocation               opcode  2  (MAP-C)
  *   InsertSubscriberData         opcode  7  (Subscriber-data insertion)
  *   CancelLocation               opcode  3
@@ -43,6 +44,7 @@
 #define MAP_OP_CODE_INSERT_SUBSCRIBER_DATA  7
 #define MAP_OP_CODE_SEND_ROUTING_INFO       22  /* sendRoutingInformation (MT call) */
 #define MAP_OP_CODE_UPDATE_GPRS_LOCATION    23
+#define MAP_OP_CODE_SEND_ROUTING_INFO_FOR_GPRS 24 /* SendRoutingInfoForGPRS */
 #define MAP_OP_CODE_SEND_AUTH_INFO          56
 #define MAP_OP_CODE_PURGE_MS                67
 #define MAP_OP_CODE_SEND_ROUTING_INFO_SM    45
@@ -104,8 +106,10 @@ typedef struct {
     char     imsi_str[16];
     uint8_t  sgsn_number_bcd[8];
     uint8_t  sgsn_number_bcd_len;
-    /* sgsn-Address (TS 29.002 GSN-Address; IPv4 is 4 bytes after BCD len). */
-    uint8_t  sgsn_addr[16];
+    /* sgsn-Address: GSN-Address value (TS 29.060 / 23.003).
+     * IPv4 is 5 bytes (0x04 + 4), IPv6 is 17 bytes (0x50 + 16).
+     * This is not an E.164 number and not a PDP address. */
+    uint8_t  sgsn_addr[17];
     uint8_t  sgsn_addr_len;
 } map_ugl_req_t;
 
@@ -169,6 +173,32 @@ int map_decode_sri_arg(const uint8_t *p, size_t n,
                        char *msisdn_out, size_t cap);
 int map_encode_sri_res(const char *imsi_str, const char *msrn_digits,
                        uint8_t *out, size_t out_cap);
+
+/* SendRoutingInfoForGPRS (opcode 24).
+ * Arg ggsn-Address is the requester's GGSN (optional), not the address
+ * the HLR returns. Result is a plain SEQUENCE: mandatory sgsn-Address [0]
+ * and at most one ggsn-Address [1]. Neither field is a PDP address, an
+ * APN, or an E.164 GGSN number.
+ * GSN-Address value: IPv4 = 0x04 + 4 bytes, IPv6 = 0x50 + 16 bytes.
+ * A raw 4-byte IPv4 is accepted and prefixed with 0x04. */
+typedef struct {
+    uint8_t  imsi_bcd[8];
+    uint8_t  imsi_bcd_len;
+    char     imsi_str[16];
+    uint8_t  ggsn_addr[17];
+    uint8_t  ggsn_addr_len;          /* 0 when the arg omitted ggsn-Address */
+    bool     have_requested_info;    /* arg requestedInfo [2] NULL present  */
+} map_sri_gprs_req_t;
+
+int map_gsn_normalize(const uint8_t *in, size_t n,
+                      uint8_t *out, size_t cap, size_t *out_len);
+int map_gsn_from_ipv4(uint32_t host_order, uint8_t out[5]);
+int map_decode_sri_gprs_arg(const uint8_t *p, size_t n, map_sri_gprs_req_t *out);
+/* ggsn may be NULL or ggsn_len 0 to omit [1]. Returns -1 if sgsn is missing
+ * or either address is not a single IPv4/IPv6 GSN-Address. */
+int map_encode_sri_gprs_res(const uint8_t *sgsn, size_t sgsn_len,
+                            const uint8_t *ggsn, size_t ggsn_len,
+                            uint8_t *out, size_t out_cap);
 
 /* MAP SMS (TS 29.002) — used by sms_iwf when SMS_IWF_ENABLED. */
 int map_decode_sri_sm_arg(const uint8_t *p, size_t n, char *msisdn_out, size_t cap);
@@ -315,6 +345,8 @@ typedef enum {
     MAP_AC_MWD_MNGT_V2              = 10, /* readyForSM (MW alerting)       */
     MAP_AC_SHORT_MSG_MO_RELAY_V3    = 11, /* mo-ForwardSM (MO submit, v3)  */
     MAP_AC_LOCATION_INFO_RETRIEVAL_V3 = 12, /* sendRoutingInformation (SRI) */
+    /* gprsLocationInfoRetrievalContext-v3: 0.4.0.0.1.0.33.3 (not voice ctx 5) */
+    MAP_AC_GPRS_LOCATION_INFO_RETRIEVAL_V3 = 13,
 } map_app_ctx_t;
 
 int map_encode_aarq(map_app_ctx_t ac, uint8_t *out, size_t out_cap);

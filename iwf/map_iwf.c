@@ -110,6 +110,8 @@
 #include <sys/timerfd.h>
 #include <sys/epoll.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 /* ====================================================================== */
 /* Inbound dispatch from ss7_link.c                                       */
@@ -126,6 +128,7 @@ static map_app_ctx_t ac_for_op(map_op_t op)
     case MAP_OP_PURGE_MS: return MAP_AC_MS_PURGING_V3;
     case MAP_OP_PRN:      return MAP_AC_ROAMING_NUMBER_ENQUIRY_V3;
     case MAP_OP_SRI:      return MAP_AC_LOCATION_INFO_RETRIEVAL_V3;
+    case MAP_OP_SRI_GPRS: return MAP_AC_GPRS_LOCATION_INFO_RETRIEVAL_V3;
     default: return MAP_AC_INFO_RETRIEVAL_V3;
     }
 }
@@ -274,11 +277,14 @@ static int map_send_tcap_to_peer(struct iwf_runtime *rt, map_session_t *s,
         called.ssn = SS7_SSN_SGSN;
 
     ss7_link_make_local_addr(rt, &calling);
-    /* Acting as HLR: force CgPA SSN=6 for VLR/MSC/SGSN peers (not HLR↔HLR). */
-    if (s->have_peer_sccp &&
-        (s->peer_sccp.ssn == SS7_SSN_VLR ||
-         s->peer_sccp.ssn == SS7_SSN_MSC ||
-         s->peer_sccp.ssn == SS7_SSN_SGSN))
+    /* Acting as HLR: force CgPA SSN=6 for VLR/MSC/SGSN/GGSN peers.
+     * SendRoutingInfoForGPRS is always an HLR answer, whatever SSN asked. */
+    if (s->map_op == MAP_OP_SRI_GPRS ||
+        (s->have_peer_sccp &&
+         (s->peer_sccp.ssn == SS7_SSN_VLR ||
+          s->peer_sccp.ssn == SS7_SSN_MSC ||
+          s->peer_sccp.ssn == SS7_SSN_SGSN ||
+          s->peer_sccp.ssn == SS7_SSN_GGSN)))
         calling.ssn = SS7_SSN_HLR;
 
     int rc = ss7_link_send_tcap_ex(rt, &called, &calling, out, n);
@@ -420,6 +426,8 @@ static void handle_begin_ugl(struct iwf_runtime *rt,
     map_copy_imsi_bcd(s->imsi_bcd, &s->imsi_bcd_len,
                       req.imsi_bcd, req.imsi_bcd_len);
     memcpy(s->imsi_str, req.imsi_str, sizeof(s->imsi_str));
+    if (req.sgsn_addr_len)
+        map_sess_note_sgsn_gsn(s->imsi_str, req.sgsn_addr, req.sgsn_addr_len);
     if (map_plmn_pack_home(rt->cfg.gsup_local_mcc, rt->cfg.gsup_local_mnc,
                            s->visited_plmn_bcd) == 0)
         s->have_visited_plmn = true;
@@ -1423,6 +1431,228 @@ static bool dlg_est_on_tcap(struct iwf_runtime *rt,
     return true;
 }
 
+/* One dotted or compressed address for logs. GSN-Address only. */
+static void sri_gprs_fmt_gsn(const uint8_t *g, size_t n, char *buf, size_t cap)
+{
+    if (!buf || cap == 0)
+        return;
+    buf[0] = '\0';
+    if (g && n == 5 && g[0] == 0x04) {
+        snprintf(buf, cap, "%u.%u.%u.%u", g[1], g[2], g[3], g[4]);
+        return;
+    }
+    if (g && n == 17 && g[0] == 0x50) {
+        if (!inet_ntop(AF_INET6, g + 1, buf, (socklen_t)cap))
+            snprintf(buf, cap, "ipv6");
+        return;
+    }
+    snprintf(buf, cap, "?");
+}
+
+static int sri_gprs_gsn_from_ip(const char *ip, uint8_t out[5])
+{
+    struct in_addr ia;
+    if (!ip || !ip[0] || !out || inet_pton(AF_INET, ip, &ia) != 1)
+        return -1;
+    return map_gsn_from_ipv4(ntohl(ia.s_addr), out);
+}
+
+/* IWF's own GSN-Address: the same IPv4 outbound UpdateGprsLocation advertises. */
+static int sri_gprs_local_sgsn(const struct iwf_runtime *rt, uint8_t out[5])
+{
+    const char *ip = rt->cfg.local_ip[0] ? rt->cfg.local_ip : rt->cfg.listen_ip;
+    return sri_gprs_gsn_from_ip(ip, out);
+}
+
+/* Exactly one GGSN. Order: subscribed static PGW (default APN, else first),
+ * per-PLMN roam PGW, [smf] ip when this IMSI is already known, then nothing.
+ * The argument's ggsn-Address is not consulted here. */
+static int sri_gprs_select_ggsn(struct iwf_runtime *rt, const char *imsi,
+                                uint8_t ggsn[17], char *how, size_t how_cap)
+{
+    uint32_t ip = 0;
+    char apn[64];
+    const char *rip = NULL;
+    const char *rfq = NULL;
+    uint8_t scratch[17];
+    int roam;
+    int known;
+
+    if (how && how_cap)
+        how[0] = '\0';
+    apn[0] = '\0';
+    if (subscr_cache_get_sri_pgw(imsi, &ip, apn, sizeof(apn)) &&
+        map_gsn_from_ipv4(ip, ggsn) == 5) {
+        if (how && how_cap)
+            snprintf(how, how_cap, "subscription apn=%s",
+                     apn[0] ? apn : "?");
+        return 5;
+    }
+
+    roam = iwf_config_roam_pgw(&rt->cfg, imsi, &rip, &rfq);
+    if (roam && rip && rip[0] && sri_gprs_gsn_from_ip(rip, ggsn) == 5) {
+        if (how && how_cap)
+            snprintf(how, how_cap, "roam-pgw");
+        return 5;
+    }
+    if (roam && rfq && rfq[0]) {
+        ip = subscr_resolve_fqdn_ipv4(rfq);
+        if (ip && map_gsn_from_ipv4(ip, ggsn) == 5) {
+            if (how && how_cap)
+                snprintf(how, how_cap, "roam-pgw-fqdn");
+            return 5;
+        }
+    }
+
+    known = subscr_cache_has_apns(imsi) || map_sess_imsi_present(imsi) ||
+            map_sess_sgsn_gsn(imsi, scratch, sizeof(scratch)) > 0 || roam;
+    if (known && sri_gprs_gsn_from_ip(rt->cfg.smf_ip, ggsn) == 5) {
+        if (how && how_cap)
+            snprintf(how, how_cap, "smf");
+        return 5;
+    }
+    return 0;
+}
+
+static int sri_gprs_known(const struct iwf_runtime *rt, const char *imsi)
+{
+    uint8_t scratch[17];
+    if (subscr_cache_has_apns(imsi) || map_sess_imsi_present(imsi) ||
+        map_sess_sgsn_gsn(imsi, scratch, sizeof(scratch)) > 0)
+        return 1;
+    return iwf_config_roam_pgw(&rt->cfg, imsi, NULL, NULL);
+}
+
+static map_session_t *sri_gprs_open(struct iwf_runtime *rt,
+                                    const ss7_sccp_addr_t *calling,
+                                    const tcap_msg_t *tmsg,
+                                    const tcap_component_t *c,
+                                    const char *imsi)
+{
+    map_session_t *s = map_sess_create(map_sess_new_tid());
+    if (!s)
+        return NULL;
+    s->map_op = MAP_OP_SRI_GPRS;
+    s->state = MAP_SESS_WAIT_MAP_TX;
+    s->peer_tcap_dialogue_id = tmsg->otid;
+    s->have_peer_tid = tmsg->have_otid;
+    s->peer_invoke_id = c->invoke_id;
+    s->t_dialogue_ms = rt->cfg.map_t_dialogue_ms > 0
+                           ? rt->cfg.map_t_dialogue_ms : TCAP_DEFAULT_T_MS;
+    map_sess_store_peer(s, calling);
+    if (imsi && imsi[0])
+        snprintf(s->imsi_str, sizeof(s->imsi_str), "%s", imsi);
+    return s;
+}
+
+/* SendRoutingInfoForGPRS (visited SGSN or GGSN -> HLR).
+ * Result sgsn-Address is the GSN from the last UpdateGprsLocation for this
+ * IMSI, or the IWF local GSN when we are the SGSN. Result ggsn-Address is
+ * one home PGW/GGSN. It is not the PDP address, not the APN, and not the
+ * ggsn-Address the requester put in the argument unless we have no home
+ * GGSN of our own. */
+static void handle_begin_sri_gprs(struct iwf_runtime *rt,
+                                  const ss7_sccp_addr_t *calling,
+                                  const tcap_msg_t *tmsg,
+                                  const tcap_component_t *c)
+{
+    map_sri_gprs_req_t req;
+    map_session_t *s;
+    uint8_t sgsn[17];
+    uint8_t ggsn[17];
+    int sl;
+    int gl;
+    int known;
+    const char *sgsn_how;
+    char ggsn_how[96];
+    char sgsn_txt[64];
+    char ggsn_txt[64];
+    char req_txt[64];
+    uint8_t params[64];
+    int pn;
+
+    if (map_decode_sri_gprs_arg(c->parameters, c->parameters_len, &req) < 0) {
+        LOGW("map", "SRI-GPRS: malformed argument otid=0x%08x", tmsg->otid);
+        s = sri_gprs_open(rt, calling, tmsg, c, "");
+        if (s)
+            send_tcap_end_with_error(rt, s, c->invoke_id,
+                                     MAP_ERR_UNEXPECTED_DATA_VALUE, 0);
+        return;
+    }
+
+    sl = map_sess_sgsn_gsn(req.imsi_str, sgsn, sizeof(sgsn));
+    sgsn_how = "ugl";
+    if (sl <= 0) {
+        sl = sri_gprs_local_sgsn(rt, sgsn);
+        sgsn_how = "local";
+    }
+    gl = sri_gprs_select_ggsn(rt, req.imsi_str, ggsn, ggsn_how, sizeof(ggsn_how));
+    known = sri_gprs_known(rt, req.imsi_str);
+    if (gl <= 0 && known && req.ggsn_addr_len) {
+        size_t n = 0;
+        if (map_gsn_normalize(req.ggsn_addr, req.ggsn_addr_len,
+                              ggsn, sizeof(ggsn), &n) == 0) {
+            gl = (int)n;
+            snprintf(ggsn_how, sizeof(ggsn_how), "request");
+        }
+    }
+
+    s = sri_gprs_open(rt, calling, tmsg, c, req.imsi_str);
+    if (!s)
+        return;
+
+    if (sl <= 0) {
+        LOGW("map", "[%s] SRI-GPRS: no sgsn-Address", req.imsi_str);
+        send_tcap_end_with_error(rt, s, c->invoke_id,
+                                 MAP_ERR_SYSTEM_FAILURE, 0);
+        return;
+    }
+    if (gl <= 0 && !known) {
+        LOGW("map", "[%s] SRI-GPRS: unknown subscriber", req.imsi_str);
+        send_tcap_end_with_error(rt, s, c->invoke_id,
+                                 MAP_ERR_UNKNOWN_SUBSCRIBER, 0);
+        return;
+    }
+    if (gl <= 0 && req.have_requested_info) {
+        LOGW("map",
+             "[%s] SRI-GPRS: requestedInfo set, no ggsn-Address to return",
+             req.imsi_str);
+    }
+
+    pn = map_encode_sri_gprs_res(sgsn, (size_t)sl,
+                                 gl > 0 ? ggsn : NULL,
+                                 gl > 0 ? (size_t)gl : 0,
+                                 params, sizeof(params));
+    if (pn < 0) {
+        send_tcap_end_with_error(rt, s, c->invoke_id,
+                                 MAP_ERR_SYSTEM_FAILURE, 0);
+        return;
+    }
+
+    sri_gprs_fmt_gsn(sgsn, (size_t)sl, sgsn_txt, sizeof(sgsn_txt));
+    if (gl > 0)
+        sri_gprs_fmt_gsn(ggsn, (size_t)gl, ggsn_txt, sizeof(ggsn_txt));
+    else
+        snprintf(ggsn_txt, sizeof(ggsn_txt), "omitted");
+    LOGI("map",
+         "[%s] SRI-GPRS sgsn-Address=%s (%s) ggsn-Address=%s (%s)",
+         req.imsi_str, sgsn_txt, sgsn_how, ggsn_txt,
+         gl > 0 ? ggsn_how : "none");
+    if (req.ggsn_addr_len && gl > 0 && strcmp(ggsn_how, "request") != 0) {
+        sri_gprs_fmt_gsn(req.ggsn_addr, req.ggsn_addr_len,
+                         req_txt, sizeof(req_txt));
+        LOGI("map",
+             "[%s] SRI-GPRS arg ggsn-Address %s kept as the requester; "
+             "result uses %s",
+             req.imsi_str, req_txt, ggsn_how);
+    }
+
+    send_tcap_end_with_result(rt, s, c->invoke_id,
+                              MAP_OP_CODE_SEND_ROUTING_INFO_FOR_GPRS,
+                              params, (size_t)pn);
+    iwf_imsi_trace_flush_rx(req.imsi_str);
+}
+
 /* ----- SCCP receive entrypoint (set on ss7_link at init) ----------- */
 
 static void on_sccp_pdu(struct iwf_runtime *rt,
@@ -1466,6 +1696,8 @@ static void on_sccp_pdu(struct iwf_runtime *rt,
         case MAP_OP_CODE_PROVIDE_ROAMING_NUMBER: handle_begin_prn (rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_PROVIDE_SUBSCRIBER_INFO: handle_begin_psi(rt, calling, &tmsg, c); break;
         case MAP_OP_CODE_SEND_ROUTING_INFO:      handle_begin_sri (rt, calling, &tmsg, c); break;
+        case MAP_OP_CODE_SEND_ROUTING_INFO_FOR_GPRS:
+            handle_begin_sri_gprs(rt, calling, &tmsg, c); break;
 #ifdef SMS_IWF_ENABLED
         case MAP_OP_CODE_MT_FORWARD_SM_V3:      /* mt-forwardSM (v3)      */
         case MAP_OP_CODE_MT_FORWARD_SM:         /* forwardSM (v1/v2)      */

@@ -851,6 +851,171 @@ int map_encode_sri_res(const char *imsi_str, const char *msrn_digits,
     return (int)off;
 }
 
+int map_gsn_normalize(const uint8_t *in, size_t n,
+                      uint8_t *out, size_t cap, size_t *out_len)
+{
+    if (!in || !out || !out_len)
+        return -1;
+    if (n == 4 && cap >= 5) {
+        out[0] = 0x04;
+        memcpy(out + 1, in, 4);
+        *out_len = 5;
+        return 0;
+    }
+    if (n == 5 && in[0] == 0x04 && cap >= 5) {
+        memcpy(out, in, 5);
+        *out_len = 5;
+        return 0;
+    }
+    if (n == 17 && in[0] == 0x50 && cap >= 17) {
+        memcpy(out, in, 17);
+        *out_len = 17;
+        return 0;
+    }
+    return -1;
+}
+
+int map_gsn_from_ipv4(uint32_t host_order, uint8_t out[5])
+{
+    if (!out || host_order == 0)
+        return -1;
+    out[0] = 0x04;
+    out[1] = (uint8_t)((host_order >> 24) & 0xff);
+    out[2] = (uint8_t)((host_order >> 16) & 0xff);
+    out[3] = (uint8_t)((host_order >> 8) & 0xff);
+    out[4] = (uint8_t)(host_order & 0xff);
+    return 5;
+}
+
+static int gsn_from_explicit_octets(const uint8_t *v, size_t l,
+                                    uint8_t *out, size_t *out_len)
+{
+    size_t off = 0;
+    uint8_t tag;
+    const uint8_t *inner;
+    size_t il;
+
+    if (ber_dec_tlv(v, l, &off, &tag, &inner, &il) < 0 || tag != 0x04)
+        return -1;
+    return map_gsn_normalize(inner, il, out, 17, out_len);
+}
+
+static int sri_gprs_take_imsi(map_sri_gprs_req_t *out,
+                              const uint8_t *v, size_t l)
+{
+    if (out->imsi_bcd_len)
+        return 0;
+    if (l == 0 || l > sizeof(out->imsi_bcd))
+        return -1;
+    memcpy(out->imsi_bcd, v, l);
+    out->imsi_bcd_len = (uint8_t)l;
+    map_bcd_to_str(v, l, out->imsi_str, sizeof(out->imsi_str));
+    return out->imsi_str[0] ? 0 : -1;
+}
+
+static int sri_gprs_take_ggsn(map_sri_gprs_req_t *out,
+                              const uint8_t *v, size_t l, bool explicit_tag)
+{
+    size_t n = 0;
+    uint8_t tmp[17];
+
+    if (out->ggsn_addr_len)
+        return 0; /* one address; a repeated [1] is ignored */
+    if (explicit_tag) {
+        if (gsn_from_explicit_octets(v, l, tmp, &n) < 0)
+            return -1;
+    } else if (map_gsn_normalize(v, l, tmp, sizeof(tmp), &n) < 0) {
+        return -1;
+    }
+    memcpy(out->ggsn_addr, tmp, n);
+    out->ggsn_addr_len = (uint8_t)n;
+    return 0;
+}
+
+int map_decode_sri_gprs_arg(const uint8_t *p, size_t n, map_sri_gprs_req_t *out)
+{
+    /* SendRoutingInfoForGprsArg ::= SEQUENCE {
+     *   imsi           [0] IMSI,
+     *   ggsn-Address   [1] GSN-Address OPTIONAL,   -- requester GGSN
+     *   requestedInfo  [2] NULL OPTIONAL,
+     *   extensionContainer [3] OPTIONAL, ... }
+     * IMPLICIT context tags: primitive 0x80/0x81/0x82.
+     * EXPLICIT 0xA0/0xA1 (OCTET STRING inside) is accepted too. */
+    if (!p || !out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    const uint8_t *body = p;
+    size_t blen = n;
+    if (n >= 2 && (p[0] == 0x30 || (p[0] & 0x20))) {
+        if (unwrap_seq(p, n, &body, &blen) < 0)
+            return -1;
+    }
+
+    size_t off = 0;
+    while (off < blen) {
+        uint8_t tag;
+        const uint8_t *v;
+        size_t l;
+        if (ber_dec_tlv(body, blen, &off, &tag, &v, &l) < 0)
+            return -1;
+        if (tag == 0x80) {
+            if (sri_gprs_take_imsi(out, v, l) < 0)
+                return -1;
+        } else if (tag == 0xA0) {
+            size_t io = 0;
+            uint8_t itag;
+            const uint8_t *iv;
+            size_t il;
+            if (ber_dec_tlv(v, l, &io, &itag, &iv, &il) < 0 || itag != 0x04)
+                return -1;
+            if (sri_gprs_take_imsi(out, iv, il) < 0)
+                return -1;
+        } else if (tag == 0x04) {
+            if (sri_gprs_take_imsi(out, v, l) < 0)
+                return -1;
+        } else if (tag == 0x81) {
+            if (sri_gprs_take_ggsn(out, v, l, false) < 0)
+                return -1;
+        } else if (tag == 0xA1) {
+            if (sri_gprs_take_ggsn(out, v, l, true) < 0)
+                return -1;
+        } else if (tag == 0x82) {
+            out->have_requested_info = true;
+        }
+        /* [3] extensionContainer and anything else are skipped. */
+    }
+    return out->imsi_bcd_len ? 0 : -1;
+}
+
+int map_encode_sri_gprs_res(const uint8_t *sgsn, size_t sgsn_len,
+                            const uint8_t *ggsn, size_t ggsn_len,
+                            uint8_t *out, size_t out_cap)
+{
+    /* SendRoutingInfoForGprsRes ::= SEQUENCE {
+     *   sgsn-Address [0] GSN-Address,
+     *   ggsn-Address [1] GSN-Address OPTIONAL, ... }
+     * Exactly one of each. [1] is omitted when the caller has no GGSN. */
+    uint8_t sbuf[17], gbuf[17];
+    size_t sl = 0, gl = 0;
+    uint8_t body[48];
+    size_t bo = 0, off = 0;
+
+    if (!out || map_gsn_normalize(sgsn, sgsn_len, sbuf, sizeof(sbuf), &sl) < 0)
+        return -1;
+    if (ber_enc_tlv(body, sizeof(body), &bo, 0x80, sbuf, sl) < 0)
+        return -1;
+    if (ggsn_len) {
+        if (!ggsn ||
+            map_gsn_normalize(ggsn, ggsn_len, gbuf, sizeof(gbuf), &gl) < 0)
+            return -1;
+        if (ber_enc_tlv(body, sizeof(body), &bo, 0x81, gbuf, gl) < 0)
+            return -1;
+    }
+    if (ber_enc_tlv(out, out_cap, &off, 0x30, body, bo) < 0)
+        return -1;
+    return (int)off;
+}
+
 int map_encode_ul_arg(const char *imsi_str,
                       const char *msc_gt_digits,
                       const char *vlr_gt_digits,
@@ -1278,6 +1443,7 @@ int map_encode_systemfailure_diag(uint8_t network_resource,
  *   networkLocUpContext-v3               0.4.0.0.1.0. 1.3 -> 04 00 00 01 00 01 03
  *   roamingNumberEnquiryContext-v3       0.4.0.0.1.0. 3.3 -> 04 00 00 01 00 03 03
  *   locationInfoRetrievalContext-v3      0.4.0.0.1.0. 5.3 -> 04 00 00 01 00 05 03
+ *   gprsLocationInfoRetrievalContext-v3  0.4.0.0.1.0.33.3 -> 04 00 00 01 00 21 03
  *   infoRetrievalContext-v3              0.4.0.0.1.0.14.3 -> 04 00 00 01 00 0e 03
  *   gprsLocationUpdateContext-v3         0.4.0.0.1.0.32.3 -> 04 00 00 01 00 20 03
  *   subscriberDataMngtContext-v3         0.4.0.0.1.0.16.3 -> 04 00 00 01 00 10 03
@@ -1287,6 +1453,7 @@ int map_encode_systemfailure_diag(uint8_t network_resource,
 static const uint8_t AC_NETWORK_LOC_UP_V3[]      = { 0x04,0x00,0x00,0x01,0x00,0x01,0x03 };
 static const uint8_t AC_ROAMING_NUMBER_ENQ_V3[]  = { 0x04,0x00,0x00,0x01,0x00,0x03,0x03 };
 static const uint8_t AC_LOCATION_INFO_RETR_V3[]  = { 0x04,0x00,0x00,0x01,0x00,0x05,0x03 };
+static const uint8_t AC_GPRS_LOC_INFO_RETR_V3[]  = { 0x04,0x00,0x00,0x01,0x00,0x21,0x03 };
 static const uint8_t AC_INFO_RETRIEVAL_V3[]      = { 0x04,0x00,0x00,0x01,0x00,0x0e,0x03 };
 static const uint8_t AC_GPRS_LOC_UPDATE_V3[]     = { 0x04,0x00,0x00,0x01,0x00,0x20,0x03 };
 static const uint8_t AC_SUBSCRIBER_DATA_MGMT_V3[]= { 0x04,0x00,0x00,0x01,0x00,0x10,0x03 };
@@ -1310,6 +1477,8 @@ static int oid_for_ac(map_app_ctx_t ac, const uint8_t **out, size_t *out_len)
         *out = AC_ROAMING_NUMBER_ENQ_V3;   *out_len = sizeof(AC_ROAMING_NUMBER_ENQ_V3);   break;
     case MAP_AC_LOCATION_INFO_RETRIEVAL_V3:
         *out = AC_LOCATION_INFO_RETR_V3;   *out_len = sizeof(AC_LOCATION_INFO_RETR_V3);   break;
+    case MAP_AC_GPRS_LOCATION_INFO_RETRIEVAL_V3:
+        *out = AC_GPRS_LOC_INFO_RETR_V3;   *out_len = sizeof(AC_GPRS_LOC_INFO_RETR_V3);   break;
     case MAP_AC_INFO_RETRIEVAL_V3:
         *out = AC_INFO_RETRIEVAL_V3;       *out_len = sizeof(AC_INFO_RETRIEVAL_V3);       break;
     case MAP_AC_GPRS_LOCATION_UPDATE_V3:
@@ -1825,6 +1994,10 @@ int map_decode_aarq_ac(const uint8_t *p, size_t n, map_app_ctx_t *out)
             if (oid_len == sizeof(AC_LOCATION_INFO_RETR_V3) &&
                 !memcmp(oid, AC_LOCATION_INFO_RETR_V3, oid_len)) {
                 *out = MAP_AC_LOCATION_INFO_RETRIEVAL_V3; return 0;
+            }
+            if (oid_len == sizeof(AC_GPRS_LOC_INFO_RETR_V3) &&
+                !memcmp(oid, AC_GPRS_LOC_INFO_RETR_V3, oid_len)) {
+                *out = MAP_AC_GPRS_LOCATION_INFO_RETRIEVAL_V3; return 0;
             }
             if (oid_len == sizeof(AC_INFO_RETRIEVAL_V3) &&
                 !memcmp(oid, AC_INFO_RETRIEVAL_V3, oid_len)) {
