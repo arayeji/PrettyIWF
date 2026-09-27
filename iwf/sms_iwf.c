@@ -935,26 +935,39 @@ static void sms_mo_reply_err(int conn_id, const char *imsi, uint8_t mr,
         gsup_server_send(conn_id, gsup, (size_t)n);
 }
 
-/* Node GT for SRI-SM-Res: same as UL msc-Number (serving MSC). */
-static const char *sms_msc_gt(void)
+/* Example placeholders from iwf.conf / compile-time defaults. They must
+ * not hide [local_msc].msc_gt (serving MSC advertised in CS UL / SRI-SM). */
+static int sms_gt_usable(const char *gt)
 {
-    if (g_rt->cfg.local_msc_msc_gt[0])
+    if (!gt || !gt[0])
+        return 0;
+    if (!strcmp(gt, "1234567890000") || !strcmp(gt, "1234567890006"))
+        return 0;
+    return 1;
+}
+
+/* Serving MSC GT: [local_msc].msc_gt, then [sms_iwf].local_msc_gt,
+ * then [map_iwf].local_gt. Used for SRI-SM-Res and mo-ForwardSM CgPA. */
+static const char *sms_serving_msc_gt(void)
+{
+    if (sms_gt_usable(g_rt->cfg.local_msc_msc_gt))
         return g_rt->cfg.local_msc_msc_gt;
-    if (g_rt->cfg.sms_local_msc_gt[0])
+    if (sms_gt_usable(g_rt->cfg.sms_local_msc_gt))
         return g_rt->cfg.sms_local_msc_gt;
-    if (g_rt->cfg.map_local_gt[0])
+    if (sms_gt_usable(g_rt->cfg.map_local_gt))
         return g_rt->cfg.map_local_gt;
     return "";
 }
 
-/* SCCP CgPA for outbound mo-ForwardSM: serving MSC GT (TS 23.040). */
+static const char *sms_msc_gt(void)
+{
+    return sms_serving_msc_gt();
+}
+
+/* SCCP CgPA for outbound mo-ForwardSM: same serving MSC as UL msc-Number. */
 static const char *sms_mo_cgpa_gt(void)
 {
-    if (g_rt->cfg.sms_local_msc_gt[0])
-        return g_rt->cfg.sms_local_msc_gt;
-    if (g_rt->cfg.map_local_gt[0])
-        return g_rt->cfg.map_local_gt;
-    return "";
+    return sms_serving_msc_gt();
 }
 
 /* Nature of number from a MAP AddressString / GSUP SM-RP-DA first octet.
