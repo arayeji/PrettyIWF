@@ -17,7 +17,7 @@
 
 #define IWF_IMSI_TRACE_LEN          16
 #define IWF_IMSI_TRACE_MAX_FILTERS  32
-#define IWF_IMSI_TRACE_PACKET_MAX   2048
+#define IWF_IMSI_TRACE_PACKET_MAX   4608
 #define IWF_IMSI_TRACE_PACKET_PER_S 200
 
 void iwf_imsi_trace_init(void);
@@ -48,10 +48,33 @@ int iwf_imsi_trace_admin(const iwf_imsi_trace_query_t *q,
                          char *body, size_t body_cap, size_t *body_len);
 
 /* PACKET line:
- *   [IMSI:<imsi>] PACKET: proto=<name> dir=<rx|tx> len=<n> [trunc=1] b64=<base64>
+ *   [IMSI:<imsi>] PACKET: proto=<name> dir=<rx|tx> len=<n> [frame=ipv4]
+ *                 [trunc=1] b64=<base64>
+ *
+ * frame=ipv4: b64 is a rebuilt IPv4 packet (see trace_frame.h) and len is
+ * its length. Without it, b64 is the application payload only.
  */
 void iwf_imsi_trace_packet(const char *imsi, const char *proto, const char *dir,
                            const void *data, size_t len);
+void iwf_imsi_trace_packet_frame(const char *imsi, const char *proto,
+                                 const char *dir, const void *frame, size_t len);
+
+/* [logging] trace_packet_layer: true = ip (default), false = app. */
+void iwf_imsi_trace_set_frames(bool on);
+/* True when a filter is active and the layer is ip; gate frame building. */
+bool iwf_imsi_trace_frames_wanted(void);
+
+/* Transport hooks. A TX frame is used for the next "tx" PACKET of proto
+ * whose payload equals app. The RX frame is used for "rx" PACKETs of proto
+ * whose payload lies inside frame[payload_off, payload_off+payload_len),
+ * until iwf_imsi_trace_clear_rx_frame(). */
+void iwf_imsi_trace_offer_tx_frame(const char *proto,
+                                   const void *app, size_t app_len,
+                                   const void *frame, size_t frame_len);
+void iwf_imsi_trace_offer_rx_frame(const char *proto,
+                                   const void *frame, size_t frame_len,
+                                   size_t payload_off, size_t payload_len);
+void iwf_imsi_trace_clear_rx_frame(void);
 
 /* Defer RX trace until IMSI is known (BEGIN decode, MSISDN lookup, or
  * TCAP/Diameter correlation of an answer that carries no IMSI). The bind

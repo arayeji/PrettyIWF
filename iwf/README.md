@@ -124,6 +124,7 @@ teid        = 0
 level       = error             ; error|warn|info|debug|trace (default: error)
 file        = /var/log/iwf.log  ; "-" or empty = stderr
 # trace_imsi  = 001010          ; optional startup prefixes (comma-separated)
+# trace_packet_layer = ip       ; ip (rebuilt IPv4 frame) or app (payload only)
 
 [metrics]
 enabled     = 1
@@ -147,8 +148,29 @@ curl -sS 'http://127.0.0.1:9090/admin/trace/imsi?imsi=001010000000001&match=exac
 Traced IMSIs emit DEBUG-level logs and PACKET lines even when global `level = error`:
 
 ```text
-[IMSI:001010000000001] PACKET: proto=map dir=rx len=142 b64=...
+[IMSI:001010000000001] PACKET: proto=map dir=rx len=236 frame=ipv4 b64=...
 ```
+
+With `[logging] trace_packet_layer = ip` (the default), `b64` holds a whole
+IPv4 packet and the line carries `frame=ipv4`; `len` is the frame length:
+
+| proto | frame |
+|-------|-------|
+| `gtp` | IPv4 / UDP / GTP-C |
+| `map` | IPv4 / SCTP DATA (PPID 3) / M3UA DATA / SCCP / TCAP |
+| `isup` | IPv4 / SCTP DATA (PPID 3) / M3UA DATA / ISUP or BICC |
+
+The kernel owns IP, UDP and SCTP, so these headers are rebuilt. Addresses,
+ports, OPC/DPC, SIO, SLS, routing context and the SCCP bytes as received
+(before the local CdPA point-code strip) are real. The M3UA endpoint comes from the live
+SCTP socket towards `[stp] ip:port`, otherwise from `[stp] local_ip`/`local_port`.
+IP ID/TTL, SCTP verification tag, TSN and stream sequence number are
+synthetic, and one SCTP packet carries exactly one DATA chunk. Diameter, GSUP,
+SMPP and SIP lines, and any PDU that does not fit the 4608-byte PACKET limit,
+stay application payload only (no `frame=`). `trace_packet_layer = app` restores
+payload-only lines for every protocol.
+
+To open in Wireshark, decode the b64 into a raw-IPv4 pcap (link type 228).
 
 Responses without IMSI in the payload (MAP END, Diameter AIA, etc.) are correlated via `map_session_t` (TCAP DTID / Diameter Session-Id).
 

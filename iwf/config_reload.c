@@ -154,6 +154,7 @@ int iwf_config_reload(iwf_runtime_t *rt)
     subscr_cache_set_ttl(nc.pgw_cache_ttl_s);
     pgw_dns_set_ttl(nc.pgw_cache_ttl_s, nc.pgw_dns_neg_ttl_s);
     pgw_dns_set_timeout_ms(nc.pgw_dns_timeout_ms);
+    iwf_imsi_trace_set_frames(nc.trace_packet_ip != 0);
     iwf_imsi_trace_load_config(nc.trace_imsi);
 
     if (!msrn_cfg_equal(old, &nc)) {

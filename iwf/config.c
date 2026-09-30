@@ -25,6 +25,7 @@ static void defaults(iwf_config_t *c)
     strncpy(c->log_level, "error", sizeof(c->log_level) - 1);
     strncpy(c->log_file, "-", sizeof(c->log_file) - 1);
     c->trace_imsi[0] = '\0';
+    c->trace_packet_ip = 1;
     c->metrics_enabled = 1;
     strncpy(c->metrics_listen_ip, "127.0.0.1", sizeof(c->metrics_listen_ip) - 1);
     c->metrics_listen_port = 9090;
@@ -926,6 +927,13 @@ int iwf_config_load(const char *path, iwf_config_t *out)
             else if (!strcmp(key, "file"))  copy_str(out->log_file, sizeof(out->log_file), val);
             else if (!strcmp(key, "trace_imsi"))
                 copy_str(out->trace_imsi, sizeof(out->trace_imsi), val);
+            else if (!strcmp(key, "trace_packet_layer")) {
+                if      (!strcasecmp(val, "ip"))  out->trace_packet_ip = 1;
+                else if (!strcasecmp(val, "app")) out->trace_packet_ip = 0;
+                else LOGW("config", "[logging].trace_packet_layer=%s: "
+                          "expected ip or app, keeping %s", val,
+                          out->trace_packet_ip ? "ip" : "app");
+            }
             else LOGW("config", "unknown key [logging].%s", key);
         } else if (!strcmp(section, "metrics")) {
             if      (!strcmp(key, "enabled")) out->metrics_enabled = (atoi(val) != 0);

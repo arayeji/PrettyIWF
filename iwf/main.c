@@ -129,7 +129,7 @@ int iwf_send_v1(iwf_runtime_t *rt, const iwf_endpoint_t *to,
         LOGE("net", "sendto v1 failed: %s", strerror(errno));
         return -1;
     }
-    iwf_gtp_trace_tx_v1(buf, len);
+    iwf_gtp_trace_tx_v1(buf, len, &to->addr);
     return (int)r;
 }
 
@@ -145,7 +145,7 @@ int iwf_send_v2_addr(iwf_runtime_t *rt, const struct sockaddr_in *to,
              inet_ntoa(to->sin_addr), ntohs(to->sin_port), strerror(errno));
         return -1;
     }
-    iwf_gtp_trace_tx_v2(buf, len);
+    iwf_gtp_trace_tx_v2(buf, len, to);
     return (int)r;
 }
 
@@ -184,7 +184,7 @@ static void handle_v1_packet(iwf_runtime_t *rt,
         return;
     }
     iwf_log_hex("net", "RX-Gn raw", buf, len);
-    iwf_gtp_trace_rx_v1(buf, len, &msg);
+    iwf_gtp_trace_rx_v1(buf, len, &msg, &from->addr);
     translate_v1_request(rt, from, &msg);
 }
 
@@ -200,7 +200,7 @@ static void handle_v2_packet(iwf_runtime_t *rt,
         return;
     }
     iwf_log_hex("net", "RX-S4 raw", buf, len);
-    iwf_gtp_trace_rx_v2(buf, len, &msg);
+    iwf_gtp_trace_rx_v2(buf, len, &msg, &from->addr);
     translate_v2_response(rt, from, &msg);
 }
 
@@ -270,6 +270,7 @@ int main(int argc, char **argv)
                  rt.cfg.log_file);
 
     iwf_imsi_trace_init();
+    iwf_imsi_trace_set_frames(rt.cfg.trace_packet_ip != 0);
     if (rt.cfg.trace_imsi[0])
         iwf_imsi_trace_load_config(rt.cfg.trace_imsi);
 
@@ -321,6 +322,15 @@ int main(int argc, char **argv)
 
     if (open_udp(bind_ip, rt.cfg.listen_port, &rt.v1_sock) < 0) return 1;
     rt.v2_sock = rt.v1_sock; /* multiplexed - see header comment */
+    {
+        struct sockaddr_in la;
+        socklen_t lal = sizeof(la);
+        uint32_t trace_ip = rt.local_ipv4_be;
+        if (getsockname(rt.v1_sock, (struct sockaddr *)&la, &lal) == 0 &&
+            la.sin_family == AF_INET && la.sin_addr.s_addr != htonl(INADDR_ANY))
+            trace_ip = la.sin_addr.s_addr;
+        iwf_gtp_trace_set_local(trace_ip, rt.cfg.listen_port);
+    }
 
     rt.sgwc_addr.sin_family = AF_INET;
     rt.sgwc_addr.sin_port   = htons(rt.cfg.sgwc_port);

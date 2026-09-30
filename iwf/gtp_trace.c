@@ -4,6 +4,7 @@
 
 #include "gtp_trace.h"
 #include "imsi_trace.h"
+#include "trace_frame.h"
 #include "gtpv1.h"
 #include "gtpv2.h"
 #include "session.h"
@@ -11,8 +12,8 @@
 #include "iwf.h"
 
 #include <stdio.h>
-
 #include <string.h>
+#include <arpa/inet.h>
 
 static int imsi_from_v1_ies(const iwf_msg_t *msg, char *imsi, size_t cap)
 {
@@ -107,8 +108,45 @@ static int resolve_imsi_v2(const iwf_msg_t *msg, char *imsi, size_t cap)
     return -1;
 }
 
+static uint32_t g_local_ip;
+static uint16_t g_local_port;
+
+void iwf_gtp_trace_set_local(uint32_t ipv4_be, uint16_t port)
+{
+    g_local_ip = ipv4_be;
+    g_local_port = port;
+}
+
+static void trace_emit(const char *imsi, const char *dir,
+                       const uint8_t *buf, size_t len,
+                       const struct sockaddr_in *peer)
+{
+    static uint8_t frame[IWF_IMSI_TRACE_PACKET_MAX];
+    iwf_trace_ep_t ep;
+    size_t n = 0;
+
+    if (peer && iwf_imsi_trace_frames_wanted() && iwf_imsi_trace_match(imsi)) {
+        if (dir[0] == 'r') {
+            ep.src_ip = peer->sin_addr.s_addr;
+            ep.src_port = ntohs(peer->sin_port);
+            ep.dst_ip = g_local_ip;
+            ep.dst_port = g_local_port;
+        } else {
+            ep.src_ip = g_local_ip;
+            ep.src_port = g_local_port;
+            ep.dst_ip = peer->sin_addr.s_addr;
+            ep.dst_port = ntohs(peer->sin_port);
+        }
+        n = iwf_trace_frame_udp(&ep, buf, len, frame, sizeof(frame));
+    }
+    if (n)
+        iwf_imsi_trace_packet_frame(imsi, "gtp", dir, frame, n);
+    else
+        iwf_imsi_trace_packet(imsi, "gtp", dir, buf, len);
+}
+
 static void trace_v1(const char *dir, const uint8_t *buf, size_t len,
-                     const iwf_msg_t *msg_in)
+                     const iwf_msg_t *msg_in, const struct sockaddr_in *peer)
 {
     iwf_msg_t local;
     const iwf_msg_t *msg = msg_in;
@@ -126,11 +164,11 @@ static void trace_v1(const char *dir, const uint8_t *buf, size_t len,
 
     if (resolve_imsi_v1(msg, imsi, sizeof(imsi)) != 0)
         return;
-    iwf_imsi_trace_packet(imsi, "gtp", dir, buf, len);
+    trace_emit(imsi, dir, buf, len, peer);
 }
 
 static void trace_v2(const char *dir, const uint8_t *buf, size_t len,
-                     const iwf_msg_t *msg_in)
+                     const iwf_msg_t *msg_in, const struct sockaddr_in *peer)
 {
     iwf_msg_t local;
     const iwf_msg_t *msg = msg_in;
@@ -148,25 +186,29 @@ static void trace_v2(const char *dir, const uint8_t *buf, size_t len,
 
     if (resolve_imsi_v2(msg, imsi, sizeof(imsi)) != 0)
         return;
-    iwf_imsi_trace_packet(imsi, "gtp", dir, buf, len);
+    trace_emit(imsi, dir, buf, len, peer);
 }
 
-void iwf_gtp_trace_rx_v1(const uint8_t *buf, size_t len, const iwf_msg_t *msg)
+void iwf_gtp_trace_rx_v1(const uint8_t *buf, size_t len, const iwf_msg_t *msg,
+                         const struct sockaddr_in *peer)
 {
-    trace_v1("rx", buf, len, msg);
+    trace_v1("rx", buf, len, msg, peer);
 }
 
-void iwf_gtp_trace_rx_v2(const uint8_t *buf, size_t len, const iwf_msg_t *msg)
+void iwf_gtp_trace_rx_v2(const uint8_t *buf, size_t len, const iwf_msg_t *msg,
+                         const struct sockaddr_in *peer)
 {
-    trace_v2("rx", buf, len, msg);
+    trace_v2("rx", buf, len, msg, peer);
 }
 
-void iwf_gtp_trace_tx_v1(const uint8_t *buf, size_t len)
+void iwf_gtp_trace_tx_v1(const uint8_t *buf, size_t len,
+                         const struct sockaddr_in *peer)
 {
-    trace_v1("tx", buf, len, NULL);
+    trace_v1("tx", buf, len, NULL, peer);
 }
 
-void iwf_gtp_trace_tx_v2(const uint8_t *buf, size_t len)
+void iwf_gtp_trace_tx_v2(const uint8_t *buf, size_t len,
+                         const struct sockaddr_in *peer)
 {
-    trace_v2("tx", buf, len, NULL);
+    trace_v2("tx", buf, len, NULL, peer);
 }

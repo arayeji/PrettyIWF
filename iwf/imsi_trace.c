@@ -29,7 +29,35 @@ static struct {
     size_t  orig_len;
     char    proto[32];
     int     used;
+    int     is_frame;
 } g_rx_bind;
+
+#define TRACE_TXF_MAX 8
+#define TRACE_TXF_TTL 5
+
+typedef struct {
+    int      used;
+    char     proto[16];
+    time_t   ts;
+    uint16_t app_len;
+    uint16_t frame_len;
+    uint8_t  app[IWF_IMSI_TRACE_PACKET_MAX];
+    uint8_t  frame[IWF_IMSI_TRACE_PACKET_MAX];
+} trace_txf_t;
+
+static trace_txf_t g_txf[TRACE_TXF_MAX];
+static int g_txf_next;
+
+static struct {
+    int      used;
+    char     proto[16];
+    uint16_t frame_len;
+    uint16_t pl_off;
+    uint16_t pl_len;
+    uint8_t  frame[IWF_IMSI_TRACE_PACKET_MAX];
+} g_rxf;
+
+static bool g_frames_on = true;
 
 #define TRACE_KIND_TCAP  1
 #define TRACE_KIND_HBH   2
@@ -52,6 +80,7 @@ typedef struct {
     uint8_t pdu[IWF_IMSI_TRACE_PACKET_MAX];
     uint16_t dump_len;
     uint16_t orig_len;
+    uint8_t is_frame;
     time_t  ts;
 } trace_hold_t;
 
@@ -225,8 +254,119 @@ static int corr_get(uint8_t kind, uint32_t id, char *imsi_out, size_t cap)
     return -1;
 }
 
+static bool proto_eq(const char *a, const char *b)
+{
+    return a && b && strcmp(a, b) == 0;
+}
+
+static bool mem_contains(const uint8_t *hay, size_t hay_len,
+                         const uint8_t *needle, size_t n)
+{
+    size_t i;
+
+    if (!n || n > hay_len)
+        return false;
+    for (i = 0; i + n <= hay_len; i++) {
+        if (hay[i] == needle[0] && memcmp(hay + i, needle, n) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Rebuilt frame recorded by the transport for this payload, if any. */
+static bool frame_for(const char *proto, const char *dir,
+                      const void *data, size_t len,
+                      const uint8_t **frame, size_t *frame_len)
+{
+    int i;
+
+    if (!g_frames_on || !data || !len || !dir)
+        return false;
+
+    if (strcmp(dir, "rx") == 0) {
+        if (!g_rxf.used || !proto_eq(proto, g_rxf.proto))
+            return false;
+        if (!mem_contains(g_rxf.frame + g_rxf.pl_off, g_rxf.pl_len,
+                          (const uint8_t *)data, len))
+            return false;
+        *frame = g_rxf.frame;
+        *frame_len = g_rxf.frame_len;
+        return true;
+    }
+
+    if (strcmp(dir, "tx") == 0) {
+        time_t now = time(NULL);
+        for (i = 1; i <= TRACE_TXF_MAX; i++) {
+            trace_txf_t *e = &g_txf[(g_txf_next - i + TRACE_TXF_MAX)
+                                    % TRACE_TXF_MAX];
+            if (!e->used || now - e->ts > TRACE_TXF_TTL)
+                continue;
+            if (e->app_len != len || !proto_eq(proto, e->proto) ||
+                memcmp(e->app, data, len) != 0)
+                continue;
+            *frame = e->frame;
+            *frame_len = e->frame_len;
+            return true;
+        }
+    }
+    return false;
+}
+
+void iwf_imsi_trace_set_frames(bool on)
+{
+    g_frames_on = on;
+}
+
+bool iwf_imsi_trace_frames_wanted(void)
+{
+    return g_frames_on && g_filter.count > 0;
+}
+
+void iwf_imsi_trace_offer_tx_frame(const char *proto,
+                                   const void *app, size_t app_len,
+                                   const void *frame, size_t frame_len)
+{
+    trace_txf_t *e;
+
+    if (!proto || !app || !app_len || !frame || !frame_len ||
+        app_len > IWF_IMSI_TRACE_PACKET_MAX ||
+        frame_len > IWF_IMSI_TRACE_PACKET_MAX)
+        return;
+    e = &g_txf[g_txf_next];
+    g_txf_next = (g_txf_next + 1) % TRACE_TXF_MAX;
+    e->used = 1;
+    snprintf(e->proto, sizeof(e->proto), "%s", proto);
+    e->ts = time(NULL);
+    e->app_len = (uint16_t)app_len;
+    e->frame_len = (uint16_t)frame_len;
+    memcpy(e->app, app, app_len);
+    memcpy(e->frame, frame, frame_len);
+}
+
+void iwf_imsi_trace_offer_rx_frame(const char *proto,
+                                   const void *frame, size_t frame_len,
+                                   size_t payload_off, size_t payload_len)
+{
+    g_rxf.used = 0;
+    if (!proto || !frame || !frame_len ||
+        frame_len > IWF_IMSI_TRACE_PACKET_MAX ||
+        payload_off > frame_len || payload_len > frame_len - payload_off)
+        return;
+    snprintf(g_rxf.proto, sizeof(g_rxf.proto), "%s", proto);
+    g_rxf.frame_len = (uint16_t)frame_len;
+    g_rxf.pl_off = (uint16_t)payload_off;
+    g_rxf.pl_len = (uint16_t)payload_len;
+    memcpy(g_rxf.frame, frame, frame_len);
+    g_rxf.used = 1;
+}
+
+void iwf_imsi_trace_clear_rx_frame(void)
+{
+    g_rxf.used = 0;
+}
+
 static void hold_put(uint32_t tid, const char *proto, const char *dir,
-                      const void *data, size_t len)
+                      const void *data, size_t len, int is_frame)
 {
     time_t now;
     int i, free_i = -1, oldest = 0;
@@ -245,6 +385,7 @@ static void hold_put(uint32_t tid, const char *proto, const char *dir,
             memcpy(g_hold[i].pdu, data, dump_len);
             g_hold[i].dump_len = (uint16_t)dump_len;
             g_hold[i].orig_len = (uint16_t)(len > 65535 ? 65535 : len);
+            g_hold[i].is_frame = (uint8_t)(is_frame != 0);
             g_hold[i].ts = now;
             if (proto && proto[0])
                 snprintf(g_hold[i].proto, sizeof(g_hold[i].proto), "%s", proto);
@@ -262,6 +403,7 @@ static void hold_put(uint32_t tid, const char *proto, const char *dir,
     g_hold[free_i].tid = tid;
     g_hold[free_i].dump_len = (uint16_t)dump_len;
     g_hold[free_i].orig_len = (uint16_t)(len > 65535 ? 65535 : len);
+    g_hold[free_i].is_frame = (uint8_t)(is_frame != 0);
     g_hold[free_i].ts = now;
     memcpy(g_hold[free_i].pdu, data, dump_len);
     snprintf(g_hold[free_i].proto, sizeof(g_hold[free_i].proto), "%s",
@@ -273,6 +415,7 @@ static void hold_put(uint32_t tid, const char *proto, const char *dir,
 static void bind_clear(void)
 {
     g_rx_bind.used = 0;
+    g_rx_bind.is_frame = 0;
     g_rx_bind.dump_len = 0;
     g_rx_bind.orig_len = 0;
     g_rx_bind.proto[0] = '\0';
@@ -287,6 +430,8 @@ void iwf_imsi_trace_init(void)
     bind_clear();
     memset(g_corr, 0, sizeof(g_corr));
     memset(g_hold, 0, sizeof(g_hold));
+    memset(g_txf, 0, sizeof(g_txf));
+    g_rxf.used = 0;
 }
 
 void iwf_imsi_trace_shutdown(void)
@@ -510,8 +655,8 @@ int iwf_imsi_trace_admin(const iwf_imsi_trace_query_t *q,
     return 200;
 }
 
-void iwf_imsi_trace_packet(const char *imsi, const char *proto, const char *dir,
-                           const void *data, size_t len)
+static void trace_emit(const char *imsi, const char *proto, const char *dir,
+                       const void *data, size_t len, int is_frame)
 {
     char b64[((IWF_IMSI_TRACE_PACKET_MAX + 2) / 3) * 4 + 1];
     size_t dump_len;
@@ -543,16 +688,40 @@ void iwf_imsi_trace_packet(const char *imsi, const char *proto, const char *dir,
         return;
 
     iwf_log_imsi(IWF_LOG_INFO, imsi, "trace",
-                 "PACKET: proto=%s dir=%s len=%zu%s b64=%s",
+                 "PACKET: proto=%s dir=%s len=%zu%s%s b64=%s",
                  proto && proto[0] ? proto : "-",
                  dir && dir[0] ? dir : "-",
                  len,
+                 is_frame ? " frame=ipv4" : "",
                  truncated ? " trunc=1" : "",
                  b64);
 }
 
+void iwf_imsi_trace_packet(const char *imsi, const char *proto, const char *dir,
+                           const void *data, size_t len)
+{
+    const uint8_t *frame;
+    size_t frame_len;
+
+    if (g_filter.count == 0)
+        return;
+    if (frame_for(proto, dir, data, len, &frame, &frame_len))
+        trace_emit(imsi, proto, dir, frame, frame_len, 1);
+    else
+        trace_emit(imsi, proto, dir, data, len, 0);
+}
+
+void iwf_imsi_trace_packet_frame(const char *imsi, const char *proto,
+                                 const char *dir, const void *frame, size_t len)
+{
+    trace_emit(imsi, proto, dir, frame, len, 1);
+}
+
 void iwf_imsi_trace_bind_rx(const char *proto, const void *data, size_t len)
 {
+    const uint8_t *frame;
+    size_t frame_len;
+
     bind_clear();
 
     if (g_filter.count == 0)
@@ -560,6 +729,11 @@ void iwf_imsi_trace_bind_rx(const char *proto, const void *data, size_t len)
     if (!data || !len)
         return;
 
+    if (frame_for(proto, "rx", data, len, &frame, &frame_len)) {
+        data = frame;
+        len = frame_len;
+        g_rx_bind.is_frame = 1;
+    }
     g_rx_bind.orig_len = len;
     g_rx_bind.dump_len = len > IWF_IMSI_TRACE_PACKET_MAX
                          ? IWF_IMSI_TRACE_PACKET_MAX : len;
@@ -575,8 +749,8 @@ void iwf_imsi_trace_flush_rx(const char *imsi)
 {
     if (!g_rx_bind.used || !g_rx_bind.dump_len)
         return;
-    iwf_imsi_trace_packet(imsi, g_rx_bind.proto, "rx",
-                          g_rx_bind.data, g_rx_bind.orig_len);
+    trace_emit(imsi, g_rx_bind.proto, "rx",
+               g_rx_bind.data, g_rx_bind.orig_len, g_rx_bind.is_frame);
     bind_clear();
 }
 
@@ -609,14 +783,23 @@ void iwf_imsi_trace_park_rx(uint32_t tid)
 {
     if (!g_rx_bind.used || !g_rx_bind.dump_len)
         return;
-    hold_put(tid, g_rx_bind.proto, "rx", g_rx_bind.data, g_rx_bind.orig_len);
+    hold_put(tid, g_rx_bind.proto, "rx", g_rx_bind.data, g_rx_bind.orig_len,
+             g_rx_bind.is_frame);
     bind_clear();
 }
 
 void iwf_imsi_trace_park_pdu(uint32_t tid, const char *proto, const char *dir,
                              const void *data, size_t len)
 {
-    hold_put(tid, proto, dir, data, len);
+    const uint8_t *frame;
+    size_t frame_len;
+
+    if (g_filter.count == 0)
+        return;
+    if (frame_for(proto, dir, data, len, &frame, &frame_len))
+        hold_put(tid, proto, dir, frame, frame_len, 1);
+    else
+        hold_put(tid, proto, dir, data, len, 0);
 }
 
 void iwf_imsi_trace_flush_parked(uint32_t tid, const char *imsi)
@@ -629,8 +812,8 @@ void iwf_imsi_trace_flush_parked(uint32_t tid, const char *imsi)
     for (i = 0; i < TRACE_HOLD_MAX; i++) {
         if (!g_hold[i].used || g_hold[i].tid != tid)
             continue;
-        iwf_imsi_trace_packet(imsi, g_hold[i].proto, g_hold[i].dir,
-                              g_hold[i].pdu, g_hold[i].orig_len);
+        trace_emit(imsi, g_hold[i].proto, g_hold[i].dir,
+                   g_hold[i].pdu, g_hold[i].orig_len, g_hold[i].is_frame);
         g_hold[i].used = 0;
     }
     iwf_imsi_trace_remember_tcap(tid, imsi);

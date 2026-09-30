@@ -44,11 +44,17 @@
 #include "logging.h"
 #include "map_iwf_priv.h"
 #include "isup_call.h"
+#include "imsi_trace.h"
+#include "trace_frame.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
+#include <dirent.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -213,6 +219,7 @@ struct ss7_impl_ctx {
     uint8_t                network_indicator;    /* [stp] network_indicator for MTP SIO */
     int                    sccp_ri;               /* IWF_SCCP_RI_GT or IWF_SCCP_RI_SSN */
     osmo_prim_cb           sccp_mtp_orig_cb;     /* libosmo SCCP MTP user, before wrap */
+    struct iwf_runtime    *rt;
 };
 
 /* libosmo-sigtran struct osmo_ss7_user (ss7_user.h): inst, name, prim_cb, priv.
@@ -225,6 +232,170 @@ struct iwf_osmo_ss7_user_layout {
 };
 
 static struct ss7_impl_ctx *g_sccp_mtp_wrap_ctx;
+
+/* ---- IMSI-trace frames: rebuilt IPv4/SCTP/M3UA around SCCP and ISUP ---- */
+
+#define M3UA_EP_REFRESH_S 10
+
+static struct {
+    time_t         ts;
+    int            from_socket;
+    iwf_trace_ep_t ep;          /* local -> STP */
+} g_m3ua_ep;
+
+static uint32_t ipv4_be_or_zero(const char *s)
+{
+    struct in_addr a;
+    if (!s || !s[0] || inet_pton(AF_INET, s, &a) != 1)
+        return 0;
+    return a.s_addr;
+}
+
+/* The SCTP association belongs to libosmo; find its socket by peer address. */
+static int m3ua_ep_from_socket(uint32_t rip_be, uint16_t rport,
+                               iwf_trace_ep_t *ep)
+{
+#ifdef SO_PROTOCOL
+    DIR *d = opendir("/proc/self/fd");
+    struct dirent *de;
+    int rc = -1;
+
+    if (!d)
+        return -1;
+    while ((de = readdir(d)) != NULL) {
+        const char *s = de->d_name;
+        int fd = 0, proto = 0;
+        socklen_t ol = sizeof(proto);
+        struct sockaddr_in peer, loc;
+        socklen_t al;
+
+        if (*s < '0' || *s > '9')
+            continue;
+        for (; *s >= '0' && *s <= '9'; s++)
+            fd = fd * 10 + (*s - '0');
+        if (*s || fd == dirfd(d))
+            continue;
+        if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &proto, &ol) < 0 ||
+            proto != IPPROTO_SCTP)
+            continue;
+        al = sizeof(peer);
+        if (getpeername(fd, (struct sockaddr *)&peer, &al) < 0 ||
+            peer.sin_family != AF_INET || ntohs(peer.sin_port) != rport ||
+            (rip_be && peer.sin_addr.s_addr != rip_be))
+            continue;
+        al = sizeof(loc);
+        if (getsockname(fd, (struct sockaddr *)&loc, &al) < 0 ||
+            loc.sin_family != AF_INET)
+            continue;
+        ep->src_ip = loc.sin_addr.s_addr;
+        ep->src_port = ntohs(loc.sin_port);
+        ep->dst_ip = peer.sin_addr.s_addr;
+        ep->dst_port = rport;
+        rc = 0;
+        break;
+    }
+    closedir(d);
+    return rc;
+#else
+    (void)rip_be; (void)rport; (void)ep;
+    return -1;
+#endif
+}
+
+static void m3ua_trace_ep(const struct ss7_impl_ctx *ctx, int tx,
+                          iwf_trace_ep_t *out)
+{
+    const struct iwf_runtime *rt = ctx->rt;
+    time_t now = time(NULL);
+    iwf_trace_ep_t ep;
+
+    if (!g_m3ua_ep.ts ||
+        now - g_m3ua_ep.ts >= (g_m3ua_ep.from_socket ? M3UA_EP_REFRESH_S : 1)) {
+        uint32_t rip = ipv4_be_or_zero(rt->cfg.stp_ip);
+        g_m3ua_ep.ts = now;
+        g_m3ua_ep.from_socket =
+            m3ua_ep_from_socket(rip, rt->cfg.stp_port, &g_m3ua_ep.ep) == 0;
+        if (!g_m3ua_ep.from_socket) {
+            uint32_t lip = ipv4_be_or_zero(rt->cfg.stp_local_ip);
+            g_m3ua_ep.ep.src_ip = lip ? lip : rt->local_ipv4_be;
+            g_m3ua_ep.ep.src_port = rt->cfg.stp_local_port;
+            g_m3ua_ep.ep.dst_ip = rip;
+            g_m3ua_ep.ep.dst_port = rt->cfg.stp_port;
+        }
+    }
+    ep = g_m3ua_ep.ep;
+    if (!tx) {
+        out->src_ip = ep.dst_ip;
+        out->src_port = ep.dst_port;
+        out->dst_ip = ep.src_ip;
+        out->dst_port = ep.src_port;
+    } else {
+        *out = ep;
+    }
+}
+
+static void m3ua_trace_mtp(const struct ss7_impl_ctx *ctx,
+                           uint32_t opc, uint32_t dpc, uint8_t sio, uint8_t sls,
+                           iwf_trace_mtp_t *out)
+{
+    out->opc = opc;
+    out->dpc = dpc;
+    out->sio = sio;
+    out->sls = sls;
+    out->rctx = ctx->rt ? ctx->rt->cfg.stp_routing_context : 0;
+}
+
+static void m3ua_trace_tx(const struct ss7_impl_ctx *ctx, const char *proto,
+                          uint32_t opc, uint32_t dpc, uint8_t sio, uint8_t sls,
+                          const uint8_t *mtp_payload, size_t mtp_len,
+                          const uint8_t *app, size_t app_len)
+{
+    static uint8_t frame[IWF_IMSI_TRACE_PACKET_MAX];
+    iwf_trace_ep_t ep;
+    iwf_trace_mtp_t mtp;
+    size_t n;
+
+    if (!ctx->rt || !iwf_imsi_trace_frames_wanted())
+        return;
+    m3ua_trace_ep(ctx, 1, &ep);
+    m3ua_trace_mtp(ctx, opc, dpc, sio, sls, &mtp);
+    n = iwf_trace_frame_m3ua(&ep, &mtp, mtp_payload, mtp_len,
+                             frame, sizeof(frame), NULL);
+    if (n)
+        iwf_imsi_trace_offer_tx_frame(proto, app, app_len, frame, n);
+}
+
+static void m3ua_trace_rx(const struct ss7_impl_ctx *ctx, const char *proto,
+                          const struct osmo_mtp_prim *omp,
+                          const uint8_t *mtp_payload, size_t mtp_len)
+{
+    static uint8_t frame[IWF_IMSI_TRACE_PACKET_MAX];
+    iwf_trace_ep_t ep;
+    iwf_trace_mtp_t mtp;
+    size_t n, off = 0;
+
+    iwf_imsi_trace_clear_rx_frame();
+    if (!ctx || !ctx->rt || !mtp_payload || !mtp_len ||
+        !iwf_imsi_trace_frames_wanted())
+        return;
+    m3ua_trace_ep(ctx, 0, &ep);
+    m3ua_trace_mtp(ctx, omp->u.transfer.opc, omp->u.transfer.dpc,
+                   omp->u.transfer.sio, omp->u.transfer.sls, &mtp);
+    n = iwf_trace_frame_m3ua(&ep, &mtp, mtp_payload, mtp_len,
+                             frame, sizeof(frame), &off);
+    if (n)
+        iwf_imsi_trace_offer_rx_frame(proto, frame, n, off, mtp_len);
+}
+
+static void mtp_prim_payload(struct msgb *msg, const uint8_t **p, size_t *len)
+{
+    *p = msgb_l2(msg);
+    *len = msgb_l2len(msg);
+    if (!*p) {
+        *p = msgb_data(msg);
+        *len = msgb_length(msg);
+    }
+}
 
 /* Q.713 pointer: first octet of the parameter is at ptr_field + *ptr_field. */
 static uint8_t *iwf_sccp_ptr_target(uint8_t *sccp, size_t len, uint8_t *ptr_field)
@@ -352,17 +523,26 @@ static void iwf_sccp_msg_strip_foreign_cdpa_pc(struct msgb *msg,
 static int iwf_sccp_mtp_wrap(struct osmo_prim_hdr *oph, void *priv)
 {
     struct ss7_impl_ctx *ctx = g_sccp_mtp_wrap_ctx;
+    int rc;
 
     if (ctx && ctx->ss7 && oph &&
         oph->primitive == OSMO_MTP_PRIM_TRANSFER &&
         oph->operation == PRIM_OP_INDICATION && oph->msg) {
         struct osmo_mtp_prim *omp = (struct osmo_mtp_prim *)oph;
+        const uint8_t *sccp;
+        size_t sccp_len;
+        mtp_prim_payload(oph->msg, &sccp, &sccp_len);
+        m3ua_trace_rx(ctx, "map", omp, sccp, sccp_len);
         if (osmo_ss7_pc_is_local(ctx->ss7, omp->u.transfer.dpc))
             iwf_sccp_msg_strip_foreign_cdpa_pc(oph->msg, ctx->ss7);
     }
-    if (!ctx || !ctx->sccp_mtp_orig_cb)
+    if (!ctx || !ctx->sccp_mtp_orig_cb) {
+        iwf_imsi_trace_clear_rx_frame();
         return 0;
-    return ctx->sccp_mtp_orig_cb(oph, priv);
+    }
+    rc = ctx->sccp_mtp_orig_cb(oph, priv);
+    iwf_imsi_trace_clear_rx_frame();
+    return rc;
 }
 
 static void iwf_ss7_wrap_sccp_mtp(struct ss7_impl_ctx *ctx)
@@ -397,15 +577,15 @@ static int isup_mtp_prim_cb(struct osmo_prim_hdr *oph, void *priv)
     if (oph->primitive == OSMO_MTP_PRIM_TRANSFER &&
         oph->operation == PRIM_OP_INDICATION && msg) {
         struct osmo_mtp_prim *omp = (struct osmo_mtp_prim *)oph;
-        const uint8_t *pay = msgb_l2(msg);
-        size_t plen = msgb_l2len(msg);
-        if (!pay) {
-            pay = msgb_data(msg);
-            plen = msgb_length(msg);
-        }
+        const uint8_t *pay;
+        size_t plen;
+        mtp_prim_payload(msg, &pay, &plen);
+        m3ua_trace_rx(rt && rt->map ? rt->map->ss7.opaque : NULL,
+                      "isup", omp, pay, plen);
         uint8_t si = (uint8_t)(omp->u.transfer.sio & 0x0f);
         isup_call_rx(rt, omp->u.transfer.opc, omp->u.transfer.dpc,
                      si, pay, plen);
+        iwf_imsi_trace_clear_rx_frame();
     }
     if (msg)
         msgb_free(msg);
@@ -894,6 +1074,7 @@ int ss7_link_init(struct iwf_runtime *rt)
          (unsigned)default_pc,
          rt->cfg.map_local_pc[0] ? rt->cfg.map_local_pc : "?");
 
+    ctx->rt       = rt;
     ctx->local_pc = default_pc;
     ctx->stp_dpc  = pack_dotted_pc(rt->cfg.stp_remote_pc);
     ctx->network_indicator = rt->cfg.stp_network_indicator;
@@ -1033,6 +1214,10 @@ static int ss7_tx_unitdata_mtp(struct ss7_impl_ctx *ctx,
         return rc;
     }
 
+    m3ua_trace_tx(ctx, "map", ctx->local_pc, ctx->stp_dpc,
+                  MTP_SIO(MTP_SI_SCCP, ctx->network_indicator), 0,
+                  msgb_data(msg), msgb_length(msg), tcap, tcap_len);
+
     /* Match osmo_mtp_prim_xfer_req_prepend: l2h = SCCP before pushing prim. */
     msg->l2h = msg->data;
     if (msgb_headroom(msg) < (int)sizeof(struct osmo_mtp_prim)) {
@@ -1093,6 +1278,8 @@ int ss7_link_send_mtp(struct iwf_runtime *rt, uint8_t si,
     omp->u.transfer.dpc = dpc;
     omp->u.transfer.sls = (uint8_t)(payload[0] & 0x0f);
     omp->u.transfer.sio = MTP_SIO(si, ctx->network_indicator);
+    m3ua_trace_tx(ctx, "isup", opc, dpc, omp->u.transfer.sio,
+                  omp->u.transfer.sls, payload, len, payload, len);
     return osmo_ss7_user_mtp_sap_prim_down(ctx->isup_user, omp);
 }
 

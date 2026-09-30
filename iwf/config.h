@@ -85,6 +85,7 @@ typedef struct {
     char        log_level[16];
     char        log_file[256];
     char        trace_imsi[512];          /* optional startup prefixes (comma-sep) */
+    int         trace_packet_ip;          /* trace_packet_layer: 1 = ip (default), 0 = app */
 
     /* [metrics] HTTP admin (Pretty5GS-compatible /admin/trace/imsi) */
     int         metrics_enabled;
